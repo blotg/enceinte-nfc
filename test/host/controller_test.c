@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "controller.h"
@@ -23,6 +24,14 @@ static uint8_t g_store[16][600];
 static size_t g_store_len[16];
 static int g_saves;
 static int g_pos_saves; /* écritures de la position seule */
+static int64_t g_full_at_us; /* heure du dernier point complet */
+
+static int64_t mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
 
 void resume_store_load(resume_point_t *points, int count)
 {
@@ -37,6 +46,7 @@ esp_err_t resume_store_save(int slot, const resume_point_t *p)
 {
     g_store_len[slot] = resume_encode(p, g_store[slot], sizeof(g_store[slot]));
     g_saves++;
+    g_full_at_us = mono_us();
     return ESP_OK;
 }
 
@@ -379,18 +389,19 @@ int main(int argc, char **argv)
         mock_set_resume(2, false);
 
         /* 13. Écritures espacées : retraits et poses rapides n'écrivent pas à chaque fois */
-        int saves_before = g_saves;
+        int full_before = g_saves - g_pos_saves;
         for (int i = 0; i < 4; i++) {
             card(false, "AA");
             card(true, "AA");
         }
-        CHECK(g_saves - saves_before <= 2);
+        CHECK(g_saves - g_pos_saves - full_before <= 2);
 
         /* 14. Lecture continue (temps réel) : la position seule est enregistrée toutes les
-         * 10 s, carte toujours posée, sans attendre un retrait */
+         * 2 s, carte toujours posée, sans attendre un retrait */
         setenv("SHIM_SPEEDUP", "1", 1);
         card(false, "AA");
-        card(true, "EE"); /* délai dépassé : début d'un morceau de 30 s */
+        usleep(2500000); /* délai de reprise (2 s) dépassé pour EE */
+        card(true, "EE"); /* début d'un morceau de 30 s */
         CHECK(wait_state(PLAYER_PLAYING, 1000));
         CHECK_STR(status().file, "Audio/Livre/1.wav");
         uint32_t e0 = status().elapsed_ms;
@@ -401,11 +412,27 @@ int main(int argc, char **argv)
             usleep(100000);
             player_status_t now = status();
             resume_point_t sp;
-            periodic = g_pos_saves > pos_before && stored("EE", &sp) && !sp.removed &&
-                       strcmp(sp.track, now.file) == 0 && sp.position_ms >= e0 + 8000 &&
-                       sp.position_ms + 2500 >= now.elapsed_ms;
+            periodic = g_pos_saves - pos_before >= 3 && stored("EE", &sp) && !sp.removed &&
+                       strcmp(sp.track, now.file) == 0 && sp.position_ms >= e0 + 4000 &&
+                       sp.position_ms + 3500 >= now.elapsed_ms;
+        }
+        if (!periodic) {
+            resume_point_t sp;
+            bool ok = stored("EE", &sp);
+            printf("e0=%u écritures position=%d stocké=%d %s %u, lecture %s %u\n", e0, g_pos_saves - pos_before, ok,
+                   sp.track, sp.position_ms, status().file, status().elapsed_ms);
         }
         CHECK(periodic);
+        /* un retrait en cours de lecture est enregistré tout de suite (plus de 10 s depuis
+         * le dernier point complet), malgré les écritures de position récentes */
+        while (mono_us() - g_full_at_us < 10500000) {
+            usleep(100000);
+        }
+        card(false, "EE");
+        resume_point_t rm;
+        CHECK(stored("EE", &rm) && rm.removed);
+        card(true, "EE");
+        CHECK(wait_state(PLAYER_PLAYING, 1000));
         card(false, "EE");
         setenv("SHIM_SPEEDUP", "20", 1);
     } else {

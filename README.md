@@ -148,16 +148,19 @@ Les positions survivent aux coupures de courant et aux mises à jour : idéal po
 podcast ou un livre audio. Elles sont tenues à jour chaque seconde en mémoire vive, et
 enregistrées en mémoire permanente :
 
-- pendant la lecture d'un même morceau, **la position seule** (clé de 32 octets), toutes
-  les 10 s si elle a avancé : une coupure fait perdre au plus une dizaine de secondes ;
+- pendant la lecture d'un même morceau, **la position seule** (une entrée de 32 octets),
+  toutes les 2 s si elle a avancé : une coupure fait perdre au plus 2 secondes ;
 - le point complet (carte, dossier, morceau, ~600 octets) au changement de morceau, et tout
-  de suite au retrait de la carte, en pause, au changement de carte ou en fin de playlist ;
-- jamais plus d'une écriture toutes les 10 s pour une même carte, même si on la pose et la
-  retire frénétiquement.
+  de suite au retrait de la carte, au changement de carte ou en fin de playlist ;
+- jamais plus d'un point complet toutes les 10 s pour une même carte, même si on la pose et
+  la retire frénétiquement.
 
-En lecture continue, cela représente environ 280 Ko écrits par jour dans une partition de
-256 Ko à répartition d'usure : environ un effacement par secteur et par jour, pour une
-endurance de 100 000 cycles, soit bien plus que la durée de vie de l'enceinte. Après un
+Ces données sont dans la flash interne de l'ESP32 (partition « cfg » de 256 Ko), pas sur la
+carte SD. Le stockage NVS d'ESP-IDF écrit en journal : chaque nouvelle valeur va dans la case
+libre suivante, l'ancienne est seulement marquée périmée, et une page de 4 Ko n'est effacée
+qu'une fois tout le ruban parcouru. En lecture continue 24 h/24, cela fait environ
+5 effacements par page et par jour, pour une endurance de 100 000 cycles : une cinquantaine
+d'années, et des siècles à raison de quelques heures d'écoute par jour. Après un
 redémarrage, le délai de reprise est calculé avec l'heure réelle (NTP).
 
 Une mise à jour automatique attend que l'enceinte soit inactive : pas de carte posée, pas
