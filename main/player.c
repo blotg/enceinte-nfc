@@ -9,7 +9,6 @@
 #include <unistd.h>
 
 #include "changes.h"
-#include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
@@ -981,9 +980,6 @@ esp_err_t player_init(uint8_t volume, uint8_t max_volume, player_event_cb_t cb)
         ESP_LOGE(TAG, "I2S : %s", esp_err_to_name(err));
         return err;
     }
-    /* Diagnostic : configuration effective des broches I2S */
-    gpio_dump_io_configuration(stdout, (1ULL << CONFIG_ENC_I2S_BCLK_GPIO) | (1ULL << CONFIG_ENC_I2S_WS_GPIO) |
-                                           (1ULL << CONFIG_ENC_I2S_DOUT_GPIO));
     xTaskCreatePinnedToCore(reader_task, "reader", 4608, NULL, 9, NULL, 1);
     /* Les décodeurs (Opus, Vorbis, FLAC...) demandent environ 20 Ko de pile selon Espressif. */
     xTaskCreatePinnedToCore(player_task, "player", 24576, NULL, 10, &s_player_task, 1);
