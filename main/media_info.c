@@ -325,9 +325,14 @@ static void probe_mp3(FILE *f, media_info_t *mi, uint32_t start)
         if (!mp3_parse_header(buf + i, &h)) {
             continue;
         }
-        /* Confirmation par l'en-tête de la trame suivante quand c'est possible. */
-        mp3_hdr_t h2;
-        if (i + h.frame_len + 4 <= n && !mp3_parse_header(buf + i + h.frame_len, &h2)) {
+        /* Confirmation par les en-têtes des deux trames suivantes quand c'est possible
+         * (évite de prendre des données quelconques pour du MP3). */
+        mp3_hdr_t h2, h3;
+        size_t i2 = i + h.frame_len;
+        if (i2 + 4 <= n && !mp3_parse_header(buf + i2, &h2)) {
+            continue;
+        }
+        if (i2 + 4 <= n && i2 + h2.frame_len + 4 <= n && !mp3_parse_header(buf + i2 + h2.frame_len, &h3)) {
             continue;
         }
         found = true;
@@ -389,11 +394,16 @@ static void probe_mp3(FILE *f, media_info_t *mi, uint32_t start)
     free(buf);
 }
 
-/* ---- FLAC ---- */
+/* ---- Commentaires Vorbis (FLAC, Ogg Vorbis, Opus) ---- */
 
 static uint32_t le32(const uint8_t *b)
 {
     return (uint32_t)b[3] << 24 | (uint32_t)b[2] << 16 | (uint32_t)b[1] << 8 | b[0];
+}
+
+static uint64_t le64(const uint8_t *b)
+{
+    return (uint64_t)le32(b + 4) << 32 | le32(b);
 }
 
 static void vorbis_comment(media_info_t *mi, const char *c, size_t len)
@@ -426,6 +436,32 @@ static void vorbis_comment(media_info_t *mi, const char *c, size_t len)
     }
 }
 
+/* Bloc de commentaires : longueur+fournisseur, nombre, puis "CLÉ=valeur" (petit-boutiste). */
+static void vorbis_comments(media_info_t *mi, const uint8_t *vc, uint32_t len)
+{
+    if (len < 8) {
+        return;
+    }
+    uint32_t vlen = le32(vc);
+    if (vlen > len - 8) {
+        return;
+    }
+    uint32_t p = 4 + vlen;
+    uint32_t count = le32(vc + p);
+    p += 4;
+    for (uint32_t i = 0; i < count && p + 4 <= len; i++) {
+        uint32_t clen = le32(vc + p);
+        p += 4;
+        if (clen > len - p) {
+            break; /* commentaire tronqué (souvent une pochette encodée) */
+        }
+        vorbis_comment(mi, (const char *)vc + p, clen);
+        p += clen;
+    }
+}
+
+/* ---- FLAC ---- */
+
 static void probe_flac(FILE *f, media_info_t *mi, uint32_t start)
 {
     uint8_t h[4];
@@ -433,6 +469,7 @@ static void probe_flac(FILE *f, media_info_t *mi, uint32_t start)
         return;
     }
     uint32_t pos = start + 4;
+    uint64_t total = 0;
     for (int guard = 0; guard < 64; guard++) {
         uint8_t bh[4];
         if (fseek(f, pos, SEEK_SET) != 0 || fread(bh, 1, 4, f) != 4) {
@@ -444,39 +481,186 @@ static void probe_flac(FILE *f, media_info_t *mi, uint32_t start)
         if (type == 0 && len >= 18) {
             uint8_t si[18];
             if (fread(si, 1, 18, f) == 18) {
+                uint16_t min_block = (uint16_t)(si[0] << 8 | si[1]);
+                uint16_t max_block = (uint16_t)(si[2] << 8 | si[3]);
                 uint32_t rate = (uint32_t)si[10] << 12 | (uint32_t)si[11] << 4 | si[12] >> 4;
-                uint64_t total = (uint64_t)(si[13] & 0x0F) << 32 | be32(si + 14);
+                total = (uint64_t)(si[13] & 0x0F) << 32 | be32(si + 14);
                 mi->sample_rate = rate;
+                mi->flac_block_size = min_block == max_block ? min_block : 0;
+                mi->flac_total_samples = total;
                 if (rate) {
                     mi->duration_ms = (uint32_t)(total * 1000 / rate);
                 }
             }
+        } else if (type == 3 && len >= 18) {
+            mi->flac_seektable_pos = pos + 4;
+            mi->flac_seektable_n = (uint16_t)(len / 18 > 65535 ? 65535 : len / 18);
         } else if (type == 4 && len < 65536) {
             uint8_t *vc = malloc(len);
-            if (vc && fread(vc, 1, len, f) == len && len >= 8) {
-                uint32_t vlen = le32(vc);
-                uint32_t p = 4 + vlen;
-                if (p + 4 <= len) {
-                    uint32_t count = le32(vc + p);
-                    p += 4;
-                    for (uint32_t i = 0; i < count && p + 4 <= len; i++) {
-                        uint32_t clen = le32(vc + p);
-                        p += 4;
-                        if (clen > len - p) {
-                            break;
-                        }
-                        vorbis_comment(mi, (const char *)vc + p, clen);
-                        p += clen;
-                    }
-                }
+            if (vc && fread(vc, 1, len, f) == len) {
+                vorbis_comments(mi, vc, len);
             }
             free(vc);
         }
         pos += 4 + len;
         if (last) {
+            mi->audio_start = pos; /* première trame audio */
             break;
         }
     }
+    if (mi->audio_start && mi->sample_rate && total && mi->audio_end > mi->audio_start) {
+        mi->bitrate = (uint32_t)((uint64_t)(mi->audio_end - mi->audio_start) * 8 * mi->sample_rate / total);
+        mi->seekable = true;
+    }
+}
+
+static uint8_t crc8(const uint8_t *d, size_t n)
+{
+    uint8_t c = 0;
+    for (size_t i = 0; i < n; i++) {
+        c ^= d[i];
+        for (int b = 0; b < 8; b++) {
+            c = (uint8_t)((c & 0x80) ? (c << 1) ^ 0x07 : c << 1);
+        }
+    }
+    return c;
+}
+
+/* En-tête de trame FLAC valide (CRC-8 compris) ? Renvoie le premier échantillon de la trame. */
+static bool flac_frame_header(const uint8_t *b, size_t avail, const media_info_t *mi, uint64_t *sample)
+{
+    if (avail < 16 || b[0] != 0xFF || (b[1] & 0xFE) != 0xF8) {
+        return false;
+    }
+    int bs_code = b[2] >> 4, sr_code = b[2] & 0x0F, ch = b[3] >> 4, ss = (b[3] >> 1) & 7;
+    if (bs_code == 0 || sr_code == 15 || ch > 10 || ss == 3 || (b[3] & 1)) {
+        return false;
+    }
+    /* numéro de trame ou d'échantillon, codé comme de l'UTF-8 (jusqu'à 7 octets) */
+    size_t p = 4;
+    uint8_t first = b[p++];
+    int extra;
+    uint64_t v;
+    if (!(first & 0x80)) {
+        v = first;
+        extra = 0;
+    } else if ((first & 0xE0) == 0xC0) {
+        v = first & 0x1F;
+        extra = 1;
+    } else if ((first & 0xF0) == 0xE0) {
+        v = first & 0x0F;
+        extra = 2;
+    } else if ((first & 0xF8) == 0xF0) {
+        v = first & 0x07;
+        extra = 3;
+    } else if ((first & 0xFC) == 0xF8) {
+        v = first & 0x03;
+        extra = 4;
+    } else if ((first & 0xFE) == 0xFC) {
+        v = first & 0x01;
+        extra = 5;
+    } else if (first == 0xFE) {
+        v = 0;
+        extra = 6;
+    } else {
+        return false;
+    }
+    for (int i = 0; i < extra; i++) {
+        if ((b[p] & 0xC0) != 0x80) {
+            return false;
+        }
+        v = v << 6 | (b[p++] & 0x3F);
+    }
+    p += bs_code == 6 ? 1 : (bs_code == 7 ? 2 : 0);
+    p += sr_code == 12 ? 1 : ((sr_code == 13 || sr_code == 14) ? 2 : 0);
+    if (p >= avail || crc8(b, p) != b[p]) {
+        return false;
+    }
+    bool variable = b[1] & 1;
+    if (variable) {
+        *sample = v;
+    } else if (mi->flac_block_size) {
+        *sample = v * mi->flac_block_size;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool seek_flac(FILE *f, const media_info_t *mi, uint32_t ms, media_seek_t *out)
+{
+    uint64_t target = (uint64_t)ms * mi->sample_rate / 1000;
+    uint32_t start = 0;
+    /* 1. Table de points de recherche, si elle existe (positions exactes). */
+    if (mi->flac_seektable_pos && fseek(f, mi->flac_seektable_pos, SEEK_SET) == 0) {
+        uint64_t best_sample = 0, best_off = 0;
+        bool found = false;
+        uint8_t pt[18];
+        for (uint32_t i = 0; i < mi->flac_seektable_n && fread(pt, 1, 18, f) == 18; i++) {
+            uint64_t smp = (uint64_t)be32(pt) << 32 | be32(pt + 4);
+            if (smp == UINT64_MAX || smp > target) {
+                continue; /* point réservé, ou au-delà de la cible */
+            }
+            if (!found || smp >= best_sample) {
+                best_sample = smp;
+                best_off = (uint64_t)be32(pt + 8) << 32 | be32(pt + 12);
+                found = true;
+            }
+        }
+        if (found && mi->audio_start + best_off < mi->audio_end) {
+            start = (uint32_t)(mi->audio_start + best_off);
+        }
+    }
+    /* 2. Sinon, estimation proportionnelle, avec une marge en arrière. */
+    if (!start) {
+        double frac = mi->flac_total_samples ? (double)target / mi->flac_total_samples : 0;
+        uint32_t est = mi->audio_start + (uint32_t)(frac * (mi->audio_end - mi->audio_start));
+        start = est > mi->audio_start + 32768 ? est - 32768 : mi->audio_start;
+    }
+    /* Parcourt les trames à partir de "start" : garde la dernière qui ne dépasse pas la cible. */
+    enum { WIN = 32768, SPAN = 4 * WIN };
+    uint8_t *buf = malloc(WIN);
+    if (!buf) {
+        return false;
+    }
+    bool ok = false, done = false;
+    uint64_t first_smp = 0;
+    uint32_t first_off = 0;
+    for (uint32_t base = start; !done && base < mi->audio_end && base < start + SPAN; base += WIN - 16) {
+        size_t n = 0;
+        if (fseek(f, base, SEEK_SET) == 0) {
+            n = fread(buf, 1, WIN, f);
+        }
+        for (size_t i = 0; i + 16 <= n; i++) {
+            uint64_t smp;
+            if (buf[i] != 0xFF || !flac_frame_header(buf + i, n - i, mi, &smp) || smp > mi->flac_total_samples) {
+                continue;
+            }
+            if (!first_off) {
+                first_off = base + (uint32_t)i;
+                first_smp = smp;
+            }
+            if (smp > target) {
+                done = true;
+                break;
+            }
+            out->offset = base + (uint32_t)i;
+            out->actual_ms = (uint32_t)(smp * 1000 / mi->sample_rate);
+            ok = true;
+            i += 15; /* une trame fait plus de 16 octets */
+        }
+        if (n < WIN) {
+            break;
+        }
+    }
+    free(buf);
+    if (!ok && first_off) { /* estimation trop loin : première trame trouvée */
+        out->offset = first_off;
+        out->actual_ms = (uint32_t)(first_smp * 1000 / mi->sample_rate);
+        ok = true;
+    }
+    out->header_end = mi->audio_start;
+    return ok;
 }
 
 /* ---- WAV ---- */
@@ -488,7 +672,6 @@ static void probe_wav(FILE *f, media_info_t *mi)
         memcmp(h + 8, "WAVE", 4) != 0) {
         return;
     }
-    uint32_t byte_rate = 0;
     uint32_t pos = 12;
     for (int guard = 0; guard < 32; guard++) {
         uint8_t ch[8];
@@ -500,18 +683,381 @@ static void probe_wav(FILE *f, media_info_t *mi)
             uint8_t fmt[16];
             if (fread(fmt, 1, 16, f) == 16) {
                 mi->sample_rate = le32(fmt + 4);
-                byte_rate = le32(fmt + 8);
-                mi->bitrate = byte_rate * 8;
+                mi->wav_byte_rate = le32(fmt + 8);
+                mi->wav_block_align = (uint16_t)(fmt[12] | fmt[13] << 8);
+                mi->bitrate = mi->wav_byte_rate * 8;
             }
         } else if (memcmp(ch, "data", 4) == 0) {
-            if (byte_rate) {
-                mi->duration_ms = (uint32_t)((uint64_t)len * 1000 / byte_rate);
+            mi->audio_start = pos + 8;
+            if (pos + 8 + (uint64_t)len < mi->audio_end) {
+                mi->audio_end = pos + 8 + len;
+            }
+            if (mi->wav_byte_rate) {
+                mi->duration_ms = (uint32_t)((uint64_t)len * 1000 / mi->wav_byte_rate);
+                mi->seekable = mi->wav_block_align > 0;
             }
             return;
         }
         pos += 8 + len + (len & 1);
     }
 }
+
+/* ---- Ogg (Opus, Vorbis) ---- */
+
+typedef struct {
+    uint32_t off;
+    uint32_t size; /* en-tête + données */
+    int64_t granule;
+    uint32_t serial;
+    uint8_t type;
+    uint8_t nseg;
+    uint8_t lacing[255];
+} ogg_page_t;
+
+static bool ogg_parse_page(const uint8_t *b, size_t avail, ogg_page_t *pg)
+{
+    if (avail < 27 || memcmp(b, "OggS", 4) != 0 || b[4] != 0) {
+        return false;
+    }
+    pg->type = b[5];
+    pg->granule = (int64_t)le64(b + 6);
+    pg->serial = le32(b + 14);
+    pg->nseg = b[26];
+    if (avail < 27u + pg->nseg) {
+        return false;
+    }
+    uint32_t body = 0;
+    for (int i = 0; i < pg->nseg; i++) {
+        pg->lacing[i] = b[27 + i];
+        body += b[27 + i];
+    }
+    pg->size = 27 + pg->nseg + body;
+    return true;
+}
+
+/* Première page commençant à "from" ou après (recherche du motif "OggS"). */
+static bool ogg_find_page(FILE *f, uint32_t from, uint32_t end, uint32_t serial, ogg_page_t *pg)
+{
+    enum { WIN = 16384 };
+    uint8_t *buf = malloc(WIN);
+    if (!buf) {
+        return false;
+    }
+    bool ok = false;
+    for (uint32_t base = from; !ok && base < end; base += WIN - 300) {
+        size_t n = 0;
+        if (fseek(f, base, SEEK_SET) == 0) {
+            n = fread(buf, 1, WIN, f);
+        }
+        for (size_t i = 0; i + 27 <= n; i++) {
+            if (buf[i] == 'O' && ogg_parse_page(buf + i, n - i, pg) && (!serial || pg->serial == serial)) {
+                pg->off = base + (uint32_t)i;
+                ok = pg->off < end;
+                break;
+            }
+        }
+        if (n < WIN) {
+            break;
+        }
+    }
+    free(buf);
+    return ok;
+}
+
+static uint32_t ogg_granule_ms(const media_info_t *mi, int64_t g)
+{
+    if (mi->ogg_opus) {
+        g -= mi->ogg_preskip;
+        return g > 0 ? (uint32_t)(g / 48) : 0;
+    }
+    return mi->sample_rate && g > 0 ? (uint32_t)((uint64_t)g * 1000 / mi->sample_rate) : 0;
+}
+
+/* Position (granule) de la dernière page du flux : lecture de la fin du fichier en une fois,
+ * recherche de la dernière page en partant de la fin (fenêtre agrandie si besoin). */
+static int64_t ogg_last_granule(FILE *f, const media_info_t *mi)
+{
+    int64_t result = -1;
+    for (uint32_t win = 16384; win <= 262144 && result < 0; win *= 4) {
+        uint32_t start = mi->audio_end > mi->audio_start + win ? mi->audio_end - win : mi->audio_start;
+        uint32_t len = mi->audio_end - start;
+        uint8_t *buf = malloc(len);
+        if (!buf) {
+            break;
+        }
+        size_t n = 0;
+        if (fseek(f, start, SEEK_SET) == 0) {
+            n = fread(buf, 1, len, f);
+        }
+        ogg_page_t pg;
+        for (size_t i = n >= 27 ? n - 27 : 0; n >= 27; i--) {
+            if (buf[i] == 'O' && ogg_parse_page(buf + i, n - i, &pg) && pg.serial == mi->ogg_serial &&
+                pg.granule != -1) {
+                result = pg.granule;
+                break;
+            }
+            if (i == 0) {
+                break;
+            }
+        }
+        free(buf);
+        if (start == mi->audio_start) {
+            break;
+        }
+    }
+    return result;
+}
+
+/*
+ * Commentaires Vorbis lus au fil de l'eau (paquet OpusTags ou "\x03vorbis") : les
+ * commentaires volumineux, typiquement une pochette METADATA_BLOCK_PICTURE de plusieurs
+ * centaines de Ko, sont sautés sans être lus.
+ */
+enum { VC_MAGIC, VC_VENDOR_LEN, VC_SKIP_VENDOR, VC_COUNT, VC_LEN, VC_DATA, VC_SKIP, VC_DONE };
+
+typedef struct {
+    int state;
+    uint8_t acc[8];
+    int acc_n;
+    uint32_t need;
+    uint32_t left; /* commentaires restants */
+    char cbuf[512];
+    uint32_t clen;
+} vc_stream_t;
+
+static void vc_next_comment(vc_stream_t *v)
+{
+    v->state = v->left-- > 0 ? VC_LEN : VC_DONE;
+    v->acc_n = 0;
+}
+
+static void vc_feed(vc_stream_t *v, media_info_t *mi, const uint8_t *d, size_t n)
+{
+    size_t i = 0;
+    while (i < n && v->state != VC_DONE) {
+        switch (v->state) {
+        case VC_MAGIC:
+            v->acc[v->acc_n++] = d[i++];
+            if (v->acc_n == 7 && memcmp(v->acc, "\x03vorbis", 7) == 0) {
+                v->state = VC_VENDOR_LEN;
+                v->acc_n = 0;
+            } else if (v->acc_n == 8) {
+                v->state = memcmp(v->acc, "OpusTags", 8) == 0 ? VC_VENDOR_LEN : VC_DONE;
+                v->acc_n = 0;
+            }
+            break;
+        case VC_VENDOR_LEN:
+        case VC_COUNT:
+        case VC_LEN:
+            v->acc[v->acc_n++] = d[i++];
+            if (v->acc_n == 4) {
+                uint32_t val = le32(v->acc);
+                v->acc_n = 0;
+                if (v->state == VC_VENDOR_LEN) {
+                    v->need = val;
+                    v->state = val ? VC_SKIP_VENDOR : VC_COUNT;
+                } else if (v->state == VC_COUNT) {
+                    v->left = val;
+                    vc_next_comment(v);
+                } else {
+                    v->clen = val;
+                    v->need = val;
+                    v->state = val < sizeof(v->cbuf) ? VC_DATA : VC_SKIP;
+                    if (val == 0) {
+                        vc_next_comment(v);
+                    }
+                }
+            }
+            break;
+        case VC_SKIP_VENDOR:
+        case VC_SKIP: {
+            size_t take = n - i < v->need ? n - i : v->need;
+            i += take;
+            v->need -= (uint32_t)take;
+            if (v->need == 0) {
+                if (v->state == VC_SKIP_VENDOR) {
+                    v->state = VC_COUNT;
+                    v->acc_n = 0;
+                } else {
+                    vc_next_comment(v);
+                }
+            }
+            break;
+        }
+        case VC_DATA: {
+            size_t take = n - i < v->need ? n - i : v->need;
+            memcpy(v->cbuf + (v->clen - v->need), d + i, take);
+            i += take;
+            v->need -= (uint32_t)take;
+            if (v->need == 0) {
+                vorbis_comment(mi, v->cbuf, v->clen);
+                vc_next_comment(v);
+            }
+            break;
+        }
+        }
+    }
+}
+
+static bool vc_skipping(const vc_stream_t *v, uint32_t n)
+{
+    return (v->state == VC_SKIP || v->state == VC_SKIP_VENDOR) && v->need >= n;
+}
+
+/* Saute n octets sans les lire (à n'appeler que si vc_skipping(v, n)). */
+static void vc_skip_bytes(vc_stream_t *v, uint32_t n)
+{
+    if (!vc_skipping(v, n)) {
+        return;
+    }
+    v->need -= n;
+    if (v->need == 0) {
+        if (v->state == VC_SKIP_VENDOR) {
+            v->state = VC_COUNT;
+            v->acc_n = 0;
+        } else {
+            vc_next_comment(v);
+        }
+    }
+}
+
+static void probe_ogg(FILE *f, media_info_t *mi)
+{
+    enum { PKT_CAP = 512, BODY_MAX = 255 * 255 };
+    uint8_t *pkt = malloc(PKT_CAP);
+    uint8_t *body = malloc(BODY_MAX);
+    vc_stream_t *vc = calloc(1, sizeof(vc_stream_t));
+    if (!pkt || !body || !vc) {
+        free(pkt);
+        free(body);
+        free(vc);
+        return;
+    }
+    /* Parcourt les pages d'en-tête jusqu'à la première page audio. Paquet 0 :
+     * identification ; paquet 1 : commentaires, lus au fil de l'eau. */
+    uint32_t off = 0;
+    size_t plen = 0;
+    int packet = 0;
+    ogg_page_t pg;
+    for (int guard = 0; guard < 4096 && off < mi->audio_end; guard++) {
+        uint8_t hdr[27 + 255];
+        size_t n = 0;
+        if (fseek(f, off, SEEK_SET) == 0) {
+            n = fread(hdr, 1, sizeof(hdr), f);
+        }
+        if (!ogg_parse_page(hdr, n, &pg)) {
+            break;
+        }
+        if (guard == 0) {
+            mi->ogg_serial = pg.serial;
+        }
+        if (pg.serial == mi->ogg_serial) {
+            /* Les en-têtes (2 paquets pour Opus, 3 pour Vorbis) se terminent en fin de page :
+             * la page suivante est la première page audio. */
+            int header_packets = mi->ogg_opus ? 2 : 3;
+            if (packet >= header_packets) {
+                mi->audio_start = off;
+                break;
+            }
+            uint32_t blen = pg.size - 27 - pg.nseg;
+            /* Inutile de lire une page entièrement couverte par un saut (pochette). */
+            bool read_body = packet == 0 || (packet == 1 && vc->state != VC_DONE && !vc_skipping(vc, blen));
+            if (read_body && (fseek(f, off + 27 + pg.nseg, SEEK_SET) != 0 || fread(body, 1, blen, f) != blen)) {
+                break;
+            }
+            uint32_t bp = 0;
+            for (int i = 0; i < pg.nseg; i++) {
+                uint32_t seg = pg.lacing[i];
+                if (packet == 0 && read_body && plen + seg <= PKT_CAP) {
+                    memcpy(pkt + plen, body + bp, seg);
+                    plen += seg;
+                } else if (packet == 1) {
+                    if (read_body) {
+                        vc_feed(vc, mi, body + bp, seg);
+                    } else {
+                        vc_skip_bytes(vc, seg);
+                    }
+                }
+                bp += seg;
+                if (seg < 255) { /* fin de paquet */
+                    if (packet == 0 && plen >= 19 && memcmp(pkt, "OpusHead", 8) == 0) {
+                        mi->ogg_opus = true;
+                        mi->ogg_preskip = (uint16_t)(pkt[10] | pkt[11] << 8);
+                        mi->sample_rate = 48000;
+                    } else if (packet == 0 && plen >= 16 && memcmp(pkt, "\x01vorbis", 7) == 0) {
+                        mi->sample_rate = le32(pkt + 12);
+                    }
+                    packet++;
+                    plen = 0;
+                }
+            }
+        }
+        off += pg.size;
+    }
+    free(pkt);
+    free(body);
+    free(vc);
+    if (!mi->audio_start || !mi->sample_rate) {
+        return;
+    }
+    int64_t last = ogg_last_granule(f, mi);
+    if (last > 0) {
+        mi->duration_ms = ogg_granule_ms(mi, last);
+        if (mi->duration_ms) {
+            mi->bitrate = (uint32_t)((uint64_t)(mi->audio_end - mi->audio_start) * 8 * 1000 / mi->duration_ms);
+            mi->seekable = true;
+        }
+    }
+}
+
+/*
+ * Recherche par dichotomie de la dernière page dont la position (granule) précède la
+ * cible ; la lecture reprend à la page suivante. Les en-têtes (OpusHead, OpusTags...)
+ * sont renvoyés d'abord au décodeur.
+ */
+static bool seek_ogg(FILE *f, const media_info_t *mi, uint32_t ms, media_seek_t *out)
+{
+    int64_t target = mi->ogg_opus ? (int64_t)ms * 48 + mi->ogg_preskip
+                                  : (int64_t)((uint64_t)ms * mi->sample_rate / 1000);
+    ogg_page_t pg, best = {0};
+    bool have_best = false;
+    uint32_t lo = mi->audio_start, hi = mi->audio_end;
+    for (int iter = 0; iter < 40 && hi - lo > 8192; iter++) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (!ogg_find_page(f, mid, hi, mi->ogg_serial, &pg)) {
+            hi = mid;
+            continue;
+        }
+        if (pg.granule != -1 && pg.granule <= target) {
+            best = pg;
+            have_best = true;
+            lo = pg.off + pg.size;
+        } else {
+            hi = mid;
+        }
+    }
+    /* Affinage linéaire sur les quelques pages restantes. */
+    uint32_t from = have_best ? best.off + best.size : mi->audio_start;
+    for (int i = 0; i < 64 && ogg_find_page(f, from, mi->audio_end, mi->ogg_serial, &pg); i++) {
+        if (pg.granule != -1 && pg.granule > target) {
+            break;
+        }
+        if (pg.granule != -1) {
+            best = pg;
+            have_best = true;
+        }
+        from = pg.off + pg.size;
+    }
+    if (!have_best) {
+        return false;
+    }
+    out->offset = best.off + best.size;
+    out->actual_ms = ogg_granule_ms(mi, best.granule);
+    out->header_end = mi->audio_start;
+    return out->offset < mi->audio_end;
+}
+
+/* ---- Point d'entrée ---- */
 
 bool media_probe(FILE *f, audio_fmt_t fmt, media_info_t *mi)
 {
@@ -524,7 +1070,7 @@ bool media_probe(FILE *f, audio_fmt_t fmt, media_info_t *mi)
         return false;
     }
     mi->audio_end = (uint32_t)size;
-    uint32_t id3 = parse_id3v2(f, mi);
+    uint32_t id3 = fmt == AUDIO_FMT_OGG ? 0 : parse_id3v2(f, mi);
     if (id3 > (uint32_t)size) {
         id3 = 0;
     }
@@ -532,6 +1078,7 @@ bool media_probe(FILE *f, audio_fmt_t fmt, media_info_t *mi)
     case AUDIO_FMT_MP3:
         parse_id3v1(f, mi, size);
         probe_mp3(f, mi, id3);
+        mi->seekable = mi->duration_ms > 0 && mi->audio_end > mi->audio_start;
         break;
     case AUDIO_FMT_FLAC:
         probe_flac(f, mi, id3);
@@ -539,20 +1086,17 @@ bool media_probe(FILE *f, audio_fmt_t fmt, media_info_t *mi)
     case AUDIO_FMT_WAV:
         probe_wav(f, mi);
         break;
+    case AUDIO_FMT_OGG:
+        probe_ogg(f, mi);
+        break;
     default:
         break;
     }
     return true;
 }
 
-uint32_t media_seek_offset(const media_info_t *mi, audio_fmt_t fmt, uint32_t ms)
+static bool seek_mp3(const media_info_t *mi, uint32_t ms, media_seek_t *out)
 {
-    if (fmt != AUDIO_FMT_MP3 || mi->duration_ms == 0 || mi->audio_end <= mi->audio_start) {
-        return 0;
-    }
-    if (ms >= mi->duration_ms) {
-        ms = mi->duration_ms - 1;
-    }
     uint32_t bytes = mi->audio_end - mi->audio_start;
     double frac = (double)ms / mi->duration_ms;
     double pos;
@@ -568,6 +1112,41 @@ uint32_t media_seek_offset(const media_info_t *mi, audio_fmt_t fmt, uint32_t ms)
     } else {
         pos = frac * bytes;
     }
-    uint32_t off = mi->audio_start + (uint32_t)pos;
-    return off > mi->audio_start ? off : mi->audio_start + 1;
+    out->offset = mi->audio_start + (uint32_t)pos; /* le décodeur se recale sur la trame suivante */
+    out->header_end = 0;
+    out->actual_ms = ms;
+    return true;
+}
+
+static bool seek_wav(const media_info_t *mi, uint32_t ms, media_seek_t *out)
+{
+    uint64_t bytes = (uint64_t)ms * mi->wav_byte_rate / 1000;
+    bytes -= bytes % mi->wav_block_align;
+    out->offset = mi->audio_start + (uint32_t)bytes;
+    out->header_end = mi->audio_start;
+    out->actual_ms = (uint32_t)(bytes * 1000 / mi->wav_byte_rate);
+    return out->offset < mi->audio_end;
+}
+
+bool media_seek(FILE *f, const media_info_t *mi, audio_fmt_t fmt, uint32_t ms, media_seek_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!mi->seekable || ms == 0) {
+        return false;
+    }
+    if (mi->duration_ms && ms >= mi->duration_ms) {
+        ms = mi->duration_ms - 1;
+    }
+    switch (fmt) {
+    case AUDIO_FMT_MP3:
+        return seek_mp3(mi, ms, out);
+    case AUDIO_FMT_FLAC:
+        return f && seek_flac(f, mi, ms, out);
+    case AUDIO_FMT_WAV:
+        return seek_wav(mi, ms, out);
+    case AUDIO_FMT_OGG:
+        return f && seek_ogg(f, mi, ms, out);
+    default:
+        return false;
+    }
 }

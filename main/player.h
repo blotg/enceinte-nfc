@@ -44,6 +44,7 @@ typedef struct {
     bool consume;
     uint8_t single; /* 0, 1, 2 = "oneshot" */
     bool seekable;
+    uint32_t paused_s; /* durée de la pause en cours */
     char file[REL_PATH_MAX];
     char error[96];
 } player_status_t;

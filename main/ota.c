@@ -24,6 +24,7 @@
 #include "player.h"
 #include "settings.h"
 #include "util.h"
+#include "web_server.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "ota";
@@ -222,7 +223,9 @@ static bool device_idle(void)
     player_get_status(&ps);
     controller_status_t cs;
     controller_get_status(&cs);
-    return ps.state == PLAYER_STOPPED && cs.resume_remaining_s == 0 && !cs.present_uid[0];
+    /* Une pause longue (reprise « toujours ») ne bloque pas les mises à jour indéfiniment. */
+    return !cs.present_uid[0] && !web_server_busy() &&
+           (ps.state == PLAYER_STOPPED || (ps.state == PLAYER_PAUSED && ps.paused_s >= 2 * 3600));
 }
 
 static void install(const char *bin_url, const char *expected_version)
@@ -320,7 +323,8 @@ static void ota_task(void *arg)
         ESP_LOGI(TAG, "version %s disponible", version);
         /* Ne jamais couper la musique : attendre que l'enceinte soit inactive. */
         while (!device_idle()) {
-            set_state(OTA_WAITING_IDLE, 0, "version %s disponible, installation dès la fin de la lecture", version);
+            set_state(OTA_WAITING_IDLE, 0, "version %s disponible, installation dès que l'enceinte sera inactive",
+                      version);
             if (xEventGroupWaitBits(s_ev, BIT_CHECK, pdFALSE, pdFALSE, pdMS_TO_TICKS(IDLE_POLL_MS)) & BIT_CHECK) {
                 break; /* nouvelle vérification demandée */
             }

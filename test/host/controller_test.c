@@ -15,14 +15,41 @@
 int g_failures;
 int g_checks;
 
-/* Associations simulées */
-bool cards_lookup(const char *uid, char *folder, size_t len)
+void mock_set_resume(uint32_t timeout_s, bool after_other);
+
+/* Associations simulées ; la carte EE reprend même après une autre carte (réglage propre). */
+bool cards_get(const char *uid, card_entry_t *out)
 {
-    const char *f = strcmp(uid, "AA") == 0 ? "Histoire" : strcmp(uid, "BB") == 0 ? "Comptines" : NULL;
-    if (f) {
-        snprintf(folder, len, "%s", f);
+    const char *f = strcmp(uid, "AA") == 0   ? "Histoire"
+                    : strcmp(uid, "BB") == 0 ? "Comptines"
+                    : strcmp(uid, "EE") == 0 ? "Livre"
+                                             : NULL;
+    if (!f) {
+        return false;
     }
-    return f != NULL;
+    snprintf(out->uid, sizeof(out->uid), "%s", uid);
+    snprintf(out->folder, sizeof(out->folder), "%s", f);
+    out->resume_s = CARD_DEFAULT;
+    out->resume_other = strcmp(uid, "EE") == 0 ? 1 : CARD_DEFAULT;
+    return true;
+}
+
+static bool copy_file(const char *from, const char *to)
+{
+    FILE *a = fopen(from, "rb"), *b = fopen(to, "wb");
+    char buf[65536];
+    size_t n;
+    bool ok = a && b;
+    while (ok && (n = fread(buf, 1, sizeof(buf), a)) > 0) {
+        ok = fwrite(buf, 1, n, b) == n;
+    }
+    if (a) {
+        fclose(a);
+    }
+    if (b) {
+        fclose(b);
+    }
+    return ok;
 }
 
 static player_status_t status(void)
@@ -120,7 +147,7 @@ int main(int argc, char **argv)
     CHECK(wait_state(PLAYER_PAUSED, 1000));
     uint32_t e2 = status().elapsed_ms;
     card(true, "CC");
-    CHECK(wait_state(PLAYER_STOPPED, 1000));
+    CHECK(status().state == PLAYER_PAUSED); /* la carte inconnue ne touche pas au lecteur */
     controller_get_status(&cs);
     CHECK_STR(cs.last_unknown_uid, "CC");
     card(false, "CC");
@@ -179,6 +206,60 @@ int main(int argc, char **argv)
     card(true, "AA"); /* la carte d'association ne compte pas comme « autre carte » */
     CHECK(wait_state(PLAYER_PLAYING, 1000));
     CHECK(status().elapsed_ms > 1000);
+
+    /* 10. Délai « toujours » : la carte reprend même après le délai habituel */
+    card(false, "AA");
+    CHECK(wait_state(PLAYER_PAUSED, 1000));
+    uint32_t e5 = status().elapsed_ms;
+    mock_set_resume(0, false);
+    usleep(3200000); /* plus que les 2 s du réglage par défaut */
+    CHECK(status().state == PLAYER_PAUSED);
+    controller_get_status(&cs);
+    CHECK(cs.resume_remaining_s == -1);
+    card(true, "AA");
+    CHECK(wait_state(PLAYER_PLAYING, 1000));
+    CHECK(status().elapsed_ms >= e5);
+    mock_set_resume(2, false);
+
+    /* 11. Reprise après une autre carte (réglage de la carte EE) : le dossier est rechargé et
+     *     la lecture repart au morceau et à la position mémorisés, dans un vrai fichier WAV. */
+    if (argc > 1) {
+        char src[512];
+        snprintf(p, sizeof(p), "%s/Livre", sd);
+        mkdir(p, 0755);
+        snprintf(src, sizeof(src), "%s/long.wav", argv[1]);
+        snprintf(p, sizeof(p), "%s/Livre/1.wav", sd);
+        CHECK(copy_file(src, p));
+        snprintf(p, sizeof(p), "%s/Livre/2.wav", sd);
+        CHECK(copy_file(src, p));
+        card(false, "AA");
+        card(true, "EE");
+        CHECK(wait_state(PLAYER_PLAYING, 1000));
+        usleep(350000);
+        card(false, "EE");
+        CHECK(wait_state(PLAYER_PAUSED, 1000));
+        player_status_t before = status();
+        CHECK_STR(before.file, "Livre/1.wav");
+        CHECK(before.elapsed_ms > 5000);
+        card(true, "BB"); /* autre carte : la file est remplacée */
+        CHECK(wait_state(PLAYER_PLAYING, 1000));
+        CHECK(strncmp(status().file, "Comptines/", 10) == 0);
+        card(false, "BB");
+        controller_on_nfc(true, "EE");
+        usleep(60000);
+        player_status_t after = status();
+        CHECK(after.state == PLAYER_PLAYING);
+        CHECK_STR(after.file, "Livre/1.wav");
+        CHECK(after.elapsed_ms + 50 >= before.elapsed_ms && after.elapsed_ms < before.elapsed_ms + 3000);
+        /* la carte AA (réglage général) recommence, elle, au début */
+        card(false, "EE");
+        card(true, "AA");
+        CHECK(wait_state(PLAYER_PLAYING, 1000));
+        CHECK_STR(status().file, "Histoire/1 debut.mp3");
+        CHECK(status().elapsed_ms < 5000);
+    } else {
+        printf("(scénario de reprise après une autre carte ignoré : fichiers d'exemple absents)\n");
+    }
 
     printf("contrôleur : %d vérifications, %d échec(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

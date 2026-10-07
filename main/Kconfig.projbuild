@@ -66,8 +66,10 @@ menu "Enceinte"
             default "Enceinte"
 
         config ENC_RESUME_TIMEOUT_S
-            int "Délai de reprise après retrait de la carte (s)"
+            int "Délai de reprise après retrait de la carte (s), par défaut"
             default 600
+            help
+                Valeur initiale, modifiable dans l'interface web (0 = toujours reprendre).
 
         config ENC_DEFAULT_VOLUME
             int "Volume par défaut (0-100)"

@@ -5,6 +5,7 @@
 #  3. intégration MPD : vrai lecteur + vrai serveur pilotés par python-mpd2.
 # Tout est compilé avec AddressSanitizer et UndefinedBehaviorSanitizer.
 #
+# Fichiers audio d'exemple générés avec ffmpeg (libopus, libvorbis), lame et flac.
 # Usage : test/host/run_tests.sh [dossier_de_travail]
 #   PYTHON=/chemin/vers/python (avec python-mpd2) pour l'étape 3.
 set -euo pipefail
@@ -33,16 +34,25 @@ gen_fixtures() {
         --ty 1999 --tn 7 "$FIX/tone.wav" "$FIX/v1.mp3"
     ffmpeg "${q[@]}" -i "$FIX/tone.wav" -c:a flac -metadata "title=Titre FLAC" -metadata "artist=Artiste FLAC" \
         -metadata "track=5" "$FIX/tone.flac"
-    head -c 20000 /dev/urandom > "$FIX/garbage.mp3"
+    ffmpeg "${q[@]}" -f lavfi -i "sine=frequency=330:duration=30:sample_rate=44100" -ac 2 "$FIX/long.wav"
+    ffmpeg "${q[@]}" -i "$FIX/long.wav" -c:a libopus -b:a 96k -metadata "title=Chouette hulotte" \
+        -metadata "artist=Oiseaux de France" "$FIX/long.opus"
+    ffmpeg "${q[@]}" -i "$FIX/long.wav" -c:a libvorbis -q:a 3 -metadata "title=Merle noir" "$FIX/long.ogg"
+    # Opus dont les métadonnées commencent par une « pochette » de 400 Ko
+    python3 -c "import base64, os; print(';FFMETADATA1'); print('METADATA_BLOCK_PICTURE=' + base64.b64encode(os.urandom(300000)).decode()); print('title=Grosse pochette')" > "$FIX/bigtags.txt"
+    ffmpeg "${q[@]}" -i "$FIX/long.wav" -i "$FIX/bigtags.txt" -map_metadata 1 -c:a libopus -b:a 64k "$FIX/bigtags.opus"
+    flac --silent --force -S 2s -T "TITLE=Rouge-gorge" -o "$FIX/long_seektable.flac" "$FIX/long.wav"
+    flac --silent --force -S- -o "$FIX/long_noseektable.flac" "$FIX/long.wav"
+    python3 -c "import random, sys; random.seed(1234); sys.stdout.buffer.write(bytes(random.getrandbits(8) for _ in range(20000)))" > "$FIX/garbage.mp3"
     printf 'ID3\x03\x00\x00\x7f\x7f\x7f\x7f' > "$FIX/truncated.mp3"
 }
 
 HAVE_MEDIA=0
-if command -v ffmpeg > /dev/null && command -v lame > /dev/null; then
+if command -v ffmpeg > /dev/null && command -v lame > /dev/null && command -v flac > /dev/null; then
     gen_fixtures
     HAVE_MEDIA=1
 else
-    echo "ffmpeg/lame absents : tests utilisant des fichiers audio ignorés"
+    echo "ffmpeg/lame/flac absents : tests utilisant des fichiers audio ignorés"
 fi
 
 echo "== 1. Tests unitaires"
@@ -57,7 +67,11 @@ gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd_ctrl\"" -DCONFIG_ENC_RESUME_TIMEOUT_
     -I"$HERE/stubs" -I"$MAIN" -I"$HERE" "$HERE/controller_test.c" "$HERE/shims.c" "$HERE/mocks.c" \
     "$MAIN/controller.c" "$MAIN/session.c" "$MAIN/player.c" "$MAIN/media_info.c" "$MAIN/util.c" \
     "$MAIN/changes.c" -lm -o "$WORK/controller_test"
-ASAN_OPTIONS=detect_leaks=0 "$WORK/controller_test"
+if [ $HAVE_MEDIA = 1 ]; then
+    ASAN_OPTIONS=detect_leaks=0 "$WORK/controller_test" "$FIX"
+else
+    ASAN_OPTIONS=detect_leaks=0 "$WORK/controller_test"
+fi
 
 echo "== 3. Intégration MPD"
 if [ $HAVE_MEDIA = 1 ] && "$PY" -c "import mpd" 2> /dev/null; then

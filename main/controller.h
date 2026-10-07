@@ -17,7 +17,7 @@ typedef struct {
     char last_unknown_uid[UID_STR_MAX];
     char session_uid[UID_STR_MAX];
     char session_folder[REL_PATH_MAX];
-    int resume_remaining_s;            /* > 0 : la carte retirée peut reprendre */
+    int resume_remaining_s;            /* > 0 : secondes restantes pour reprendre ; -1 : sans limite */
 } controller_status_t;
 
 esp_err_t controller_start(void);

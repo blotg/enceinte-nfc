@@ -50,6 +50,25 @@ typedef struct {
 } web_session_t;
 
 static web_session_t s_sessions[MAX_SESSIONS];
+static volatile int s_transfers; /* envois en cours */
+static volatile int64_t s_last_transfer_us;
+
+bool web_server_busy(void)
+{
+    /* Le navigateur envoie les fichiers l'un après l'autre : on attend aussi un peu après le dernier. */
+    return s_transfers > 0 || (s_last_transfer_us && esp_timer_get_time() - s_last_transfer_us < 5LL * 60 * 1000000);
+}
+
+static void transfer_begin(void)
+{
+    __atomic_add_fetch(&s_transfers, 1, __ATOMIC_SEQ_CST);
+}
+
+static void transfer_end(void)
+{
+    s_last_transfer_us = esp_timer_get_time();
+    __atomic_sub_fetch(&s_transfers, 1, __ATOMIC_SEQ_CST);
+}
 static int s_login_failures;
 static int64_t s_login_blocked_until;
 
@@ -560,6 +579,16 @@ static esp_err_t h_cards_get(httpd_req_t *req)
         cJSON_AddStringToObject(e, "uid", list[i].uid);
         cJSON_AddStringToObject(e, "folder", list[i].folder);
         cJSON_AddBoolToObject(e, "exists", storage_is_dir(list[i].folder));
+        if (list[i].resume_s >= 0) {
+            cJSON_AddNumberToObject(e, "resume_s", list[i].resume_s);
+        } else {
+            cJSON_AddNullToObject(e, "resume_s");
+        }
+        if (list[i].resume_other >= 0) {
+            cJSON_AddBoolToObject(e, "resume_other", list[i].resume_other == 1);
+        } else {
+            cJSON_AddNullToObject(e, "resume_other");
+        }
         cJSON_AddItemToArray(arr, e);
     }
     free(list);
@@ -594,14 +623,24 @@ static esp_err_t h_cards_set(httpd_req_t *req)
     cJSON *body = read_json(req);
     const char *uid = json_str(body, "uid");
     const char *folder = json_str(body, "folder");
-    char norm[REL_PATH_MAX];
+    /* Réglages de reprise propres à la carte : absent ou null = réglage général. */
+    const cJSON *rs = cJSON_GetObjectItem(body, "resume_s");
+    const cJSON *ro = cJSON_GetObjectItem(body, "resume_other");
+    card_entry_t e = {.resume_s = CARD_DEFAULT, .resume_other = CARD_DEFAULT};
+    if (cJSON_IsNumber(rs) && rs->valuedouble >= 0 && rs->valuedouble <= 30 * 24 * 3600) {
+        e.resume_s = (int32_t)rs->valuedouble;
+    }
+    if (cJSON_IsBool(ro)) {
+        e.resume_other = cJSON_IsTrue(ro) ? 1 : 0;
+    }
     esp_err_t err = ESP_ERR_INVALID_ARG;
     const char *msg = "carte ou dossier invalide";
-    if (uid && folder && uid_valid(uid) && path_sanitize(folder, norm, sizeof(norm)) && norm[0]) {
-        if (!storage_is_dir(norm)) {
+    if (uid && folder && uid_valid(uid) && path_sanitize(folder, e.folder, sizeof(e.folder)) && e.folder[0]) {
+        if (!storage_is_dir(e.folder)) {
             msg = "dossier introuvable";
         } else {
-            err = cards_set(uid, norm);
+            str_copy(e.uid, uid, sizeof(e.uid));
+            err = cards_set(&e);
             msg = "enregistrement impossible";
         }
     }
@@ -735,6 +774,7 @@ static esp_err_t h_upload(httpd_req_t *req)
     if (fd < 0) {
         return send_error(req, "500 Internal Server Error", "écriture impossible");
     }
+    transfer_begin();
     uint8_t *buf = heap_caps_malloc(UPLOAD_BUF, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!buf) {
         buf = malloc(UPLOAD_BUF);
@@ -762,6 +802,7 @@ static esp_err_t h_upload(httpd_req_t *req)
     if (close(fd) != 0) {
         ok = false;
     }
+    transfer_end();
     if (ok) {
         unlink(abs); /* remplacement d'un fichier existant */
         ok = rename(part, abs) == 0;
@@ -845,6 +886,8 @@ static esp_err_t h_settings_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "ota_url", cfg.ota_url);
     cJSON_AddNumberToObject(root, "ota_interval_h", cfg.ota_interval_h);
     cJSON_AddNumberToObject(root, "max_volume", cfg.max_volume);
+    cJSON_AddNumberToObject(root, "resume_s", cfg.resume_timeout_s);
+    cJSON_AddBoolToObject(root, "resume_after_other", cfg.resume_after_other);
     cJSON_AddBoolToObject(root, "mpd_password_set", cfg.mpd_pass_set);
     cJSON_AddNumberToObject(root, "mpd_port", CONFIG_ENC_MPD_PORT);
     return send_json(req, root);
@@ -880,6 +923,16 @@ static esp_err_t h_settings_set(httpd_req_t *req)
         }
         if (url && url[0] && strcmp(url, cfg.ota_url) != 0) {
             ota_check_now();
+        }
+    }
+    const cJSON *rs = cJSON_GetObjectItem(body, "resume_s");
+    const cJSON *ro = cJSON_GetObjectItem(body, "resume_after_other");
+    if (cJSON_IsNumber(rs) || cJSON_IsBool(ro)) {
+        uint32_t timeout = cJSON_IsNumber(rs) && rs->valuedouble >= 0 ? (uint32_t)rs->valuedouble : cfg.resume_timeout_s;
+        bool other = cJSON_IsBool(ro) ? cJSON_IsTrue(ro) : cfg.resume_after_other;
+        if ((cJSON_IsNumber(rs) && rs->valuedouble < 0) || settings_set_resume(timeout, other) != ESP_OK) {
+            cJSON_Delete(body);
+            return send_error(req, "400 Bad Request", "délai de reprise invalide (30 jours maximum)");
         }
     }
     const cJSON *maxv = cJSON_GetObjectItem(body, "max_volume");

@@ -16,6 +16,8 @@ typedef struct {
     char wifi_pass[65];
     char ota_url[256];
     uint16_t ota_interval_h;
+    uint32_t resume_timeout_s; /* délai de reprise après retrait, 0 = toujours */
+    bool resume_after_other;   /* reprendre même si une autre carte a été posée entre-temps */
     uint8_t volume;     /* 0-100, dernier volume utilisé */
     uint8_t max_volume; /* 1-100 */
     bool admin_set;     /* false = sortie d'usine, assistant de configuration */
@@ -29,6 +31,7 @@ esp_err_t settings_set_hostname(const char *hostname);
 esp_err_t settings_set_wifi(const char *ssid, const char *pass);
 esp_err_t settings_set_ota(const char *url, uint16_t interval_h);
 esp_err_t settings_set_max_volume(uint8_t max_volume);
+esp_err_t settings_set_resume(uint32_t timeout_s, bool after_other);
 /* Enregistrement différé (évite d'user la flash quand le volume bouge beaucoup). */
 void settings_set_volume_deferred(uint8_t volume);
 

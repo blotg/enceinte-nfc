@@ -113,6 +113,12 @@ esp_err_t settings_init(void)
         if (nvs_get_u8(h, "max_vol", &s_cfg.max_volume) != ESP_OK) {
             s_cfg.max_volume = CONFIG_ENC_DEFAULT_MAX_VOLUME;
         }
+        if (nvs_get_u32(h, "resume_s", &s_cfg.resume_timeout_s) != ESP_OK) {
+            s_cfg.resume_timeout_s = CONFIG_ENC_RESUME_TIMEOUT_S;
+        }
+        uint8_t other = 0;
+        nvs_get_u8(h, "resume_other", &other);
+        s_cfg.resume_after_other = other != 0;
         s_cfg.admin_set = blob_exists(h, "admin_pw");
         s_cfg.mpd_pass_set = blob_exists(h, "mpd_pw");
         nvs_close(h);
@@ -123,6 +129,7 @@ esp_err_t settings_init(void)
         s_cfg.ota_interval_h = CONFIG_ENC_OTA_DEFAULT_INTERVAL_H;
         s_cfg.volume = CONFIG_ENC_DEFAULT_VOLUME;
         s_cfg.max_volume = CONFIG_ENC_DEFAULT_MAX_VOLUME;
+        s_cfg.resume_timeout_s = CONFIG_ENC_RESUME_TIMEOUT_S;
     }
     if (s_cfg.max_volume == 0 || s_cfg.max_volume > 100) {
         s_cfg.max_volume = 100;
@@ -229,6 +236,33 @@ esp_err_t settings_set_max_volume(uint8_t max_volume)
     if (err == ESP_OK) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_cfg.max_volume = max_volume;
+        xSemaphoreGive(s_lock);
+    }
+    return err;
+}
+
+esp_err_t settings_set_resume(uint32_t timeout_s, bool after_other)
+{
+    if (timeout_s > 30 * 24 * 3600) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = open_ns(NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u32(h, "resume_s", timeout_s);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, "resume_other", after_other ? 1 : 0);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_cfg.resume_timeout_s = timeout_s;
+        s_cfg.resume_after_other = after_other;
         xSemaphoreGive(s_lock);
     }
     return err;

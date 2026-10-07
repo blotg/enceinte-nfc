@@ -98,6 +98,8 @@ p { margin: 6px 0; }
 
 label { display: block; font-size: 14px; font-weight: 600; margin: 12px 0 4px; }
 label .muted { font-weight: 400; }
+label.check { display: flex; align-items: center; gap: 10px; font-weight: 500; margin-top: 14px; }
+label.check input { width: 20px; height: 20px; accent-color: var(--accent); flex: none; }
 
 input[type=text], input[type=password], input[type=number], input[type=url], select {
   width: 100%;

@@ -3,7 +3,8 @@
 On pose une carte NFC sur l'enceinte : elle joue le dossier de la carte SD associé à
 cette carte. On retire la carte : pause. On la repose dans les 10 minutes (sans avoir
 posé d'autre carte entre-temps, et si la playlist n'était pas finie) : la lecture
-reprend où elle s'était arrêtée. Sinon, elle recommence au début.
+reprend où elle s'était arrêtée. Sinon, elle recommence au début. Le délai et la règle
+« autre carte » se règlent globalement et carte par carte.
 
 Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 
@@ -12,7 +13,7 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Fonction demandée | État | Remarques |
 |---|---|---|
 | Carte NFC → lecture d'un dossier | ✅ | MP3, AAC, M4A, FLAC, WAV, OGG/Opus. Sous-dossiers inclus, ordre « naturel » (2 avant 10). |
-| Pause au retrait, reprise sous 10 min | ✅ | Règle exacte de la demande. Une carte inconnue compte comme « une autre carte ». |
+| Pause au retrait, reprise sous 10 min | ✅ | Délai réglable (0 = toujours) et reprise possible même après une autre carte, en réglage général ou carte par carte. Une carte inconnue compte comme « une autre carte ». |
 | Association dossier ↔ carte par l'interface web | ✅ | Mode association : la carte posée est capturée sans lancer la musique. Dossiers nommés librement (accents, espaces). |
 | Dépôt de fichiers par l'interface web | ✅ | Fichiers ou dossiers entiers, glisser-déposer. Débit limité par la carte SD en SPI. |
 | Mises à jour automatiques | ✅ | Depuis les releases GitHub (ou votre serveur), au démarrage (+1 min) et toutes les N heures. Installation seulement quand l'enceinte est inactive. Retour automatique à l'ancienne version si la nouvelle ne démarre pas. |
@@ -27,7 +28,9 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 
 - L'interface web est en **HTTP** : un certificat HTTPS sur un objet local déclencherait des
   alertes du navigateur. Le mot de passe circule donc en clair sur le réseau local.
-- **Recherche de position (seek) : MP3 seulement.** Le décodeur d'Espressif ne lit qu'en continu.
+- **Reprise en cours de morceau et recherche de position : MP3, FLAC, Opus, Vorbis, WAV.**
+  Pas en AAC ni M4A : le morceau y reprend à son début. Le décodeur d'Espressif ne lit
+  qu'en continu ; le firmware lui renvoie l'en-tête du fichier puis saute à la position voulue.
 - **M4A** : seulement les fichiers « optimisés pour le streaming » (`moov` avant `mdat`).
 - **Carte SD en FAT32** : exFAT n'est pas pris en charge par ESP-IDF. Reformater les cartes de plus
   de 32 Go en FAT32.
@@ -116,15 +119,32 @@ changer celui-ci de canal.
   renommer, supprimer, écouter un dossier sans carte.
 - **MPD** : serveur `enceinte.local`, port 6600, dans M.A.L.P. (Android), mpc, Cantata,
   ncmpcpp, Rigelian (iOS)… Mot de passe facultatif dans *Réglages*.
-  Pris en charge : lecture, pause, morceau suivant ou précédent, recherche de position (MP3),
+  Pris en charge : lecture, pause, morceau suivant ou précédent, recherche de position,
   volume, aléatoire, répétition, single, consume. Aussi la file d'attente (`add`, `delete`,
   `move`, `swap`, `playlistinfo`, `plchanges`…), le parcours de la carte (`lsinfo`,
   `listall[info]`, `listfiles`), `list`/`find`/`search`/`count` (filtres classiques et
   expressions), `idle`/`noidle`, les listes de commandes et `albumart` (`cover.jpg`/`.png`
   dans le dossier).
 
-Une commande MPD ou web qui modifie la file d'attente détache la carte : la reposer
-recommence alors son dossier au début.
+### Reprise d'une carte
+
+Retirer une carte met en pause et mémorise sa position (morceau et instant, pour les
+16 dernières cartes). Reposée, la carte reprend si sa playlist n'était pas finie et si :
+
+- le **délai** n'est pas dépassé : 10 min par défaut, 0 = toujours ;
+- aucune **autre carte** n'a été posée entre-temps, sauf si la règle « reprendre même si
+  une autre carte a été posée » est active : le dossier est alors rechargé et la lecture
+  repart au morceau et à l'instant mémorisés.
+
+Ces deux réglages se trouvent dans *Réglages → Reprise de la lecture*. Chaque carte peut
+les remplacer (*Cartes → ✎*), par exemple « toujours reprendre » pour un livre audio.
+Une commande MPD ou web qui modifie la file d'attente compte comme une autre carte.
+Les positions sont gardées en mémoire vive : elles sont perdues en cas de coupure de
+courant ou de redémarrage.
+
+Une mise à jour automatique attend que l'enceinte soit inactive : pas de carte posée, pas
+d'envoi de fichiers (ni dans les 5 dernières minutes), et lecture arrêtée ou en pause
+depuis plus de 2 heures.
 
 ## Mises à jour du firmware
 

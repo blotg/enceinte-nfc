@@ -1,9 +1,14 @@
 #pragma once
 /*
- * Règle de reprise d'une carte (logique pure, testée sur PC) :
- * une carte retirée met en pause. Si elle est reposée dans le délai, qu'aucune
- * autre carte n'a été posée entre-temps et que la playlist n'est pas terminée,
- * la lecture reprend ; sinon elle recommence au début.
+ * Règles de reprise d'une carte (logique pure, testée sur PC).
+ *
+ * Retirer une carte met en pause et mémorise son point de reprise (morceau, position).
+ * Reposée, elle reprend si :
+ *  - sa playlist n'était pas terminée ;
+ *  - le délai n'est pas dépassé (délai 0 = toujours) ;
+ *  - aucune autre carte n'a été posée entre-temps, sauf si la règle de la carte
+ *    autorise la reprise après une autre carte.
+ * Sinon, elle recommence au début de son dossier.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,21 +22,40 @@ typedef enum {
 } sess_player_state_t;
 
 typedef struct {
-    char uid[UID_STR_MAX];  /* "" = aucune session */
-    uint32_t queue_version; /* version de la file au chargement : détecte une modification extérieure */
-    bool finished;          /* playlist jouée jusqu'au bout */
-    bool removed;
+    uint32_t timeout_s; /* 0 = toujours reprendre */
+    bool after_other;   /* reprendre même si une autre carte a été posée entre-temps */
+} resume_policy_t;
+
+typedef struct {
+    char uid[UID_STR_MAX];   /* "" = emplacement libre */
+    char folder[REL_PATH_MAX];
+    char track[REL_PATH_MAX]; /* morceau en cours au retrait */
+    uint32_t position_ms;
+    uint32_t queue_version;   /* version de la file pendant que la carte jouait */
+    uint32_t card_seq;        /* numéro de la dernière pose de cette carte */
     int64_t removed_at_us;
-} card_session_t;
+    bool removed;
+    bool finished;            /* playlist jouée jusqu'au bout */
+} resume_point_t;
 
 typedef enum {
-    SESSION_START_NEW,
-    SESSION_RESUME,
-    SESSION_NOTHING, /* déjà en lecture */
+    SESSION_START_NEW,   /* recommencer au début du dossier */
+    SESSION_RESUME_LIVE, /* le lecteur est encore en pause sur cette carte : reprise immédiate */
+    SESSION_RESUME_SEEK, /* recharger le dossier, reprendre au morceau et à la position mémorisés */
+    SESSION_NOTHING,     /* déjà en lecture */
 } session_action_t;
 
-session_action_t session_on_card(const card_session_t *s, const char *uid, int64_t now_us, uint32_t queue_version,
-                                 sess_player_state_t player, int64_t timeout_us);
+/*
+ * p : point de reprise de la carte (NULL si aucun).
+ * queue_version / player : état actuel du lecteur.
+ * card_seq_now : numéro de la pose en cours (incrémenté à chaque carte posée).
+ */
+session_action_t session_decide(const resume_point_t *p, const resume_policy_t *pol, int64_t now_us,
+                                uint32_t queue_version, sess_player_state_t player, uint32_t card_seq_now);
 
-/* Vrai si la session en pause a dépassé le délai de reprise. */
-bool session_expired(const card_session_t *s, int64_t now_us, int64_t timeout_us);
+/* Vrai si le point de reprise a dépassé son délai. */
+bool session_expired(const resume_point_t *p, const resume_policy_t *pol, int64_t now_us);
+
+/* Règle effective d'une carte : réglage de la carte, sinon réglage général. */
+resume_policy_t session_policy(int32_t card_resume_s, int8_t card_resume_other, uint32_t default_timeout_s,
+                               bool default_after_other);

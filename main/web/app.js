@@ -90,6 +90,15 @@ function fmtSize(b) {
   return b.toFixed(b < 10 ? 1 : 0).replace('.', ',') + ' ' + u[i];
 }
 
+function fmtDelay(s) {
+  if (!s) return 'toujours';
+  if (s < 3600) return Math.round(s / 60) + ' min';
+  const hh = s / 3600;
+  return (Number.isInteger(hh) ? hh : hh.toFixed(1).replace('.', ',')) + ' h';
+}
+
+const DELAY_CHOICES = [0, 60, 300, 600, 1800, 3600, 10800, 86400];
+
 function joinPath(a, b) { return a ? a + '/' + b : b; }
 function baseName(p) { return p.split('/').pop(); }
 
@@ -402,7 +411,9 @@ function renderPlay() {
     else if (c.present && c.present === c.last_unknown && c.present !== c.session) {
       text = `Carte inconnue (${c.present}). Associez-la dans l'onglet Cartes.`; cls += ' warn';
     } else if (c.present && c.session === c.present) text = `Carte posée : ${c.folder}`;
-    else if (c.resume_remaining > 0) {
+    else if (c.resume_remaining < 0) {
+      text = 'Carte retirée : reposez-la pour reprendre où vous en étiez.';
+    } else if (c.resume_remaining > 0) {
       text = `Carte retirée : reposez-la avant ${fmtTime(c.resume_remaining)} pour reprendre où vous en étiez.`;
     } else if (!st.sd.mounted) { text = 'Carte SD absente ou illisible.'; cls += ' bad'; }
     else text = 'Posez une carte sur l\'enceinte pour écouter sa musique.';
@@ -443,29 +454,36 @@ function folderSelect(folders, current) {
 }
 
 async function renderCards() {
-  const [data, folders] = await Promise.all([api('/api/cards'), topFolders().catch(() => [])]);
+  const [data, folders, defaults] = await Promise.all([api('/api/cards'), topFolders().catch(() => []),
+    api('/api/settings').catch(() => ({ resume_s: 600, resume_after_other: false }))]);
   const list = h('ul', { class: 'list' });
   if (!data.cards.length) list.append(h('li', { class: 'muted' }, 'Aucune carte associée pour l\'instant.'));
   for (const c of data.cards) {
-    const del = h('button', { class: 'small danger' }, 'Supprimer');
+    const del = h('button', { class: 'small danger', 'aria-label': 'Supprimer', title: 'Supprimer' }, '✕');
     del.addEventListener('click', () => {
       if (!confirm(`Supprimer l'association de la carte ${c.uid} ?`)) return;
       busy(del, async () => { await post('/api/cards/delete', { uid: c.uid }); toast('Association supprimée'); renderCards(); });
     });
-    const edit = h('button', { class: 'small' }, 'Modifier');
-    edit.addEventListener('click', () => learnFlow(c.folder, c.uid, folders));
+    const edit = h('button', { class: 'small', 'aria-label': 'Modifier', title: 'Modifier' }, '✎');
+    edit.addEventListener('click', () => learnFlow(c.folder, c.uid, folders, c, defaults));
+    const rules = [];
+    if (c.resume_s !== null && c.resume_s !== undefined) rules.push(`reprise : ${fmtDelay(c.resume_s)}`);
+    if (c.resume_other !== null && c.resume_other !== undefined) {
+      rules.push(c.resume_other ? 'reprend même après une autre carte' : 'recommence après une autre carte');
+    }
     list.append(h('li', null,
       h('span', { class: 'ico' }, '▣'),
       h('div', { class: 'name' },
         c.folder, !c.exists ? h('span', { class: 'error-text small' }, '  (dossier introuvable)') : null,
-        h('small', { class: 'mono' }, c.uid)),
+        h('small', { class: 'mono' }, c.uid),
+        rules.length ? h('small', null, rules.join(' · ')) : null),
       edit, del));
   }
   const add = h('button', { class: 'primary' }, '+ Associer une carte');
-  add.addEventListener('click', () => learnFlow('', '', folders));
+  add.addEventListener('click', () => learnFlow('', '', folders, null, defaults));
   const quick = data.present && !data.cards.some((c) => c.uid === data.present)
     ? h('div', { class: 'notice warn' }, `Une carte inconnue est posée (${data.present}). `,
-        h('button', { class: 'linkish', onclick: () => learnFlow('', data.present, folders) }, 'L\'associer'))
+        h('button', { class: 'linkish', onclick: () => learnFlow('', data.present, folders, null, defaults) }, 'L\'associer'))
     : null;
   setKids(root, 
     !data.reader_ok ? h('div', { class: 'notice bad' }, 'Lecteur NFC non détecté.') : null,
@@ -480,7 +498,7 @@ async function renderCards() {
  * Association : capture d'une carte (mode association de l'enceinte, la musique ne
  * démarre pas) puis choix du dossier. knownUid permet de sauter la capture.
  */
-function learnFlow(presetFolder, knownUid, folders) {
+function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null) {
   let stopped = false;
   const box = h('div', { class: 'card stack' });
   const cancel = h('button', null, 'Annuler');
@@ -492,24 +510,43 @@ function learnFlow(presetFolder, knownUid, folders) {
   setKids(root, box);
   app.view = null;
 
-  const chooseFolder = (uid) => {
+  const chooseFolder = async (uid) => {
     const sel = folderSelect(folders, presetFolder);
-    const save = h('button', { class: 'primary' }, 'Associer');
+    if (!defaults) defaults = await api('/api/settings').catch(() => ({ resume_s: 600, resume_after_other: false }));
+    const curDelay = card && card.resume_s !== null && card.resume_s !== undefined ? card.resume_s : null;
+    const curOther = card && card.resume_other !== null && card.resume_other !== undefined ? card.resume_other : null;
+    const delays = DELAY_CHOICES.includes(curDelay) || curDelay === null ? DELAY_CHOICES : [...DELAY_CHOICES, curDelay].sort((a, b) => a - b);
+    const delaySel = h('select', null,
+      h('option', { value: '', selected: curDelay === null }, `Réglage général (${fmtDelay(defaults.resume_s)})`),
+      ...delays.map((d) => h('option', { value: String(d), selected: d === curDelay },
+        d === 0 ? 'Toujours reprendre' : fmtDelay(d))));
+    const otherSel = h('select', null,
+      h('option', { value: '', selected: curOther === null },
+        `Réglage général (${defaults.resume_after_other ? 'reprendre' : 'recommencer'})`),
+      h('option', { value: '1', selected: curOther === true }, 'Reprendre où on en était'),
+      h('option', { value: '0', selected: curOther === false }, 'Recommencer au début'));
+    const save = h('button', { class: 'primary' }, card ? 'Enregistrer' : 'Associer');
     save.addEventListener('click', () => busy(save, async () => {
       if (!sel.value) { toast('Choisissez un dossier', true); return; }
-      await post('/api/cards', { uid, folder: sel.value });
-      toast('Carte associée');
+      await post('/api/cards', {
+        uid, folder: sel.value,
+        resume_s: delaySel.value === '' ? null : Number(delaySel.value),
+        resume_other: otherSel.value === '' ? null : otherSel.value === '1',
+      });
+      toast(card ? 'Carte modifiée' : 'Carte associée');
       renderCards();
     }));
-    setKids(box, 
-      h('h2', null, 'Choisir la musique'),
+    setKids(box,
+      h('h2', null, card ? 'Modifier la carte' : 'Choisir la musique'),
       h('div', { class: 'big-uid mono' }, uid),
       h('label', null, 'Dossier de la carte SD'), sel,
       h('p', { class: 'muted small' }, 'Pour un sous-dossier, utilisez « Associer une carte » depuis l\'onglet Musique.'),
-      h('div', { class: 'row end' }, cancel, save));
+      h('label', null, 'Reprise après retrait de la carte'), delaySel,
+      h('label', null, 'Si une autre carte a été posée entre-temps'), otherSel,
+      h('div', { class: 'row end actions' }, cancel, save));
   };
 
-  if (knownUid) { chooseFolder(knownUid); return; }
+  if (knownUid) { chooseFolder(knownUid).catch(reportError); return; }
 
   setKids(box, 
     h('h2', null, 'Associer une carte'),
@@ -529,13 +566,15 @@ function learnFlow(presetFolder, knownUid, folders) {
       const d = await api('/api/cards');
       if (d.learning) seenLearning = true;
       if (d.learned && !d.learning && (seenLearning || d.learned !== previous)) {
-        chooseFolder(d.learned);
+        const known = d.cards.find((c) => c.uid === d.learned) || null;
+        if (known && !card) { card = known; presetFolder = presetFolder || known.folder; }
+        await chooseFolder(d.learned);
         return;
       }
       if (!d.learning && (seenLearning || Date.now() - started > 4000)) {
         setKids(box, h('h2', null, 'Aucune carte détectée'),
           h('p', { class: 'muted' }, 'Le délai d\'une minute est écoulé.'),
-          h('div', { class: 'row end' }, cancel, h('button', { class: 'primary', onclick: () => learnFlow(presetFolder, '', folders) }, 'Réessayer')));
+          h('div', { class: 'row end' }, cancel, h('button', { class: 'primary', onclick: () => learnFlow(presetFolder, '', folders, card, defaults) }, 'Réessayer')));
         return;
       }
     }
@@ -744,7 +783,7 @@ async function processUploads() {
 
 /* ---------------- Réglages ---------------- */
 
-const OTA_STATES = ['Inactif', 'Vérification', 'En attente de fin de lecture', 'Téléchargement', 'Redémarrage', 'Erreur'];
+const OTA_STATES = ['Inactif', 'Vérification', 'En attente (enceinte occupée)', 'Téléchargement', 'Redémarrage', 'Erreur'];
 
 async function renderSettings() {
   const [s, st] = await Promise.all([api('/api/settings'), api('/api/status')]);
@@ -774,6 +813,17 @@ async function renderSettings() {
     await post('/api/settings', { hostname: host.value.trim(), max_volume: Number(maxVol.value) });
     toast('Réglages enregistrés');
     refreshStatus();
+  }));
+
+  /* Reprise */
+  const resumeMin = h('input', { type: 'number', min: 0, max: 43200, step: 1, value: Math.round(s.resume_s / 60) });
+  const resumeOther = h('input', { type: 'checkbox', checked: !!s.resume_after_other, id: 'resume-other' });
+  const saveResume = h('button', { class: 'primary' }, 'Enregistrer');
+  saveResume.addEventListener('click', () => busy(saveResume, async () => {
+    const m = Number(resumeMin.value);
+    if (!Number.isFinite(m) || m < 0) { toast('Délai invalide', true); return; }
+    await post('/api/settings', { resume_s: Math.round(m * 60), resume_after_other: resumeOther.checked });
+    toast('Réglages de reprise enregistrés');
   }));
 
   /* Sécurité */
@@ -852,6 +902,14 @@ async function renderSettings() {
       h('label', null, 'Nom ', h('span', { class: 'muted' }, '(adresse http://nom.local)')), host,
       h('label', null, 'Volume maximum'), h('div', { class: 'vol' }, maxVol, maxLbl),
       h('div', { class: 'row end actions' }, saveDev)),
+    h('div', { class: 'card' },
+      h('h2', null, 'Reprise de la lecture'),
+      h('p', { class: 'small muted' }, 'Réglage général, modifiable carte par carte dans l\'onglet Cartes.'),
+      h('label', null, 'Délai pour reprendre après le retrait d\'une carte (minutes)'), resumeMin,
+      h('p', { class: 'small muted' }, '0 : toujours reprendre où on en était, quel que soit le délai.'),
+      h('label', { class: 'check' }, resumeOther,
+        ' Reprendre même si une autre carte a été posée entre-temps'),
+      h('div', { class: 'row end actions' }, saveResume)),
     h('div', { class: 'card' },
       h('h2', null, 'Mot de passe administrateur'),
       h('label', null, 'Mot de passe actuel'), cur,

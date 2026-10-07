@@ -6,6 +6,10 @@
  *  - lecture, associations de cartes, gestion des fichiers, réglages, mises à jour ;
  *  - portail captif quand le point d'accès est actif.
  */
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 esp_err_t web_server_start(void);
+/* Vrai pendant un envoi de fichier ou de firmware (une mise à jour doit attendre). */
+bool web_server_busy(void);

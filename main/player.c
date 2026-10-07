@@ -84,6 +84,7 @@ static uint32_t s_next_id = 1;
 static uint32_t s_cur_id;
 static int s_removed_pos = -1;
 static player_state_t s_state;
+static int64_t s_paused_at_us;
 static uint32_t s_elapsed_ms, s_duration_ms, s_base_ms;
 static uint32_t s_bitrate_kbps;
 static uint32_t s_rate = 44100;
@@ -95,7 +96,6 @@ static uint8_t s_single;
 static char s_error[96];
 static media_info_t s_probe;
 static uint32_t s_probe_gen;
-static audio_fmt_t s_cur_fmt;
 
 /* ---------- Propre à la tâche player ---------- */
 
@@ -275,6 +275,7 @@ static void reader_task(void *arg)
 {
     int fd = -1;
     uint32_t gen = 0, pos = 0, size = 0, start_ms = 0;
+    uint32_t header_left = 0, jump_to = 0; /* repositionnement : en-tête d'abord, puis saut */
     bool first = false;
     media_info_t *mi = malloc(sizeof(media_info_t));
     for (;;) {
@@ -300,15 +301,14 @@ static void reader_task(void *arg)
                 continue;
             }
             media_probe(f, fmt, mi);
-            fclose(f);
-            uint32_t off = 0;
+            media_seek_t sk = {0};
             start_ms = 0;
-            if (req.seek_ms) {
-                off = media_seek_offset(mi, fmt, req.seek_ms);
-                if (off) {
-                    start_ms = req.seek_ms;
-                }
+            if (req.seek_ms && media_seek(f, mi, fmt, req.seek_ms, &sk)) {
+                start_ms = sk.actual_ms;
+            } else {
+                memset(&sk, 0, sizeof(sk));
             }
+            fclose(f);
             LOCK();
             s_probe = *mi;
             s_probe_gen = gen;
@@ -325,11 +325,19 @@ static void reader_task(void *arg)
             }
             size = (uint32_t)st.st_size;
             pos = 0;
-            if (off && lseek(fd, off, SEEK_SET) == (off_t)off) {
-                pos = off;
-            } else if (off) {
+            header_left = 0;
+            if (sk.offset && sk.header_end) {
+                /* FLAC, Ogg, WAV : le décodeur doit d'abord recevoir l'en-tête du fichier */
+                header_left = sk.header_end;
+                jump_to = sk.offset;
+            } else if (sk.offset && lseek(fd, sk.offset, SEEK_SET) == (off_t)sk.offset) {
+                pos = sk.offset;
+            } else if (sk.offset) {
                 lseek(fd, 0, SEEK_SET);
                 start_ms = 0;
+            }
+            if (start_ms) {
+                ESP_LOGI(TAG, "reprise à %u,%03u s", (unsigned)(start_ms / 1000), (unsigned)(start_ms % 1000));
             }
             first = true;
             continue;
@@ -341,7 +349,21 @@ static void reader_task(void *arg)
         if (xQueueReceive(s_free_q, &c, pdMS_TO_TICKS(20)) != pdTRUE) {
             continue; /* réservoir plein : on revient surveiller les requêtes */
         }
-        int n = read(fd, s_bounce, s_chunk_size);
+        size_t want = s_chunk_size;
+        if (header_left && want > header_left) {
+            want = header_left;
+        }
+        int n = read(fd, s_bounce, want);
+        if (n > 0 && header_left) {
+            header_left -= (uint32_t)n < header_left ? (uint32_t)n : header_left;
+            if (header_left == 0) {
+                if (lseek(fd, jump_to, SEEK_SET) == (off_t)jump_to) {
+                    pos = jump_to - n; /* "pos += n" ci-dessous : pos = jump_to */
+                } else {
+                    start_ms = 0; /* saut impossible : lecture depuis le début */
+                }
+            }
+        }
         c->gen = gen;
         c->first = first;
         c->start_ms = start_ms;
@@ -581,7 +603,6 @@ static void start_song(uint32_t id, uint32_t seek_ms)
     bool ok = req.path[0] && open_decoder(fmt);
     LOCK();
     s_cur_id = id;
-    s_cur_fmt = fmt;
     s_state = PLAYER_PLAYING;
     s_elapsed_ms = seek_ms;
     s_base_ms = seek_ms;
@@ -734,7 +755,7 @@ static void decode_step(void)
             if (s_probe_gen == c->gen) {
                 s_duration_ms = s_probe.duration_ms;
                 s_bitrate_kbps = s_probe.bitrate / 1000;
-                s_seekable = media_seek_offset(&s_probe, s_cur_fmt, s_probe.duration_ms / 2) != 0;
+                s_seekable = s_probe.seekable;
             }
             s_base_ms = c->start_ms;
             s_elapsed_ms = c->start_ms;
@@ -773,8 +794,14 @@ static void decode_step(void)
         return;
     }
     if (ret != ESP_AUDIO_ERR_OK) {
-        /* Données corrompues : on saute ce bloc, le décodeur se resynchronise. */
-        s_raw.len = 0;
+        /* Données refusées (paquet corrompu, métadonnées inattendues...) : on saute la partie
+         * consommée si le décodeur l'indique, sinon tout le bloc ; il se resynchronise ensuite. */
+        if (s_raw.consumed > 0 && s_raw.consumed < s_raw.len) {
+            s_raw.len -= s_raw.consumed;
+            s_raw.buffer += s_raw.consumed;
+        } else {
+            s_raw.len = 0;
+        }
         if (++s_dec_errors > 20) {
             track_failed("fichier illisible");
         }
@@ -838,6 +865,7 @@ static void handle_cmd(const cmd_t *c)
         player_state_t st = s_state;
         if (st == PLAYER_PLAYING && (c->arg == 1 || c->arg == -1)) {
             s_state = PLAYER_PAUSED;
+            s_paused_at_us = esp_timer_get_time();
         } else if (st == PLAYER_PAUSED && (c->arg == 0 || c->arg == -1)) {
             s_state = PLAYER_PLAYING;
         }
@@ -880,6 +908,7 @@ static void handle_cmd(const cmd_t *c)
         if (before == PLAYER_PAUSED) {
             LOCK();
             s_state = PLAYER_PAUSED;
+            s_paused_at_us = esp_timer_get_time();
             UNLOCK();
         }
         break;
@@ -1011,6 +1040,7 @@ void player_get_status(player_status_t *st)
     st->consume = s_consume;
     st->single = s_single;
     st->seekable = s_seekable;
+    st->paused_s = s_state == PLAYER_PAUSED ? (uint32_t)((esp_timer_get_time() - s_paused_at_us) / 1000000) : 0;
     if (cur >= 0) {
         str_copy(st->file, s_queue[cur].path, sizeof(st->file));
     }

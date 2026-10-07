@@ -25,9 +25,9 @@ FILES = {
 }
 
 CARDS = [
-    {"uid": "04A1B2C3D4E5F6", "folder": "Comptines", "exists": True},
-    {"uid": "0411223344", "folder": "Histoires du soir", "exists": True},
-    {"uid": "04DEADBEEF", "folder": "Ancien dossier", "exists": False},
+    {"uid": "04A1B2C3D4E5F6", "folder": "Comptines", "exists": True, "resume_s": None, "resume_other": None},
+    {"uid": "0411223344", "folder": "Histoires du soir", "exists": True, "resume_s": 0, "resume_other": True},
+    {"uid": "04DEADBEEF", "folder": "Ancien dossier", "exists": False, "resume_s": None, "resume_other": None},
 ]
 
 
@@ -110,6 +110,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/settings":
             return self.send_json({"hostname": "enceinte", "wifi_ssid": "Maison", "ota_url": "",
                                    "ota_interval_h": 24, "max_volume": 80, "mpd_password_set": False,
+                                   "resume_s": 600, "resume_after_other": False,
                                    "mpd_port": 6600})
         self.send_json({"error": "introuvable"}, 404)
 
