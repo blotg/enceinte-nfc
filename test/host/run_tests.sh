@@ -1,0 +1,71 @@
+#!/bin/bash
+# Tests sur PC (sans le matériel).
+#  1. tests unitaires des modules purs (+ fichiers audio réels générés par ffmpeg/lame) ;
+#  2. contrôleur de cartes avec le vrai lecteur (I2S et décodeur simulés) ;
+#  3. intégration MPD : vrai lecteur + vrai serveur pilotés par python-mpd2.
+# Tout est compilé avec AddressSanitizer et UndefinedBehaviorSanitizer.
+#
+# Usage : test/host/run_tests.sh [dossier_de_travail]
+#   PYTHON=/chemin/vers/python (avec python-mpd2) pour l'étape 3.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+MAIN="$HERE/../../main"
+WORK="${1:-$(mktemp -d)}"
+FIX="$WORK/fixtures"
+PY="${PYTHON:-python3}"
+mkdir -p "$FIX"
+
+CFLAGS=(-std=gnu17 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers
+        -fsanitize=address,undefined -fno-omit-frame-pointer -pthread)
+
+gen_fixtures() {
+    local tags=(-metadata "title=Été indien" -metadata "artist=日本の歌手" -metadata "album=Album test"
+                -metadata "track=3/12" -metadata "date=2024" -metadata "genre=Chanson")
+    local q=(-hide_banner -loglevel error -y)
+    ffmpeg "${q[@]}" -f lavfi -i "sine=frequency=440:duration=5:sample_rate=44100" -ac 2 "$FIX/tone.wav"
+    ffmpeg "${q[@]}" -i "$FIX/tone.wav" -c:a libmp3lame -b:a 128k -write_xing 0 -id3v2_version 3 "${tags[@]}" "$FIX/cbr.mp3"
+    ffmpeg "${q[@]}" -i "$FIX/tone.wav" -c:a libmp3lame -q:a 4 -id3v2_version 4 "${tags[@]}" "$FIX/vbr.mp3"
+    ffmpeg "${q[@]}" -f lavfi -i "testsrc=size=600x600:rate=1" -frames:v 1 "$FIX/cover.png"
+    ffmpeg "${q[@]}" -i "$FIX/cbr.mp3" -i "$FIX/cover.png" -map 0:a -map 1:v -c copy -id3v2_version 3 \
+        -metadata:s:v "title=Cover" -metadata:s:v "comment=Cover (front)" "$FIX/art.mp3"
+    lame --quiet --cbr -b 96 --id3v1-only --tt "Vieux titre" --ta "Vieil artiste" --tl "Vieil album" \
+        --ty 1999 --tn 7 "$FIX/tone.wav" "$FIX/v1.mp3"
+    ffmpeg "${q[@]}" -i "$FIX/tone.wav" -c:a flac -metadata "title=Titre FLAC" -metadata "artist=Artiste FLAC" \
+        -metadata "track=5" "$FIX/tone.flac"
+    head -c 20000 /dev/urandom > "$FIX/garbage.mp3"
+    printf 'ID3\x03\x00\x00\x7f\x7f\x7f\x7f' > "$FIX/truncated.mp3"
+}
+
+HAVE_MEDIA=0
+if command -v ffmpeg > /dev/null && command -v lame > /dev/null; then
+    gen_fixtures
+    HAVE_MEDIA=1
+else
+    echo "ffmpeg/lame absents : tests utilisant des fichiers audio ignorés"
+fi
+
+echo "== 1. Tests unitaires"
+gcc "${CFLAGS[@]}" -DDNS_HOST_TEST -I"$MAIN" -I"$HERE" -I"$HERE/stubs" \
+    "$HERE"/test_*.c "$MAIN/util.c" "$MAIN/pn532_frame.c" "$MAIN/session.c" "$MAIN/dns_server.c" \
+    "$MAIN/mpd_proto.c" "$MAIN/media_info.c" -o "$WORK/tests"
+if [ $HAVE_MEDIA = 1 ]; then "$WORK/tests" "$FIX"; else "$WORK/tests"; fi
+
+echo "== 2. Contrôleur de cartes (vrai lecteur)"
+rm -rf "$WORK/sd_ctrl"
+gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd_ctrl\"" -DCONFIG_ENC_RESUME_TIMEOUT_S=2 \
+    -I"$HERE/stubs" -I"$MAIN" -I"$HERE" "$HERE/controller_test.c" "$HERE/shims.c" "$HERE/mocks.c" \
+    "$MAIN/controller.c" "$MAIN/session.c" "$MAIN/player.c" "$MAIN/media_info.c" "$MAIN/util.c" \
+    "$MAIN/changes.c" -lm -o "$WORK/controller_test"
+ASAN_OPTIONS=detect_leaks=0 "$WORK/controller_test"
+
+echo "== 3. Intégration MPD"
+if [ $HAVE_MEDIA = 1 ] && "$PY" -c "import mpd" 2> /dev/null; then
+    gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd\"" -I"$HERE/stubs" -I"$MAIN" -I"$HERE" \
+        "$HERE/mpd_host_main.c" "$HERE/shims.c" "$HERE/mocks.c" "$MAIN/player.c" "$MAIN/mpd_server.c" \
+        "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/util.c" "$MAIN/changes.c" -lm -o "$WORK/mpd_host"
+    "$PY" "$HERE/mpd_integration.py" "$WORK/mpd_host" "$WORK/sd" "$FIX"
+else
+    echo "python-mpd2 ou fichiers audio absents : étape ignorée (pip install python-mpd2)"
+fi
+echo "== Tous les tests sont passés"

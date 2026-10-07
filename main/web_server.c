@@ -1,0 +1,1115 @@
+#include "web_server.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "cJSON.h"
+#include "cards.h"
+#include "changes.h"
+#include "controller.h"
+#include "esp_heap_caps.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "lwip/sockets.h"
+#include "media_info.h"
+#include "nfc.h"
+#include "ota.h"
+#include "player.h"
+#include "sdkconfig.h"
+#include "settings.h"
+#include "storage.h"
+#include "util.h"
+#include "wifi_mgr.h"
+
+static const char *TAG = "web";
+
+#define BODY_MAX 4096
+#define UPLOAD_BUF 8192
+#define MAX_SESSIONS 8
+#define SESSION_IDLE_US (30LL * 24 * 3600 * 1000000) /* 30 jours */
+#define CSRF_HEADER "X-Requested-With"
+
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char index_html_end[] asm("_binary_index_html_end");
+extern const char app_js_start[] asm("_binary_app_js_start");
+extern const char app_js_end[] asm("_binary_app_js_end");
+extern const char style_css_start[] asm("_binary_style_css_start");
+extern const char style_css_end[] asm("_binary_style_css_end");
+
+typedef struct {
+    char token[33];
+    int64_t last_used;
+} web_session_t;
+
+static web_session_t s_sessions[MAX_SESSIONS];
+static int s_login_failures;
+static int64_t s_login_blocked_until;
+
+/* ================= Outils HTTP ================= */
+
+static esp_err_t send_json(httpd_req_t *req, cJSON *root)
+{
+    char *txt = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!txt) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t err = httpd_resp_sendstr(req, txt);
+    free(txt);
+    return err;
+}
+
+static esp_err_t send_error(httpd_req_t *req, const char *status, const char *msg)
+{
+    httpd_resp_set_status(req, status);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "error", msg);
+    return send_json(req, root);
+}
+
+static esp_err_t send_ok(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    return send_json(req, root);
+}
+
+static cJSON *read_json(httpd_req_t *req)
+{
+    if (req->content_len == 0 || req->content_len > BODY_MAX) {
+        return NULL;
+    }
+    char *buf = malloc(req->content_len + 1);
+    if (!buf) {
+        return NULL;
+    }
+    size_t got = 0;
+    int retries = 0;
+    while (got < req->content_len) {
+        int n = httpd_req_recv(req, buf + got, req->content_len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && retries++ < 3) {
+            continue;
+        }
+        if (n <= 0) {
+            free(buf);
+            return NULL;
+        }
+        got += n;
+    }
+    buf[got] = '\0';
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    return root;
+}
+
+static const char *json_str(const cJSON *obj, const char *key)
+{
+    const cJSON *it = cJSON_GetObjectItem(obj, key);
+    return cJSON_IsString(it) ? it->valuestring : NULL;
+}
+
+static bool get_query(httpd_req_t *req, const char *key, char *out, size_t len)
+{
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen == 0 || qlen > 1024) {
+        return false;
+    }
+    char *q = malloc(qlen + 1);
+    char *raw = malloc(len * 3 + 1);
+    bool ok = q && raw && httpd_req_get_url_query_str(req, q, qlen + 1) == ESP_OK &&
+              httpd_query_key_value(q, key, raw, len * 3 + 1) == ESP_OK && url_decode(raw, out, len);
+    free(q);
+    free(raw);
+    return ok;
+}
+
+static bool client_on_ap(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    struct sockaddr_in6 addr;
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr *)&addr, &len) != 0) {
+        return false;
+    }
+    uint32_t ip = 0;
+    if (addr.sin6_family == AF_INET) {
+        ip = ((struct sockaddr_in *)&addr)->sin_addr.s_addr;
+    } else {
+        ip = addr.sin6_addr.un.u32_addr[3]; /* IPv4 mappée */
+    }
+    return (ntohl(ip) & 0xFFFFFF00) == 0xC0A80400; /* 192.168.4.0/24 */
+}
+
+/* ================= Authentification ================= */
+
+static web_session_t *find_session(httpd_req_t *req)
+{
+    char token[40];
+    size_t len = sizeof(token);
+    if (httpd_req_get_cookie_val(req, "sid", token, &len) != ESP_OK || strlen(token) != 32) {
+        return NULL;
+    }
+    int64_t now = esp_timer_get_time();
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        web_session_t *s = &s_sessions[i];
+        if (s->token[0] && now - s->last_used < SESSION_IDLE_US) {
+            uint8_t diff = 0;
+            for (int k = 0; k < 32; k++) {
+                diff |= (uint8_t)(s->token[k] ^ token[k]);
+            }
+            if (diff == 0) {
+                s->last_used = now;
+                return s;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void create_session(httpd_req_t *req)
+{
+    int slot = 0;
+    for (int i = 1; i < MAX_SESSIONS; i++) {
+        if (s_sessions[i].last_used < s_sessions[slot].last_used) {
+            slot = i; /* la plus ancienne est remplacée */
+        }
+    }
+    uint8_t rnd[16];
+    esp_fill_random(rnd, sizeof(rnd));
+    bytes_to_hex(rnd, sizeof(rnd), s_sessions[slot].token);
+    s_sessions[slot].last_used = esp_timer_get_time();
+    static char cookie[96];
+    snprintf(cookie, sizeof(cookie), "sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000",
+             s_sessions[slot].token);
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie);
+}
+
+static void clear_sessions(void)
+{
+    memset(s_sessions, 0, sizeof(s_sessions));
+}
+
+/* Les requêtes qui modifient l'état doivent porter l'en-tête CSRF (impossible à
+ * ajouter depuis un autre site sans autorisation CORS, que l'enceinte ne donne pas). */
+static bool csrf_ok(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        return true;
+    }
+    char v[16];
+    return httpd_req_get_hdr_value_str(req, CSRF_HEADER, v, sizeof(v)) == ESP_OK && strcmp(v, "enceinte") == 0;
+}
+
+static bool require_auth(httpd_req_t *req)
+{
+    if (!csrf_ok(req)) {
+        send_error(req, "403 Forbidden", "requête refusée");
+        return false;
+    }
+    if (!find_session(req)) {
+        send_error(req, "401 Unauthorized", "connexion requise");
+        return false;
+    }
+    return true;
+}
+
+/* ================= Fichiers statiques ================= */
+
+static esp_err_t send_static(httpd_req_t *req, const char *start, const char *end, const char *type)
+{
+    httpd_resp_set_type(req, type);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    /* EMBED_TXTFILES ajoute un octet nul final */
+    return httpd_resp_send(req, start, end - start - 1);
+}
+
+static esp_err_t h_index(httpd_req_t *req)
+{
+    return send_static(req, index_html_start, index_html_end, "text/html; charset=utf-8");
+}
+
+static esp_err_t h_app_js(httpd_req_t *req)
+{
+    return send_static(req, app_js_start, app_js_end, "application/javascript; charset=utf-8");
+}
+
+static esp_err_t h_style(httpd_req_t *req)
+{
+    return send_static(req, style_css_start, style_css_end, "text/css; charset=utf-8");
+}
+
+/* Portail captif : toute adresse inconnue renvoie vers la page de configuration. */
+static esp_err_t h_not_found(httpd_req_t *req, httpd_err_code_t err)
+{
+    if (wifi_mgr_ap_active() && client_on_ap(req)) {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "http://" AP_IP_STR "/");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        return httpd_resp_send(req, "Redirection", HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Introuvable");
+    return ESP_FAIL;
+}
+
+/* ================= État / connexion ================= */
+
+static esp_err_t h_state(httpd_req_t *req)
+{
+    settings_t cfg;
+    settings_get(&cfg);
+    ota_status_t os;
+    ota_get_status(&os);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "setup_required", !cfg.admin_set);
+    cJSON_AddBoolToObject(root, "logged_in", cfg.admin_set && find_session(req) != NULL);
+    cJSON_AddStringToObject(root, "version", os.current_version);
+    cJSON_AddStringToObject(root, "hostname", cfg.hostname);
+    cJSON_AddBoolToObject(root, "on_ap", client_on_ap(req));
+    return send_json(req, root);
+}
+
+static esp_err_t h_setup(httpd_req_t *req)
+{
+    if (!csrf_ok(req)) {
+        return send_error(req, "403 Forbidden", "requête refusée");
+    }
+    settings_t cfg;
+    settings_get(&cfg);
+    if (cfg.admin_set) {
+        return send_error(req, "403 Forbidden", "déjà configurée");
+    }
+    cJSON *body = read_json(req);
+    const char *pw = json_str(body, "password");
+    const char *ssid = json_str(body, "ssid");
+    const char *wpass = json_str(body, "wifi_password");
+    const char *host = json_str(body, "hostname");
+    if (!wpass) {
+        wpass = "";
+    }
+    /* Tout est vérifié avant d'enregistrer quoi que ce soit : une erreur laisse
+     * l'assistant utilisable. */
+    char norm[33];
+    const char *msg = NULL;
+    if (!pw || strlen(pw) < 6 || strlen(pw) > 64) {
+        msg = "mot de passe trop court (6 caractères minimum)";
+    } else if (host && host[0] && !hostname_normalize(host, norm, sizeof(norm))) {
+        msg = "nom invalide (lettres, chiffres et tirets, 32 max)";
+    } else if (ssid && ssid[0] && (strlen(ssid) > 32 || strlen(wpass) > 64 || (wpass[0] && strlen(wpass) < 8))) {
+        msg = "réseau Wi-Fi invalide (mot de passe de 8 caractères minimum)";
+    }
+    esp_err_t err = msg ? ESP_ERR_INVALID_ARG : ESP_OK;
+    if (err == ESP_OK && host && host[0]) {
+        err = settings_set_hostname(norm);
+        if (err == ESP_OK) {
+            wifi_mgr_set_hostname(norm);
+        }
+    }
+    if (err == ESP_OK && ssid && ssid[0]) {
+        err = settings_set_wifi(ssid, wpass);
+    }
+    if (err == ESP_OK) {
+        err = settings_set_admin_password(pw); /* en dernier : marque la fin de l'assistant */
+    }
+    cJSON_Delete(body);
+    if (err != ESP_OK) {
+        return send_error(req, "400 Bad Request", msg ? msg : "enregistrement impossible");
+    }
+    if (ssid && ssid[0]) {
+        wifi_mgr_reconnect_later(1500);
+    }
+    ESP_LOGI(TAG, "configuration initiale terminée");
+    create_session(req);
+    return send_ok(req);
+}
+
+static esp_err_t h_login(httpd_req_t *req)
+{
+    if (!csrf_ok(req)) {
+        return send_error(req, "403 Forbidden", "requête refusée");
+    }
+    int64_t now = esp_timer_get_time();
+    if (now < s_login_blocked_until) {
+        return send_error(req, "429 Too Many Requests", "trop d'essais, patientez quelques secondes");
+    }
+    cJSON *body = read_json(req);
+    const char *pw = json_str(body, "password");
+    bool ok = pw && settings_check_admin_password(pw);
+    cJSON_Delete(body);
+    if (!ok) {
+        if (++s_login_failures >= 5) {
+            int shift = s_login_failures - 5 < 6 ? s_login_failures - 5 : 6;
+            s_login_blocked_until = now + (30LL << shift) * 1000000;
+        }
+        return send_error(req, "401 Unauthorized", "mot de passe incorrect");
+    }
+    s_login_failures = 0;
+    create_session(req);
+    return send_ok(req);
+}
+
+static esp_err_t h_logout(httpd_req_t *req)
+{
+    web_session_t *s = find_session(req);
+    if (s) {
+        memset(s, 0, sizeof(*s));
+    }
+    httpd_resp_set_hdr(req, "Set-Cookie", "sid=; Path=/; Max-Age=0");
+    return send_ok(req);
+}
+
+/* ================= Statut ================= */
+
+static const char *state_name(player_state_t st)
+{
+    return st == PLAYER_PLAYING ? "play" : (st == PLAYER_PAUSED ? "pause" : "stop");
+}
+
+/* Cache des tags du morceau courant (évite de relire le fichier à chaque rafraîchissement). */
+static char s_tag_path[REL_PATH_MAX];
+static char s_tag_title[128], s_tag_artist[128], s_tag_album[128];
+
+static void current_tags(const char *rel)
+{
+    if (strcmp(rel, s_tag_path) == 0) {
+        return;
+    }
+    str_copy(s_tag_path, rel, sizeof(s_tag_path));
+    s_tag_title[0] = s_tag_artist[0] = s_tag_album[0] = '\0';
+    char abs[ABS_PATH_MAX];
+    if (!rel[0] || !path_to_abs(rel, abs, sizeof(abs))) {
+        return;
+    }
+    FILE *f = fopen(abs, "rb");
+    if (!f) {
+        return;
+    }
+    media_info_t *mi = malloc(sizeof(media_info_t));
+    if (mi && media_probe(f, audio_fmt_from_name(rel), mi)) {
+        str_copy(s_tag_title, mi->title, sizeof(s_tag_title));
+        str_copy(s_tag_artist, mi->artist, sizeof(s_tag_artist));
+        str_copy(s_tag_album, mi->album, sizeof(s_tag_album));
+    }
+    free(mi);
+    fclose(f);
+}
+
+static esp_err_t h_status(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    player_status_t ps;
+    player_get_status(&ps);
+    controller_status_t cs;
+    controller_get_status(&cs);
+    wifi_status_t ws;
+    wifi_mgr_get_status(&ws);
+    ota_status_t os;
+    ota_get_status(&os);
+    settings_t cfg;
+    settings_get(&cfg);
+    current_tags(ps.file);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *p = cJSON_AddObjectToObject(root, "player");
+    cJSON_AddStringToObject(p, "state", state_name(ps.state));
+    cJSON_AddStringToObject(p, "file", ps.file);
+    cJSON_AddStringToObject(p, "title", s_tag_title[0] ? s_tag_title : path_basename(ps.file));
+    cJSON_AddStringToObject(p, "artist", s_tag_artist);
+    cJSON_AddStringToObject(p, "album", s_tag_album);
+    cJSON_AddNumberToObject(p, "elapsed", ps.elapsed_ms / 1000.0);
+    cJSON_AddNumberToObject(p, "duration", ps.duration_ms / 1000.0);
+    cJSON_AddBoolToObject(p, "seekable", ps.seekable);
+    cJSON_AddNumberToObject(p, "song", ps.song);
+    cJSON_AddNumberToObject(p, "queue_len", ps.queue_len);
+    cJSON_AddNumberToObject(p, "volume", ps.volume);
+    cJSON_AddNumberToObject(p, "max_volume", cfg.max_volume);
+    cJSON_AddBoolToObject(p, "repeat", ps.repeat);
+    cJSON_AddBoolToObject(p, "random", ps.random);
+    cJSON_AddStringToObject(p, "error", ps.error);
+
+    cJSON *c = cJSON_AddObjectToObject(root, "card");
+    cJSON_AddBoolToObject(c, "reader_ok", nfc_reader_ok());
+    cJSON_AddStringToObject(c, "present", cs.present_uid);
+    cJSON_AddStringToObject(c, "session", cs.session_uid);
+    cJSON_AddStringToObject(c, "folder", cs.session_folder);
+    cJSON_AddNumberToObject(c, "resume_remaining", cs.resume_remaining_s);
+    cJSON_AddStringToObject(c, "last_unknown", cs.last_unknown_uid);
+
+    cJSON *w = cJSON_AddObjectToObject(root, "wifi");
+    cJSON_AddBoolToObject(w, "connected", ws.sta_connected);
+    cJSON_AddStringToObject(w, "ssid", ws.sta_ssid);
+    cJSON_AddStringToObject(w, "ip", ws.sta_ip);
+    cJSON_AddNumberToObject(w, "rssi", ws.rssi);
+    cJSON_AddBoolToObject(w, "ap", ws.ap_active);
+    cJSON_AddStringToObject(w, "ap_ssid", ws.ap_ssid);
+    cJSON_AddStringToObject(w, "hostname", ws.hostname);
+
+    cJSON *sd = cJSON_AddObjectToObject(root, "sd");
+    uint64_t total = 0, freeb = 0;
+    bool mounted = storage_get_usage(&total, &freeb);
+    cJSON_AddBoolToObject(sd, "mounted", mounted);
+    cJSON_AddNumberToObject(sd, "total", (double)total);
+    cJSON_AddNumberToObject(sd, "free", (double)freeb);
+
+    cJSON *o = cJSON_AddObjectToObject(root, "ota");
+    cJSON_AddNumberToObject(o, "state", os.state);
+    cJSON_AddStringToObject(o, "message", os.message);
+    cJSON_AddStringToObject(o, "current", os.current_version);
+    cJSON_AddStringToObject(o, "available", os.available_version);
+    cJSON_AddNumberToObject(o, "progress", os.progress);
+    cJSON_AddNumberToObject(o, "last_check", (double)os.last_check);
+
+    cJSON_AddNumberToObject(root, "uptime", (double)(esp_timer_get_time() / 1000000));
+    cJSON_AddNumberToObject(root, "heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    return send_json(req, root);
+}
+
+/* ================= Lecture ================= */
+
+static esp_err_t play_folder(httpd_req_t *req, const char *raw)
+{
+    char folder[REL_PATH_MAX];
+    if (!path_sanitize(raw, folder, sizeof(folder))) {
+        return send_error(req, "400 Bad Request", "dossier invalide");
+    }
+    path_list_t list;
+    if (storage_list_tracks(folder, &list) != ESP_OK || list.count == 0) {
+        path_list_free(&list);
+        return send_error(req, "404 Not Found", "aucun morceau dans ce dossier");
+    }
+    esp_err_t err = player_queue_replace(&list);
+    path_list_free(&list);
+    if (err == ESP_OK) {
+        player_play(0);
+    }
+    return err == ESP_OK ? send_ok(req) : send_error(req, "500 Internal Server Error", "mémoire insuffisante");
+}
+
+static esp_err_t h_player(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *action = json_str(body, "action");
+    const cJSON *val = cJSON_GetObjectItem(body, "value");
+    double v = cJSON_IsNumber(val) ? val->valuedouble : 0;
+    esp_err_t err = ESP_OK;
+    if (!action) {
+        err = ESP_ERR_INVALID_ARG;
+    } else if (strcmp(action, "play") == 0) {
+        err = player_play(-1);
+    } else if (strcmp(action, "pause") == 0) {
+        err = player_pause(1);
+    } else if (strcmp(action, "toggle") == 0) {
+        player_status_t st;
+        player_get_status(&st);
+        err = st.state == PLAYER_STOPPED ? player_play(-1) : player_pause(-1);
+    } else if (strcmp(action, "stop") == 0) {
+        err = player_stop();
+    } else if (strcmp(action, "next") == 0) {
+        err = player_next();
+    } else if (strcmp(action, "prev") == 0) {
+        err = player_previous();
+    } else if (strcmp(action, "volume") == 0) {
+        player_set_volume((int)v);
+    } else if (strcmp(action, "seek") == 0) {
+        err = player_seek(-1, (uint32_t)(v * 1000));
+    } else if (strcmp(action, "play_folder") == 0) {
+        const char *folder = json_str(body, "folder");
+        esp_err_t r = folder ? play_folder(req, folder) : send_error(req, "400 Bad Request", "dossier manquant");
+        cJSON_Delete(body);
+        return r;
+    } else {
+        err = ESP_ERR_INVALID_ARG;
+    }
+    cJSON_Delete(body);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        return send_error(req, "400 Bad Request", "déplacement impossible dans ce format");
+    }
+    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", "commande invalide");
+}
+
+/* ================= Cartes ================= */
+
+static esp_err_t h_cards_get(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    card_entry_t *list;
+    int n = cards_list(&list);
+    controller_status_t cs;
+    controller_get_status(&cs);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "cards");
+    for (int i = 0; i < n; i++) {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddStringToObject(e, "uid", list[i].uid);
+        cJSON_AddStringToObject(e, "folder", list[i].folder);
+        cJSON_AddBoolToObject(e, "exists", storage_is_dir(list[i].folder));
+        cJSON_AddItemToArray(arr, e);
+    }
+    free(list);
+    cJSON_AddBoolToObject(root, "learning", cs.learning);
+    cJSON_AddNumberToObject(root, "learn_remaining", cs.learn_remaining_s);
+    cJSON_AddStringToObject(root, "learned", cs.learned_uid);
+    cJSON_AddStringToObject(root, "present", cs.present_uid);
+    cJSON_AddStringToObject(root, "last_unknown", cs.last_unknown_uid);
+    cJSON_AddBoolToObject(root, "reader_ok", nfc_reader_ok());
+    return send_json(req, root);
+}
+
+static bool uid_valid(const char *uid)
+{
+    size_t n = strlen(uid);
+    if (n < 8 || n >= UID_STR_MAX || n % 2) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!((uid[i] >= '0' && uid[i] <= '9') || (uid[i] >= 'A' && uid[i] <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static esp_err_t h_cards_set(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *uid = json_str(body, "uid");
+    const char *folder = json_str(body, "folder");
+    char norm[REL_PATH_MAX];
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    const char *msg = "carte ou dossier invalide";
+    if (uid && folder && uid_valid(uid) && path_sanitize(folder, norm, sizeof(norm)) && norm[0]) {
+        if (!storage_is_dir(norm)) {
+            msg = "dossier introuvable";
+        } else {
+            err = cards_set(uid, norm);
+            msg = "enregistrement impossible";
+        }
+    }
+    cJSON_Delete(body);
+    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", msg);
+}
+
+static esp_err_t h_cards_delete(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *uid = json_str(body, "uid");
+    esp_err_t err = uid ? cards_remove(uid) : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(body);
+    return err == ESP_OK ? send_ok(req) : send_error(req, "404 Not Found", "carte inconnue");
+}
+
+static esp_err_t h_cards_learn(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *action = json_str(body, "action");
+    if (action && strcmp(action, "cancel") == 0) {
+        controller_learn_cancel();
+    } else {
+        controller_learn_start();
+    }
+    cJSON_Delete(body);
+    return send_ok(req);
+}
+
+/* ================= Fichiers ================= */
+
+static esp_err_t h_files_list(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    char raw[REL_PATH_MAX] = "", rel[REL_PATH_MAX];
+    get_query(req, "path", raw, sizeof(raw));
+    if (!path_sanitize(raw, rel, sizeof(rel))) {
+        return send_error(req, "400 Bad Request", "chemin invalide");
+    }
+    if (!storage_is_mounted()) {
+        return send_error(req, "503 Service Unavailable", "carte SD absente");
+    }
+    dir_entry_t *entries;
+    int n;
+    esp_err_t err = storage_list_dir(rel, &entries, &n);
+    if (err != ESP_OK) {
+        return send_error(req, "404 Not Found", "dossier introuvable");
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "path", rel);
+    cJSON *arr = cJSON_AddArrayToObject(root, "entries");
+    for (int i = 0; i < n; i++) {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddStringToObject(e, "name", entries[i].name);
+        cJSON_AddBoolToObject(e, "dir", entries[i].is_dir);
+        cJSON_AddNumberToObject(e, "size", entries[i].size);
+        cJSON_AddBoolToObject(e, "audio", !entries[i].is_dir && is_audio_file(entries[i].name));
+        cJSON_AddItemToArray(arr, e);
+    }
+    storage_free_dir(entries, n);
+    uint64_t total = 0, freeb = 0;
+    storage_get_usage(&total, &freeb);
+    cJSON_AddNumberToObject(root, "total", (double)total);
+    cJSON_AddNumberToObject(root, "free", (double)freeb);
+    return send_json(req, root);
+}
+
+static bool upload_allowed(const char *name)
+{
+    static const char *const extra[] = {".jpg", ".jpeg", ".png", ".txt", ".m3u"};
+    if (audio_fmt_from_name(name) != AUDIO_FMT_NONE) {
+        return true;
+    }
+    const char *ext = strrchr(name, '.');
+    for (size_t i = 0; ext && i < sizeof(extra) / sizeof(extra[0]); i++) {
+        if (strcasecmp(ext, extra[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Crée les dossiers parents d'un chemin relatif (envoi d'un dossier complet). */
+static bool mkdir_parents(const char *rel)
+{
+    char buf[REL_PATH_MAX];
+    str_copy(buf, rel, sizeof(buf));
+    for (char *p = strchr(buf, '/'); p; p = strchr(p + 1, '/')) {
+        *p = '\0';
+        if (!storage_is_dir(buf) && storage_mkdir(buf) != ESP_OK) {
+            return false;
+        }
+        *p = '/';
+    }
+    return true;
+}
+
+static esp_err_t h_upload(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    char raw[REL_PATH_MAX] = "", rel[REL_PATH_MAX], abs[ABS_PATH_MAX], part[ABS_PATH_MAX + 8];
+    if (!get_query(req, "path", raw, sizeof(raw)) || !path_sanitize(raw, rel, sizeof(rel)) || !rel[0] ||
+        !path_to_abs(rel, abs, sizeof(abs))) {
+        return send_error(req, "400 Bad Request", "chemin invalide");
+    }
+    if (!upload_allowed(rel)) {
+        return send_error(req, "400 Bad Request", "type de fichier refusé (audio ou image uniquement)");
+    }
+    if (!storage_is_mounted()) {
+        return send_error(req, "503 Service Unavailable", "carte SD absente");
+    }
+    uint64_t total = 0, freeb = 0;
+    if (storage_get_usage(&total, &freeb) && req->content_len + 1024 * 1024 > freeb) {
+        return send_error(req, "507 Insufficient Storage", "carte SD pleine");
+    }
+    if (!mkdir_parents(rel)) {
+        return send_error(req, "500 Internal Server Error", "création du dossier impossible");
+    }
+    snprintf(part, sizeof(part), "%s.part", abs);
+    int fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0664);
+    if (fd < 0) {
+        return send_error(req, "500 Internal Server Error", "écriture impossible");
+    }
+    uint8_t *buf = heap_caps_malloc(UPLOAD_BUF, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!buf) {
+        buf = malloc(UPLOAD_BUF);
+    }
+    size_t remaining = req->content_len;
+    int timeouts = 0;
+    bool ok = buf != NULL;
+    while (ok && remaining > 0) {
+        int n = httpd_req_recv(req, (char *)buf, remaining < UPLOAD_BUF ? remaining : UPLOAD_BUF);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 5) {
+            continue;
+        }
+        if (n <= 0) {
+            ok = false;
+            break;
+        }
+        timeouts = 0;
+        if (write(fd, buf, n) != n) {
+            ok = false;
+            break;
+        }
+        remaining -= n;
+    }
+    free(buf);
+    if (close(fd) != 0) {
+        ok = false;
+    }
+    if (ok) {
+        unlink(abs); /* remplacement d'un fichier existant */
+        ok = rename(part, abs) == 0;
+    }
+    if (!ok) {
+        unlink(part);
+        ESP_LOGW(TAG, "envoi de %s interrompu", rel);
+        return send_error(req, "500 Internal Server Error", "envoi interrompu");
+    }
+    ESP_LOGI(TAG, "fichier reçu : %s (%u o)", rel, (unsigned)req->content_len);
+    changes_notify(CHG_DATABASE);
+    return send_ok(req);
+}
+
+static esp_err_t h_mkdir(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *path = json_str(body, "path");
+    char rel[REL_PATH_MAX];
+    esp_err_t err = (path && path_sanitize(path, rel, sizeof(rel)) && rel[0]) ? storage_mkdir(rel) : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(body);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return send_error(req, "409 Conflict", "ce dossier existe déjà");
+    }
+    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", "nom de dossier invalide");
+}
+
+static esp_err_t h_rename(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *from = json_str(body, "from");
+    const char *to = json_str(body, "to");
+    char rf[REL_PATH_MAX], rt[REL_PATH_MAX];
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    if (from && to && path_sanitize(from, rf, sizeof(rf)) && path_sanitize(to, rt, sizeof(rt)) && rf[0] && rt[0]) {
+        bool was_dir = storage_is_dir(rf);
+        err = storage_rename(rf, rt);
+        if (err == ESP_OK && was_dir) {
+            cards_on_folder_renamed(rf, rt);
+        }
+    }
+    cJSON_Delete(body);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return send_error(req, "409 Conflict", "ce nom est déjà utilisé");
+    }
+    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", "renommage impossible");
+}
+
+static esp_err_t h_delete(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *path = json_str(body, "path");
+    char rel[REL_PATH_MAX];
+    esp_err_t err =
+        (path && path_sanitize(path, rel, sizeof(rel)) && rel[0]) ? storage_remove_recursive(rel) : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(body);
+    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", "suppression impossible");
+}
+
+/* ================= Réglages ================= */
+
+static esp_err_t h_settings_get(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    settings_t cfg;
+    settings_get(&cfg);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "hostname", cfg.hostname);
+    cJSON_AddStringToObject(root, "wifi_ssid", cfg.wifi_ssid);
+    cJSON_AddStringToObject(root, "ota_url", cfg.ota_url);
+    cJSON_AddNumberToObject(root, "ota_interval_h", cfg.ota_interval_h);
+    cJSON_AddNumberToObject(root, "max_volume", cfg.max_volume);
+    cJSON_AddBoolToObject(root, "mpd_password_set", cfg.mpd_pass_set);
+    cJSON_AddNumberToObject(root, "mpd_port", CONFIG_ENC_MPD_PORT);
+    return send_json(req, root);
+}
+
+static esp_err_t h_settings_set(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    if (!body) {
+        return send_error(req, "400 Bad Request", "requête invalide");
+    }
+    settings_t cfg;
+    settings_get(&cfg);
+    const char *host = json_str(body, "hostname");
+    if (host && strcmp(host, cfg.hostname) != 0) {
+        if (settings_set_hostname(host) != ESP_OK) {
+            cJSON_Delete(body);
+            return send_error(req, "400 Bad Request", "nom invalide (lettres, chiffres et tirets, 32 max)");
+        }
+        settings_get(&cfg);
+        wifi_mgr_set_hostname(cfg.hostname);
+    }
+    const char *url = json_str(body, "ota_url");
+    const cJSON *interval = cJSON_GetObjectItem(body, "ota_interval_h");
+    if (url || cJSON_IsNumber(interval)) {
+        uint16_t ih = cJSON_IsNumber(interval) ? (uint16_t)interval->valueint : cfg.ota_interval_h;
+        if (settings_set_ota(url ? url : cfg.ota_url, ih) != ESP_OK) {
+            cJSON_Delete(body);
+            return send_error(req, "400 Bad Request", "adresse de mise à jour invalide (http:// ou https://)");
+        }
+        if (url && url[0] && strcmp(url, cfg.ota_url) != 0) {
+            ota_check_now();
+        }
+    }
+    const cJSON *maxv = cJSON_GetObjectItem(body, "max_volume");
+    if (cJSON_IsNumber(maxv)) {
+        if (settings_set_max_volume((uint8_t)maxv->valueint) != ESP_OK) {
+            cJSON_Delete(body);
+            return send_error(req, "400 Bad Request", "volume maximum invalide");
+        }
+        player_set_max_volume((uint8_t)maxv->valueint);
+    }
+    cJSON_Delete(body);
+    return send_ok(req);
+}
+
+static esp_err_t h_password(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *cur = json_str(body, "current");
+    const char *nw = json_str(body, "new");
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    const char *msg = "mot de passe actuel incorrect";
+    if (cur && nw && settings_check_admin_password(cur)) {
+        err = settings_set_admin_password(nw);
+        msg = "nouveau mot de passe trop court (6 caractères minimum)";
+    }
+    cJSON_Delete(body);
+    if (err != ESP_OK) {
+        return send_error(req, "400 Bad Request", msg);
+    }
+    clear_sessions(); /* déconnecte les autres appareils */
+    create_session(req);
+    return send_ok(req);
+}
+
+static esp_err_t h_mpd(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *pw = json_str(body, "password");
+    esp_err_t err = pw ? settings_set_mpd_password(pw) : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(body);
+    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", "mot de passe MPD invalide");
+}
+
+static esp_err_t h_wifi_scan(httpd_req_t *req)
+{
+    settings_t cfg;
+    settings_get(&cfg);
+    /* Autorisé sans connexion uniquement pendant l'assistant de première configuration. */
+    if (cfg.admin_set && !require_auth(req)) {
+        return ESP_OK;
+    }
+    wifi_ap_record_t *recs = calloc(24, sizeof(wifi_ap_record_t));
+    if (!recs) {
+        return send_error(req, "500 Internal Server Error", "mémoire insuffisante");
+    }
+    int n = wifi_mgr_scan(recs, 24);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "networks");
+    for (int i = 0; i < n; i++) {
+        const char *ssid = (const char *)recs[i].ssid;
+        bool dup = !ssid[0];
+        for (int j = 0; j < i && !dup; j++) {
+            dup = strcmp(ssid, (const char *)recs[j].ssid) == 0;
+        }
+        if (dup) {
+            continue; /* les résultats sont triés par signal : on garde le meilleur */
+        }
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddStringToObject(e, "ssid", ssid);
+        cJSON_AddNumberToObject(e, "rssi", recs[i].rssi);
+        cJSON_AddBoolToObject(e, "secure", recs[i].authmode != WIFI_AUTH_OPEN);
+        cJSON_AddItemToArray(arr, e);
+    }
+    free(recs);
+    return send_json(req, root);
+}
+
+static esp_err_t h_wifi_set(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *ssid = json_str(body, "ssid");
+    const char *pw = json_str(body, "password");
+    esp_err_t err = ssid ? settings_set_wifi(ssid, pw ? pw : "") : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(body);
+    if (err != ESP_OK) {
+        return send_error(req, "400 Bad Request", "réseau invalide (mot de passe de 8 caractères minimum)");
+    }
+    wifi_mgr_reconnect_later(1500);
+    return send_ok(req);
+}
+
+/* ================= Système ================= */
+
+static esp_err_t h_ota_check(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    ota_check_now();
+    return send_ok(req);
+}
+
+static esp_err_t h_ota_upload(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    esp_err_t err = ota_upload_begin(req->content_len);
+    if (err != ESP_OK) {
+        return send_error(req, "400 Bad Request", "taille de firmware invalide");
+    }
+    char *buf = malloc(4096);
+    size_t remaining = req->content_len;
+    int timeouts = 0;
+    while (buf && err == ESP_OK && remaining > 0) {
+        int n = httpd_req_recv(req, buf, remaining < 4096 ? remaining : 4096);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 5) {
+            continue;
+        }
+        if (n <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        timeouts = 0;
+        err = ota_upload_write((const uint8_t *)buf, n);
+        remaining -= n;
+    }
+    free(buf);
+    char msg[96];
+    if (err == ESP_ERR_INVALID_VERSION) {
+        ota_upload_end(false, msg, sizeof(msg));
+        return send_error(req, "400 Bad Request", "ce fichier n'est pas un firmware d'enceinte");
+    }
+    err = ota_upload_end(err == ESP_OK && remaining == 0, msg, sizeof(msg));
+    if (err != ESP_OK) {
+        return send_error(req, "400 Bad Request", msg);
+    }
+    return send_ok(req);
+}
+
+static esp_err_t h_reboot(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    send_ok(req);
+    ota_schedule_restart(1000);
+    return ESP_OK;
+}
+
+static esp_err_t h_factory_reset(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *pw = json_str(body, "password");
+    bool ok = pw && settings_check_admin_password(pw);
+    cJSON_Delete(body);
+    if (!ok) {
+        return send_error(req, "400 Bad Request", "mot de passe incorrect");
+    }
+    send_ok(req);
+    settings_factory_reset();
+    ota_schedule_restart(1000);
+    return ESP_OK;
+}
+
+/* ================= Démarrage ================= */
+
+esp_err_t web_server_start(void)
+{
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_uri_handlers = 32;
+    cfg.stack_size = 10240;
+    cfg.lru_purge_enable = true;
+    cfg.max_open_sockets = 7;
+    cfg.recv_wait_timeout = 10;
+    cfg.send_wait_timeout = 10;
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
+    httpd_handle_t server = NULL;
+    esp_err_t err = httpd_start(&server, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "démarrage impossible : %s", esp_err_to_name(err));
+        return err;
+    }
+    static const httpd_uri_t uris[] = {
+        {"/", HTTP_GET, h_index, NULL},
+        {"/index.html", HTTP_GET, h_index, NULL},
+        {"/app.js", HTTP_GET, h_app_js, NULL},
+        {"/style.css", HTTP_GET, h_style, NULL},
+        {"/api/state", HTTP_GET, h_state, NULL},
+        {"/api/setup", HTTP_POST, h_setup, NULL},
+        {"/api/login", HTTP_POST, h_login, NULL},
+        {"/api/logout", HTTP_POST, h_logout, NULL},
+        {"/api/status", HTTP_GET, h_status, NULL},
+        {"/api/player", HTTP_POST, h_player, NULL},
+        {"/api/cards", HTTP_GET, h_cards_get, NULL},
+        {"/api/cards", HTTP_POST, h_cards_set, NULL},
+        {"/api/cards/delete", HTTP_POST, h_cards_delete, NULL},
+        {"/api/cards/learn", HTTP_POST, h_cards_learn, NULL},
+        {"/api/files", HTTP_GET, h_files_list, NULL},
+        {"/api/upload", HTTP_PUT, h_upload, NULL},
+        {"/api/files/mkdir", HTTP_POST, h_mkdir, NULL},
+        {"/api/files/rename", HTTP_POST, h_rename, NULL},
+        {"/api/files/delete", HTTP_POST, h_delete, NULL},
+        {"/api/settings", HTTP_GET, h_settings_get, NULL},
+        {"/api/settings", HTTP_POST, h_settings_set, NULL},
+        {"/api/password", HTTP_POST, h_password, NULL},
+        {"/api/mpd", HTTP_POST, h_mpd, NULL},
+        {"/api/wifi/scan", HTTP_GET, h_wifi_scan, NULL},
+        {"/api/wifi", HTTP_POST, h_wifi_set, NULL},
+        {"/api/ota/check", HTTP_POST, h_ota_check, NULL},
+        {"/api/ota/upload", HTTP_PUT, h_ota_upload, NULL},
+        {"/api/reboot", HTTP_POST, h_reboot, NULL},
+        {"/api/factory-reset", HTTP_POST, h_factory_reset, NULL},
+    };
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+        httpd_register_uri_handler(server, &uris[i]);
+    }
+    httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, h_not_found);
+    ESP_LOGI(TAG, "interface web prête");
+    return ESP_OK;
+}

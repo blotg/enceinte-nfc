@@ -1,0 +1,109 @@
+menu "Enceinte"
+
+    menu "Brochage"
+        config ENC_PN532_UART_PORT
+            int "UART utilisée pour le PN532"
+            range 1 2
+            default 1
+
+        config ENC_PN532_TX_GPIO
+            int "GPIO TX de l'ESP32 (vers RX/SDA du PN532)"
+            default 20
+
+        config ENC_PN532_RX_GPIO
+            int "GPIO RX de l'ESP32 (vers TX/SCL du PN532)"
+            default 19
+
+        config ENC_SD_CS_GPIO
+            int "Carte SD : CS"
+            default 5
+
+        config ENC_SD_MOSI_GPIO
+            int "Carte SD : MOSI"
+            default 16
+
+        config ENC_SD_MISO_GPIO
+            int "Carte SD : MISO"
+            default 15
+
+        config ENC_SD_SCK_GPIO
+            int "Carte SD : SCK"
+            default 12
+
+        config ENC_SD_FREQ_KHZ
+            int "Carte SD : fréquence SPI (kHz)"
+            default 20000
+            help
+                20000 est sûr avec des fils courts. Baisser à 10000 en cas d'erreurs
+                de lecture, monter à 40000 sur un circuit imprimé.
+
+        config ENC_I2S_BCLK_GPIO
+            int "I2S BCLK (MAX98357A BCLK)"
+            default 3
+
+        config ENC_I2S_WS_GPIO
+            int "I2S LRCLK/WS (MAX98357A LRC)"
+            default 1
+
+        config ENC_I2S_DOUT_GPIO
+            int "I2S DOUT (MAX98357A DIN)"
+            default 9
+
+        config ENC_RESET_BUTTON_GPIO
+            int "Bouton de réinitialisation usine (appui 10 s)"
+            default 0
+            help
+                Par défaut le bouton BOOT de la carte de développement.
+    endmenu
+
+    menu "Comportement"
+        config ENC_DEFAULT_HOSTNAME
+            string "Nom réseau par défaut (nom.local)"
+            default "enceinte"
+
+        config ENC_AP_SSID_PREFIX
+            string "Préfixe du réseau Wi-Fi de configuration"
+            default "Enceinte"
+
+        config ENC_RESUME_TIMEOUT_S
+            int "Délai de reprise après retrait de la carte (s)"
+            default 600
+
+        config ENC_DEFAULT_VOLUME
+            int "Volume par défaut (0-100)"
+            range 0 100
+            default 30
+
+        config ENC_DEFAULT_MAX_VOLUME
+            int "Volume maximum par défaut (0-100)"
+            range 1 100
+            default 100
+
+        config ENC_WIFI_TX_POWER_DBM
+            int "Puissance d'émission Wi-Fi maximale (dBm)"
+            range 2 20
+            default 15
+            help
+                20 dBm est le maximum de l'ESP32-S3. Sur certaines cartes (alimentation 3,3 V
+                trop faible pendant les pointes d'émission, ou antenne mal adaptée), rien de
+                ce qui est émis n'est reçu à pleine puissance. Sur la carte du prototype,
+                le point d'accès était invisible à 20 dBm et fonctionnait à 17 et 15 dBm.
+
+        config ENC_MPD_PORT
+            int "Port du serveur MPD"
+            default 6600
+
+        config ENC_OTA_DEFAULT_URL
+            string "Source des mises à jour par défaut"
+            default "https://github.com/blotg/enceinte-nfc"
+            help
+                Dépôt GitHub (https://github.com/compte/depot : dernière release stable,
+                fichier enceinte.bin) ou manifeste JSON (https://serveur/manifest.json).
+                Vide = pas de mise à jour automatique. Modifiable dans la page d'administration.
+
+        config ENC_OTA_DEFAULT_INTERVAL_H
+            int "Intervalle de vérification des mises à jour (heures)"
+            default 24
+    endmenu
+
+endmenu

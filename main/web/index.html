@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2f6f62">
+<title>Enceinte</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo" aria-hidden="true">♪</span><span id="dev-name">Enceinte</span></div>
+  <div id="chips" class="chips"></div>
+</header>
+
+<main id="root">
+  <p class="loading">Chargement…</p>
+</main>
+
+<nav id="tabs" class="tabs" hidden>
+  <button data-tab="play" class="active"><span aria-hidden="true">▶</span>Lecture</button>
+  <button data-tab="cards"><span aria-hidden="true">▣</span>Cartes</button>
+  <button data-tab="music"><span aria-hidden="true">♫</span>Musique</button>
+  <button data-tab="settings"><span aria-hidden="true">⚙</span>Réglages</button>
+</nav>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>

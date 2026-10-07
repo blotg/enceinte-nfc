@@ -1,0 +1,7 @@
+# Fichiers générés par ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+# (dependencies.lock est conservé : il fige les versions des composants)
+__pycache__/

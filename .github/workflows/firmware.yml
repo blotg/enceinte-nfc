@@ -1,0 +1,82 @@
+# Tests et compilation à chaque push ; release publiée à chaque tag vX.Y.Z.
+# Un tag avec suffixe (v1.2.0-rc1) est publié en pré-version, ignorée par les enceintes.
+name: firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests sur PC
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dépendances
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg lame
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet python-mpd2
+      - name: Tests (unitaires, contrôleur de cartes, intégration MPD)
+        env:
+          PYTHON: ${{ runner.temp }}/venv/bin/python
+        run: test/host/run_tests.sh "$RUNNER_TEMP/tests"
+
+  build:
+    name: Compilation ESP-IDF
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.5.5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cohérence du tag et de version.txt
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(tr -d ' \n' < version.txt)"
+          if [ "${tag%%-*}" != "$version" ]; then
+            echo "::error::le tag $GITHUB_REF_NAME ne correspond pas à version.txt ($version)"
+            exit 1
+          fi
+      - name: Compilation
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          . "$IDF_PATH/export.sh"
+          idf.py set-target esp32s3
+          idf.py build
+          idf.py merge-bin -o enceinte-complet.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            build/enceinte.bin
+            build/enceinte-complet.bin
+          if-no-files-found: error
+
+  release:
+    name: Publication de la release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [tests, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: dist
+      - name: Release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/enceinte.bin dist/enceinte-complet.bin \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $flags
