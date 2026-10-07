@@ -65,6 +65,39 @@ void test_session(void)
     p.track[0] = '\0';
     CHECK(session_decide(&p, &keep, 200 * S, 9, SESS_PLAYER_PLAYING, 5) == SESSION_START_NEW);
 
+    /* Point rechargé après un redémarrage : la file n'existe plus, mais ce n'est pas
+     * « une autre carte » ; la carte reprend à la position enregistrée. */
+    resume_point_t r0 = point("AA", 0, 0, 0);
+    r0.removed = false; /* coupure de courant pendant la lecture */
+    r0.restored = true;
+    CHECK(session_decide(&r0, &def, 5 * S, 1, SESS_PLAYER_STOPPED, 1) == SESSION_RESUME_SEEK);
+    /* ... mais si une autre carte a été posée depuis le démarrage, la règle s'applique */
+    CHECK(session_decide(&r0, &def, 5 * S, 3, SESS_PLAYER_PLAYING, 2) == SESSION_START_NEW);
+    CHECK(session_decide(&r0, &keep, 5 * S, 3, SESS_PLAYER_PLAYING, 2) == SESSION_RESUME_SEEK);
+
+    /* Sérialisation : aller-retour, données tronquées ou abîmées */
+    resume_point_t src = point("04A1B2C3D4E5F6", 7, 9, 123);
+    strcpy(src.folder, "Livres audio/Le Petit Prince");
+    strcpy(src.track, "Livres audio/Le Petit Prince/03 - Chapitre trois.opus");
+    src.position_ms = 3725000;
+    src.removed_epoch = 1791234567;
+    src.finished = false;
+    uint8_t blob[600];
+    size_t n = resume_encode(&src, blob, sizeof(blob));
+    CHECK(n > 0);
+    resume_point_t dst;
+    CHECK(resume_decode(blob, n, &dst));
+    CHECK_STR(dst.uid, src.uid);
+    CHECK_STR(dst.folder, src.folder);
+    CHECK_STR(dst.track, src.track);
+    CHECK(dst.position_ms == 3725000 && dst.removed_epoch == 1791234567 && dst.removed && !dst.finished);
+    CHECK(dst.restored && dst.queue_version == 0 && dst.card_seq == 0);
+    CHECK(!resume_decode(blob, n - 1, &dst)); /* dernière chaîne sans terminateur */
+    CHECK(!resume_decode(blob, 10, &dst));
+    blob[0] = 99;
+    CHECK(!resume_decode(blob, n, &dst)); /* version inconnue */
+    CHECK(resume_encode(&src, blob, 20) == 0);    /* tampon trop petit */
+
     /* Règles : réglage de la carte prioritaire sur le réglage général */
     resume_policy_t r = session_policy(CARD_DEFAULT, CARD_DEFAULT, 600, false);
     CHECK(r.timeout_s == 600 && !r.after_other);

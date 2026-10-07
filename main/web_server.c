@@ -14,6 +14,9 @@
 #include "controller.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
+#include "esp_https_server.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -26,6 +29,7 @@
 #include "sdkconfig.h"
 #include "settings.h"
 #include "storage.h"
+#include "tls_cert.h"
 #include "util.h"
 #include "wifi_mgr.h"
 
@@ -50,6 +54,10 @@ typedef struct {
 } web_session_t;
 
 static web_session_t s_sessions[MAX_SESSIONS];
+static httpd_handle_t s_http, s_https;
+static volatile bool s_https_busy; /* démarrage/arrêt du serveur HTTPS en cours */
+/* user_ctx des gestionnaires : indique par quel serveur la requête est arrivée */
+static const int s_mark_http = 0, s_mark_https = 1;
 static volatile int s_transfers; /* envois en cours */
 static volatile int64_t s_last_transfer_us;
 
@@ -170,6 +178,56 @@ static bool client_on_ap(httpd_req_t *req)
     return (ntohl(ip) & 0xFFFFFF00) == 0xC0A80400; /* 192.168.4.0/24 */
 }
 
+/* ================= HTTPS ================= */
+
+static bool via_https(httpd_req_t *req)
+{
+    return req->user_ctx == &s_mark_https;
+}
+
+/* HTTPS activé : les accès HTTP depuis le réseau local passent en HTTPS (le portail de
+ * configuration du point d'accès reste en HTTP, les téléphones l'exigent). */
+static bool must_use_https(httpd_req_t *req)
+{
+    return s_https && !via_https(req) && !client_on_ap(req);
+}
+
+static void https_url(httpd_req_t *req, const char *uri, char *out, size_t len)
+{
+    char host[64] = "";
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK || !host[0]) {
+        settings_t cfg;
+        settings_get(&cfg);
+        snprintf(host, sizeof(host), "%s.local", cfg.hostname);
+    }
+    char *colon = strchr(host, ':');
+    if (colon) {
+        *colon = '\0';
+    }
+    snprintf(out, len, "https://%s%s", host, uri);
+}
+
+static esp_err_t redirect_https(httpd_req_t *req)
+{
+    static char location[320];
+    https_url(req, req->uri, location, sizeof(location));
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", location);
+    return httpd_resp_send(req, NULL, 0);
+}
+
+/* API appelée en HTTP alors que HTTPS est actif : l'interface se recharge en HTTPS. */
+static esp_err_t deny_http(httpd_req_t *req)
+{
+    char url[300];
+    https_url(req, "/", url, sizeof(url));
+    httpd_resp_set_status(req, "403 Forbidden");
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "error", "HTTPS requis");
+    cJSON_AddStringToObject(root, "https", url);
+    return send_json(req, root);
+}
+
 /* ================= Authentification ================= */
 
 static web_session_t *find_session(httpd_req_t *req)
@@ -208,9 +266,9 @@ static void create_session(httpd_req_t *req)
     esp_fill_random(rnd, sizeof(rnd));
     bytes_to_hex(rnd, sizeof(rnd), s_sessions[slot].token);
     s_sessions[slot].last_used = esp_timer_get_time();
-    static char cookie[96];
-    snprintf(cookie, sizeof(cookie), "sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000",
-             s_sessions[slot].token);
+    static char cookie[112];
+    snprintf(cookie, sizeof(cookie), "sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000%s",
+             s_sessions[slot].token, via_https(req) ? "; Secure" : "");
     httpd_resp_set_hdr(req, "Set-Cookie", cookie);
 }
 
@@ -232,6 +290,10 @@ static bool csrf_ok(httpd_req_t *req)
 
 static bool require_auth(httpd_req_t *req)
 {
+    if (must_use_https(req)) {
+        deny_http(req);
+        return false;
+    }
     if (!csrf_ok(req)) {
         send_error(req, "403 Forbidden", "requête refusée");
         return false;
@@ -247,6 +309,9 @@ static bool require_auth(httpd_req_t *req)
 
 static esp_err_t send_static(httpd_req_t *req, const char *start, const char *end, const char *type)
 {
+    if (must_use_https(req)) {
+        return redirect_https(req);
+    }
     httpd_resp_set_type(req, type);
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     /* EMBED_TXTFILES ajoute un octet nul final */
@@ -285,6 +350,9 @@ static esp_err_t h_not_found(httpd_req_t *req, httpd_err_code_t err)
 
 static esp_err_t h_state(httpd_req_t *req)
 {
+    if (must_use_https(req)) {
+        return deny_http(req);
+    }
     settings_t cfg;
     settings_get(&cfg);
     ota_status_t os;
@@ -354,6 +422,9 @@ static esp_err_t h_setup(httpd_req_t *req)
 
 static esp_err_t h_login(httpd_req_t *req)
 {
+    if (must_use_https(req)) {
+        return deny_http(req);
+    }
     if (!csrf_ok(req)) {
         return send_error(req, "403 Forbidden", "requête refusée");
     }
@@ -843,18 +914,31 @@ static esp_err_t h_rename(httpd_req_t *req)
     const char *to = json_str(body, "to");
     char rf[REL_PATH_MAX], rt[REL_PATH_MAX];
     esp_err_t err = ESP_ERR_INVALID_ARG;
+    const char *msg = "renommage ou déplacement impossible";
     if (from && to && path_sanitize(from, rf, sizeof(rf)) && path_sanitize(to, rt, sizeof(rt)) && rf[0] && rt[0]) {
-        bool was_dir = storage_is_dir(rf);
-        err = storage_rename(rf, rt);
-        if (err == ESP_OK && was_dir) {
-            cards_on_folder_renamed(rf, rt);
+        size_t fl = strlen(rf);
+        char parent[REL_PATH_MAX];
+        path_dirname(rt, parent, sizeof(parent));
+        if (strncmp(rt, rf, fl) == 0 && rt[fl] == '/') {
+            msg = "impossible de déplacer un dossier dans lui-même";
+        } else if (!storage_is_dir(parent)) {
+            msg = "dossier de destination introuvable";
+        } else {
+            bool was_dir = storage_is_dir(rf);
+            err = storage_rename(rf, rt);
+            if (err == ESP_OK) {
+                if (was_dir) {
+                    cards_on_folder_renamed(rf, rt);
+                }
+                controller_on_path_renamed(rf, rt);
+            }
         }
     }
     cJSON_Delete(body);
     if (err == ESP_ERR_INVALID_STATE) {
-        return send_error(req, "409 Conflict", "ce nom est déjà utilisé");
+        return send_error(req, "409 Conflict", "ce nom est déjà utilisé à cet endroit");
     }
-    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", "renommage impossible");
+    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", msg);
 }
 
 static esp_err_t h_delete(httpd_req_t *req)
@@ -888,6 +972,9 @@ static esp_err_t h_settings_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "max_volume", cfg.max_volume);
     cJSON_AddNumberToObject(root, "resume_s", cfg.resume_timeout_s);
     cJSON_AddBoolToObject(root, "resume_after_other", cfg.resume_after_other);
+    cJSON_AddBoolToObject(root, "https_enabled", cfg.https_enabled);
+    cJSON_AddBoolToObject(root, "https_active", s_https != NULL);
+    cJSON_AddBoolToObject(root, "https_pending", s_https_busy);
     cJSON_AddBoolToObject(root, "mpd_password_set", cfg.mpd_pass_set);
     cJSON_AddNumberToObject(root, "mpd_port", CONFIG_ENC_MPD_PORT);
     return send_json(req, root);
@@ -1112,57 +1199,139 @@ static esp_err_t h_factory_reset(httpd_req_t *req)
 
 /* ================= Démarrage ================= */
 
+static esp_err_t h_https(httpd_req_t *req);
+
+static const httpd_uri_t s_uris[] = {
+    {"/", HTTP_GET, h_index, NULL},
+    {"/index.html", HTTP_GET, h_index, NULL},
+    {"/app.js", HTTP_GET, h_app_js, NULL},
+    {"/style.css", HTTP_GET, h_style, NULL},
+    {"/api/state", HTTP_GET, h_state, NULL},
+    {"/api/setup", HTTP_POST, h_setup, NULL},
+    {"/api/login", HTTP_POST, h_login, NULL},
+    {"/api/logout", HTTP_POST, h_logout, NULL},
+    {"/api/status", HTTP_GET, h_status, NULL},
+    {"/api/player", HTTP_POST, h_player, NULL},
+    {"/api/cards", HTTP_GET, h_cards_get, NULL},
+    {"/api/cards", HTTP_POST, h_cards_set, NULL},
+    {"/api/cards/delete", HTTP_POST, h_cards_delete, NULL},
+    {"/api/cards/learn", HTTP_POST, h_cards_learn, NULL},
+    {"/api/files", HTTP_GET, h_files_list, NULL},
+    {"/api/upload", HTTP_PUT, h_upload, NULL},
+    {"/api/files/mkdir", HTTP_POST, h_mkdir, NULL},
+    {"/api/files/rename", HTTP_POST, h_rename, NULL},
+    {"/api/files/delete", HTTP_POST, h_delete, NULL},
+    {"/api/settings", HTTP_GET, h_settings_get, NULL},
+    {"/api/settings", HTTP_POST, h_settings_set, NULL},
+    {"/api/password", HTTP_POST, h_password, NULL},
+    {"/api/mpd", HTTP_POST, h_mpd, NULL},
+    {"/api/https", HTTP_POST, h_https, NULL},
+    {"/api/wifi/scan", HTTP_GET, h_wifi_scan, NULL},
+    {"/api/wifi", HTTP_POST, h_wifi_set, NULL},
+    {"/api/ota/check", HTTP_POST, h_ota_check, NULL},
+    {"/api/ota/upload", HTTP_PUT, h_ota_upload, NULL},
+    {"/api/reboot", HTTP_POST, h_reboot, NULL},
+    {"/api/factory-reset", HTTP_POST, h_factory_reset, NULL},
+};
+
+static void register_handlers(httpd_handle_t srv, bool secure)
+{
+    for (size_t i = 0; i < sizeof(s_uris) / sizeof(s_uris[0]); i++) {
+        httpd_uri_t u = s_uris[i];
+        u.user_ctx = (void *)(secure ? &s_mark_https : &s_mark_http);
+        httpd_register_uri_handler(srv, &u);
+    }
+}
+
+static void base_config(httpd_config_t *cfg)
+{
+    cfg->max_uri_handlers = 36;
+    cfg->lru_purge_enable = true;
+    cfg->recv_wait_timeout = 10;
+    cfg->send_wait_timeout = 10;
+    cfg->uri_match_fn = httpd_uri_match_wildcard;
+}
+
+/* Démarre ou arrête le serveur HTTPS selon le réglage. Tâche dédiée : la génération du
+ * certificat demande de la pile, et un serveur ne peut pas s'arrêter depuis sa propre requête. */
+static void https_apply_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(500)); /* laisse partir la réponse HTTP en cours */
+    settings_t cfg;
+    settings_get(&cfg);
+    if (!cfg.https_enabled && s_https) {
+        httpd_ssl_stop(s_https);
+        s_https = NULL;
+        ESP_LOGI(TAG, "HTTPS arrêté");
+    } else if (cfg.https_enabled && !s_https) {
+        httpd_ssl_config_t ssl = HTTPD_SSL_CONFIG_DEFAULT();
+        size_t cert_len, key_len;
+        const char *cert, *key;
+        if (tls_cert_get(cfg.hostname, &cert, &cert_len, &key, &key_len) == ESP_OK) {
+            ssl.servercert = (const uint8_t *)cert;
+            ssl.servercert_len = cert_len;
+            ssl.prvtkey_pem = (const uint8_t *)key;
+            ssl.prvtkey_len = key_len;
+            base_config(&ssl.httpd);
+            ssl.httpd.stack_size = 12288;
+            ssl.httpd.max_open_sockets = 4;
+            httpd_handle_t srv = NULL;
+            esp_err_t err = httpd_ssl_start(&srv, &ssl);
+            if (err == ESP_OK) {
+                register_handlers(srv, true);
+                s_https = srv;
+                ESP_LOGI(TAG, "HTTPS actif : https://%s.local", cfg.hostname);
+            } else {
+                ESP_LOGE(TAG, "démarrage HTTPS impossible : %s", esp_err_to_name(err));
+            }
+        }
+    }
+    s_https_busy = false;
+    vTaskDelete(NULL);
+}
+
+static void https_apply(void)
+{
+    s_https_busy = true;
+    if (xTaskCreate(https_apply_task, "https_apply", 8192, NULL, 4, NULL) != pdPASS) {
+        s_https_busy = false;
+    }
+}
+
+static esp_err_t h_https(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const cJSON *en = cJSON_GetObjectItem(body, "enabled");
+    esp_err_t err = cJSON_IsBool(en) ? settings_set_https(cJSON_IsTrue(en)) : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(body);
+    if (err != ESP_OK) {
+        return send_error(req, "400 Bad Request", "réglage invalide");
+    }
+    https_apply();
+    return send_ok(req);
+}
+
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 32;
+    base_config(&cfg);
     cfg.stack_size = 10240;
-    cfg.lru_purge_enable = true;
     cfg.max_open_sockets = 7;
-    cfg.recv_wait_timeout = 10;
-    cfg.send_wait_timeout = 10;
-    cfg.uri_match_fn = httpd_uri_match_wildcard;
-    httpd_handle_t server = NULL;
-    esp_err_t err = httpd_start(&server, &cfg);
+    esp_err_t err = httpd_start(&s_http, &cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "démarrage impossible : %s", esp_err_to_name(err));
         return err;
     }
-    static const httpd_uri_t uris[] = {
-        {"/", HTTP_GET, h_index, NULL},
-        {"/index.html", HTTP_GET, h_index, NULL},
-        {"/app.js", HTTP_GET, h_app_js, NULL},
-        {"/style.css", HTTP_GET, h_style, NULL},
-        {"/api/state", HTTP_GET, h_state, NULL},
-        {"/api/setup", HTTP_POST, h_setup, NULL},
-        {"/api/login", HTTP_POST, h_login, NULL},
-        {"/api/logout", HTTP_POST, h_logout, NULL},
-        {"/api/status", HTTP_GET, h_status, NULL},
-        {"/api/player", HTTP_POST, h_player, NULL},
-        {"/api/cards", HTTP_GET, h_cards_get, NULL},
-        {"/api/cards", HTTP_POST, h_cards_set, NULL},
-        {"/api/cards/delete", HTTP_POST, h_cards_delete, NULL},
-        {"/api/cards/learn", HTTP_POST, h_cards_learn, NULL},
-        {"/api/files", HTTP_GET, h_files_list, NULL},
-        {"/api/upload", HTTP_PUT, h_upload, NULL},
-        {"/api/files/mkdir", HTTP_POST, h_mkdir, NULL},
-        {"/api/files/rename", HTTP_POST, h_rename, NULL},
-        {"/api/files/delete", HTTP_POST, h_delete, NULL},
-        {"/api/settings", HTTP_GET, h_settings_get, NULL},
-        {"/api/settings", HTTP_POST, h_settings_set, NULL},
-        {"/api/password", HTTP_POST, h_password, NULL},
-        {"/api/mpd", HTTP_POST, h_mpd, NULL},
-        {"/api/wifi/scan", HTTP_GET, h_wifi_scan, NULL},
-        {"/api/wifi", HTTP_POST, h_wifi_set, NULL},
-        {"/api/ota/check", HTTP_POST, h_ota_check, NULL},
-        {"/api/ota/upload", HTTP_PUT, h_ota_upload, NULL},
-        {"/api/reboot", HTTP_POST, h_reboot, NULL},
-        {"/api/factory-reset", HTTP_POST, h_factory_reset, NULL},
-    };
-    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-        httpd_register_uri_handler(server, &uris[i]);
+    register_handlers(s_http, false);
+    httpd_register_err_handler(s_http, HTTPD_404_NOT_FOUND, h_not_found);
+    settings_t st;
+    settings_get(&st);
+    if (st.https_enabled) {
+        https_apply();
     }
-    httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, h_not_found);
     ESP_LOGI(TAG, "interface web prête");
     return ESP_OK;
 }

@@ -26,3 +26,5 @@ void controller_on_player_event(player_event_t evt);
 void controller_learn_start(void);
 void controller_learn_cancel(void);
 void controller_get_status(controller_status_t *st);
+/* Un fichier ou un dossier a été déplacé ou renommé : met à jour les positions mémorisées. */
+void controller_on_path_renamed(const char *from, const char *to);

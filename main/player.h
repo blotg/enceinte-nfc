@@ -84,6 +84,9 @@ esp_err_t player_queue_clear(void);
 esp_err_t player_queue_shuffle(void);
 /* Remplace toute la file (utilisé par les cartes NFC). */
 esp_err_t player_queue_replace(const path_list_t *list);
+/* Un fichier ou dossier a été déplacé : met à jour les chemins de la file. Retourne true si
+ * la file a changé. */
+bool player_queue_rename(const char *from, const char *to);
 
 /* ---- Transport ---- */
 esp_err_t player_play(int pos); /* pos < 0 : reprendre / démarrer */

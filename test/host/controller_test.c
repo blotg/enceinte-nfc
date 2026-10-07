@@ -10,6 +10,7 @@
 
 #include "controller.h"
 #include "player.h"
+#include "resume_store.h"
 #include "test.h"
 
 int g_failures;
@@ -17,12 +18,64 @@ int g_checks;
 
 void mock_set_resume(uint32_t timeout_s, bool after_other);
 
+/* Mémoire permanente simulée : passe par la vraie sérialisation */
+static uint8_t g_store[16][600];
+static size_t g_store_len[16];
+static int g_saves;
+
+void resume_store_load(resume_point_t *points, int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (g_store_len[i]) {
+            resume_decode(g_store[i], g_store_len[i], &points[i]);
+        }
+    }
+}
+
+esp_err_t resume_store_save(int slot, const resume_point_t *p)
+{
+    g_store_len[slot] = resume_encode(p, g_store[slot], sizeof(g_store[slot]));
+    g_saves++;
+    return ESP_OK;
+}
+
+esp_err_t resume_store_erase(int slot)
+{
+    g_store_len[slot] = 0;
+    g_saves++;
+    return ESP_OK;
+}
+
+static bool stored(const char *uid, resume_point_t *out)
+{
+    for (int i = 0; i < 16; i++) {
+        if (g_store_len[i] && resume_decode(g_store[i], g_store_len[i], out) && strcmp(out->uid, uid) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Les écritures sont espacées d'au moins 10 s par carte : on attend l'écriture différée. */
+static bool wait_stored(const char *uid, const char *track, bool removed, resume_point_t *out)
+{
+    for (int i = 0; i < 130; i++) {
+        if (stored(uid, out) && strcmp(out->track, track) == 0 && out->removed == removed) {
+            return true;
+        }
+        usleep(100000);
+    }
+    return false;
+}
+
 /* Associations simulées ; la carte EE reprend même après une autre carte (réglage propre). */
+static char g_ee_folder[64] = "Livre";
+
 bool cards_get(const char *uid, card_entry_t *out)
 {
     const char *f = strcmp(uid, "AA") == 0   ? "Histoire"
                     : strcmp(uid, "BB") == 0 ? "Comptines"
-                    : strcmp(uid, "EE") == 0 ? "Livre"
+                    : strcmp(uid, "EE") == 0 ? g_ee_folder
                                              : NULL;
     if (!f) {
         return false;
@@ -103,8 +156,44 @@ int main(int argc, char **argv)
     snprintf(p, sizeof(p), "%s/Comptines/b.mp3", sd);
     make_file(p, 2 << 20); /* ~12 s simulées */
 
+    /* Livre audio de deux fichiers WAV réels (repositionnables), si disponibles */
+    bool have_wav = argc > 1;
+    if (have_wav) {
+        char src[512];
+        snprintf(p, sizeof(p), "%s/Livre", sd);
+        mkdir(p, 0755);
+        snprintf(src, sizeof(src), "%s/long.wav", argv[1]);
+        snprintf(p, sizeof(p), "%s/Livre/1.wav", sd);
+        have_wav = copy_file(src, p);
+        snprintf(p, sizeof(p), "%s/Livre/2.wav", sd);
+        have_wav = have_wav && copy_file(src, p);
+        /* Position enregistrée avant une coupure de courant : carte EE, 2e fichier, 15 s */
+        resume_point_t saved = {0};
+        strcpy(saved.uid, "EE");
+        strcpy(saved.folder, "Livre");
+        strcpy(saved.track, "Livre/2.wav");
+        saved.position_ms = 15000;
+        g_store_len[3] = resume_encode(&saved, g_store[3], sizeof(g_store[3]));
+    }
+
     CHECK(player_init(30, 100, controller_on_player_event) == ESP_OK);
     CHECK(controller_start() == ESP_OK);
+
+    /* 0. Au démarrage, la position enregistrée est rechargée : la carte reprend là */
+    if (have_wav) {
+        mock_set_resume(0, false); /* sans délai : l'écriture différée a le temps de se faire */
+        controller_on_nfc(true, "EE");
+        usleep(80000);
+        player_status_t st0 = status();
+        CHECK(st0.state == PLAYER_PLAYING);
+        CHECK_STR(st0.file, "Livre/2.wav");
+        CHECK(st0.elapsed_ms >= 15000 && st0.elapsed_ms < 18000);
+        card(false, "EE");
+        CHECK(wait_state(PLAYER_PAUSED, 1000));
+        resume_point_t sp;
+        CHECK(wait_stored("EE", "Livre/2.wav", true, &sp) && sp.position_ms >= 15000);
+        mock_set_resume(2, false);
+    }
 
     /* 1. Carte posée : lecture du dossier associé */
     card(true, "AA");
@@ -223,18 +312,11 @@ int main(int argc, char **argv)
 
     /* 11. Reprise après une autre carte (réglage de la carte EE) : le dossier est rechargé et
      *     la lecture repart au morceau et à la position mémorisés, dans un vrai fichier WAV. */
-    if (argc > 1) {
-        char src[512];
-        snprintf(p, sizeof(p), "%s/Livre", sd);
-        mkdir(p, 0755);
-        snprintf(src, sizeof(src), "%s/long.wav", argv[1]);
-        snprintf(p, sizeof(p), "%s/Livre/1.wav", sd);
-        CHECK(copy_file(src, p));
-        snprintf(p, sizeof(p), "%s/Livre/2.wav", sd);
-        CHECK(copy_file(src, p));
+    if (have_wav) {
         card(false, "AA");
-        card(true, "EE");
+        card(true, "EE"); /* sa position précédente a expiré (délai de 2 s) : début du livre */
         CHECK(wait_state(PLAYER_PLAYING, 1000));
+        CHECK_STR(status().file, "Livre/1.wav");
         usleep(350000);
         card(false, "EE");
         CHECK(wait_state(PLAYER_PAUSED, 1000));
@@ -257,6 +339,39 @@ int main(int argc, char **argv)
         CHECK(wait_state(PLAYER_PLAYING, 1000));
         CHECK_STR(status().file, "Histoire/1 debut.mp3");
         CHECK(status().elapsed_ms < 5000);
+
+        /* 12. Dossier déplacé : la position mémorisée suit (fichiers et mémoire permanente) */
+        mock_set_resume(0, false);
+        card(false, "AA");
+        card(true, "EE"); /* EE reprend (règle « après une autre carte ») */
+        CHECK(wait_state(PLAYER_PLAYING, 1000));
+        usleep(300000);
+        card(false, "EE");
+        char from[512], to[512];
+        snprintf(p, sizeof(p), "%s/Audio", sd);
+        mkdir(p, 0755);
+        snprintf(from, sizeof(from), "%s/Livre", sd);
+        snprintf(to, sizeof(to), "%s/Audio/Livre", sd);
+        CHECK(rename(from, to) == 0);
+        snprintf(g_ee_folder, sizeof(g_ee_folder), "Audio/Livre"); /* l'association suit aussi */
+        controller_on_path_renamed("Livre", "Audio/Livre");
+        resume_point_t mv;
+        CHECK(wait_stored("EE", "Audio/Livre/1.wav", true, &mv) && strcmp(mv.folder, "Audio/Livre") == 0);
+        CHECK_STR(status().file, "Audio/Livre/1.wav"); /* la file de lecture a suivi */
+        card(true, "EE"); /* reprise immédiate de la carte, dans le dossier déplacé */
+        CHECK(wait_state(PLAYER_PLAYING, 1000));
+        CHECK_STR(status().file, "Audio/Livre/1.wav");
+        CHECK(status().elapsed_ms > 5000);
+        card(false, "EE");
+        mock_set_resume(2, false);
+
+        /* 13. Écritures espacées : retraits et poses rapides n'écrivent pas à chaque fois */
+        int saves_before = g_saves;
+        for (int i = 0; i < 4; i++) {
+            card(false, "AA");
+            card(true, "AA");
+        }
+        CHECK(g_saves - saves_before <= 2);
     } else {
         printf("(scénario de reprise après une autre carte ignoré : fichiers d'exemple absents)\n");
     }

@@ -1233,6 +1233,31 @@ esp_err_t player_queue_replace(const path_list_t *list)
     return ESP_OK;
 }
 
+bool player_queue_rename(const char *from, const char *to)
+{
+    size_t fl = strlen(from), tl = strlen(to);
+    bool changed = false;
+    LOCK();
+    for (int i = 0; i < s_qlen; i++) {
+        const char *p = s_queue[i].path;
+        if (strncmp(p, from, fl) == 0 && (p[fl] == '\0' || p[fl] == '/')) {
+            char *np = malloc(tl + strlen(p + fl) + 1);
+            if (np) {
+                memcpy(np, to, tl);
+                strcpy(np + tl, p + fl);
+                free(s_queue[i].path);
+                s_queue[i].path = np;
+                changed = true;
+            }
+        }
+    }
+    if (changed) {
+        queue_changed_locked();
+    }
+    UNLOCK();
+    return changed;
+}
+
 esp_err_t player_play(int pos)
 {
     return post(CMD_PLAY_POS, pos, 0, true);

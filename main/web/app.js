@@ -50,6 +50,10 @@ async function api(path, opts = {}) {
     showLogin();
     throw new AuthError(data.error || 'Connexion requise');
   }
+  if (res.status === 403 && data.https) {
+    location.href = data.https; /* HTTPS activé : on bascule */
+    throw new AuthError('Passage en HTTPS');
+  }
   if (!res.ok) throw new Error(data.error || ('Erreur ' + res.status));
   return data;
 }
@@ -125,6 +129,7 @@ const app = {
   view: null, // éléments de la vue courante mis à jour par le rafraîchissement
   uploads: [],
   uploading: false,
+  selected: new Set(), // chemins sélectionnés dans l'onglet Musique
 };
 
 function stopPolling() {
@@ -592,6 +597,7 @@ async function renderMusic(path = app.path) {
     setKids(root, h('div', { class: 'notice bad' }, e.message));
     return;
   }
+  if (app.path !== data.path) app.selected.clear();
   app.path = data.path;
 
   const crumbs = h('div', { class: 'crumbs' });
@@ -610,8 +616,33 @@ async function renderMusic(path = app.path) {
 
   const list = h('ul', { class: 'list' });
   if (!data.entries.length) list.append(h('li', { class: 'muted' }, 'Dossier vide.'));
+  const selBar = h('div', { class: 'selbar', hidden: true });
+  const drawSelBar = () => {
+    const n = app.selected.size;
+    selBar.hidden = n === 0;
+    if (!n) return;
+    const moveBtn = h('button', { class: 'small primary', onclick: () => moveFlow([...app.selected], data.path) }, '↦ Déplacer…');
+    const delBtn = h('button', { class: 'small danger' }, '✕ Supprimer');
+    delBtn.addEventListener('click', () => {
+      if (!confirm(`Supprimer ${n} élément(s) (les dossiers avec tout leur contenu) ?`)) return;
+      busy(delBtn, async () => {
+        let failed = 0;
+        for (const path of app.selected) {
+          try { await post('/api/files/delete', { path }); } catch (err) { failed++; }
+        }
+        app.selected.clear();
+        toast(failed ? `${failed} suppression(s) impossible(s)` : 'Supprimé', failed > 0);
+        renderMusic();
+      });
+    });
+    setKids(selBar, h('span', { class: 'grow' }, `${n} sélectionné${n > 1 ? 's' : ''}`), moveBtn, delBtn,
+      h('button', { class: 'small', 'aria-label': 'Annuler la sélection', onclick: () => { app.selected.clear(); renderMusic(); } }, '✕'));
+  };
   for (const e of data.entries) {
     const full = joinPath(data.path, e.name);
+    const check = h('input', { type: 'checkbox', class: 'sel', checked: app.selected.has(full), 'aria-label': 'Sélectionner ' + e.name });
+    check.addEventListener('change', () => { if (check.checked) app.selected.add(full); else app.selected.delete(full); drawSelBar(); });
+    const mv = h('button', { class: 'small', 'aria-label': 'Déplacer', title: 'Déplacer', onclick: () => moveFlow([full], data.path) }, '↦');
     const ren = h('button', { class: 'small', 'aria-label': 'Renommer' }, '✎');
     ren.addEventListener('click', () => {
       const name = prompt('Nouveau nom :', e.name);
@@ -624,18 +655,19 @@ async function renderMusic(path = app.path) {
       busy(del, async () => { await post('/api/files/delete', { path: full }); toast('Supprimé'); renderMusic(); });
     });
     if (e.dir) {
-      list.append(h('li', null,
+      list.append(h('li', null, check,
         h('span', { class: 'ico' }, '📁'),
         h('div', { class: 'name' }, h('button', { class: 'linkish', onclick: () => renderMusic(full) }, e.name)),
-        h('button', { class: 'small', 'aria-label': 'Lire', onclick: () => playFolder(full) }, '▶'),
-        ren, del));
+        h('button', { class: 'small', 'aria-label': 'Lire', title: 'Lire', onclick: () => playFolder(full) }, '▶'),
+        ren, mv, del));
     } else {
-      list.append(h('li', null,
+      list.append(h('li', null, check,
         h('span', { class: 'ico' }, e.audio ? '♪' : '·'),
         h('div', { class: 'name' }, e.name, h('small', null, fmtSize(e.size))),
-        ren, del));
+        ren, mv, del));
     }
   }
+  drawSelBar();
 
   const filesInput = h('input', { type: 'file', multiple: true, hidden: true });
   const dirInput = h('input', { type: 'file', multiple: true, hidden: true, webkitdirectory: true });
@@ -678,8 +710,69 @@ async function renderMusic(path = app.path) {
       filesInput, dirInput,
       h('div', { class: 'actions' }, drop),
       uploadsBox),
-    h('div', { class: 'card' }, list, h('div', { class: 'actions' }, usage)));
+    h('div', { class: 'card' }, selBar, list, h('div', { class: 'actions' }, usage)));
   drawUploads();
+}
+
+/*
+ * Déplacement : choix du dossier de destination en naviguant dans la carte SD.
+ * Les éléments déplacés (et leurs sous-dossiers) ne sont pas proposés comme destination.
+ */
+function moveFlow(items, backPath) {
+  const inMoved = (p) => items.some((it) => p === it || p.startsWith(it + '/'));
+  const parentOf = (p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
+  const box = h('div', { class: 'card stack' });
+  setKids(root, box);
+  app.view = null;
+  const back = () => { renderMusic(backPath); };
+  const show = async (cur) => {
+    let data;
+    try {
+      data = await api('/api/files?path=' + encodeURIComponent(cur));
+    } catch (e) { reportError(e); return show(''); }
+    const crumbs = h('div', { class: 'crumbs' }, h('button', { class: 'small', onclick: () => show('') }, 'Carte SD'));
+    let acc = '';
+    for (const part of cur ? cur.split('/') : []) {
+      acc = joinPath(acc, part);
+      const target = acc;
+      crumbs.append(h('span', { class: 'muted' }, '›'), h('button', { class: 'small', onclick: () => show(target) }, part));
+    }
+    const list = h('ul', { class: 'list' });
+    const dirs = data.entries.filter((e) => e.dir && !inMoved(joinPath(cur, e.name)));
+    if (!dirs.length) list.append(h('li', { class: 'muted' }, 'Aucun sous-dossier.'));
+    for (const e of dirs) {
+      const full = joinPath(cur, e.name);
+      list.append(h('li', null, h('span', { class: 'ico' }, '📁'),
+        h('div', { class: 'name' }, h('button', { class: 'linkish', onclick: () => show(full) }, e.name))));
+    }
+    const sameDir = items.every((it) => parentOf(it) === cur);
+    const go = h('button', { class: 'primary', disabled: sameDir }, 'Déplacer ici');
+    go.addEventListener('click', () => busy(go, async () => {
+      const errors = [];
+      for (const from of items) {
+        try {
+          await post('/api/files/rename', { from, to: joinPath(cur, baseName(from)) });
+        } catch (e) { errors.push(`${baseName(from)} : ${e.message}`); }
+      }
+      app.selected.clear();
+      if (errors.length) toast(errors.join(' ; '), true);
+      else toast(`${items.length} élément(s) déplacé(s)`);
+      renderMusic(backPath);
+    }));
+    const mk = h('button', { class: 'small' }, '+ Nouveau dossier');
+    mk.addEventListener('click', () => {
+      const name = prompt('Nom du nouveau dossier :');
+      if (!name) return;
+      busy(mk, async () => { await post('/api/files/mkdir', { path: joinPath(cur, name.trim()) }); show(joinPath(cur, name.trim())); });
+    });
+    setKids(box,
+      h('h2', null, items.length > 1 ? `Déplacer ${items.length} éléments` : `Déplacer « ${baseName(items[0])} »`),
+      h('p', { class: 'small muted' }, 'Choisissez le dossier de destination :'),
+      crumbs, list,
+      h('div', { class: 'row' }, mk),
+      h('div', { class: 'row end actions' }, h('button', { onclick: back }, 'Annuler'), go));
+  };
+  show(backPath).catch(reportError);
 }
 
 async function collectEntry(entry, prefix, out) {
@@ -826,6 +919,37 @@ async function renderSettings() {
     toast('Réglages de reprise enregistrés');
   }));
 
+  /* HTTPS */
+  const httpsBox = h('input', { type: 'checkbox', checked: !!s.https_enabled });
+  const httpsMsg = h('p', { class: 'small' });
+  const httpsUrl = `https://${location.hostname}/#settings`;
+  const showHttpsState = (st) => {
+    if (st.https_pending) httpsMsg.textContent = 'Application en cours…';
+    else if (st.https_active) {
+      setKids(httpsMsg, 'HTTPS actif. ',
+        location.protocol === 'https:' ? 'Cette page est chiffrée.' : h('a', { href: httpsUrl }, 'Ouvrir la version sécurisée'));
+    } else httpsMsg.textContent = 'HTTPS désactivé : l\'interface est en HTTP.';
+  };
+  showHttpsState(s);
+  const saveHttps = h('button', { class: 'primary' }, 'Enregistrer');
+  saveHttps.addEventListener('click', () => busy(saveHttps, async () => {
+    const enable = httpsBox.checked;
+    await post('/api/https', { enabled: enable });
+    httpsMsg.textContent = enable ? 'Création du certificat et démarrage de HTTPS…' : 'Arrêt de HTTPS…';
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      let st;
+      try { st = await api('/api/settings'); } catch (e) { if (!enable) break; continue; }
+      if (!st.https_pending && st.https_active === enable) { showHttpsState(st); break; }
+    }
+    if (enable && location.protocol !== 'https:') {
+      toast('Ouverture de la version sécurisée : acceptez l\'avertissement du navigateur.');
+      setTimeout(() => { location.href = httpsUrl; }, 1500);
+    } else if (!enable && location.protocol === 'https:') {
+      setTimeout(() => { location.href = `http://${location.hostname}/#settings`; }, 1500);
+    }
+  }));
+
   /* Sécurité */
   const cur = passwordInput('current-password'), nw = passwordInput('new-password'), nw2 = passwordInput('new-password');
   const savePw = h('button', { class: 'primary' }, 'Changer le mot de passe');
@@ -916,6 +1040,14 @@ async function renderSettings() {
       h('label', null, 'Nouveau mot de passe'), nw,
       h('label', null, 'Confirmation'), nw2,
       h('div', { class: 'row end actions' }, savePw)),
+    h('div', { class: 'card' },
+      h('h2', null, 'Accès sécurisé (HTTPS)'),
+      h('p', { class: 'small muted' },
+        'Chiffre les échanges avec l\'interface, mot de passe compris. Le certificat est créé par l\'enceinte (auto-signé) : ',
+        'votre navigateur affichera un avertissement la première fois, qu\'il faut accepter. Le Wi-Fi de configuration reste en HTTP.'),
+      h('label', { class: 'check' }, httpsBox, ' Activer HTTPS'),
+      httpsMsg,
+      h('div', { class: 'row end actions' }, saveHttps)),
     h('div', { class: 'card' },
       h('h2', null, 'Accès MPD'),
       h('p', { class: 'small muted' },

@@ -22,7 +22,31 @@ FILES = {
     "": [("Comptines", True, 0), ("Histoires du soir", True, 0), ("Musique classique", True, 0)],
     "Comptines": [("01 - Une souris verte.mp3", False, 3_412_000), ("02 - Frère Jacques.mp3", False, 2_904_112),
                   ("10 - Il était un petit navire.mp3", False, 4_800_000), ("cover.jpg", False, 85_000)],
+    "Histoires du soir": [("Contes", True, 0)],
+    "Histoires du soir/Contes": [],
+    "Musique classique": [],
 }
+
+
+def split(path):
+    return (path.rsplit("/", 1) if "/" in path else ("", path))
+
+
+def move(src, dst):
+    sparent, sname = split(src)
+    dparent, dname = split(dst)
+    if dparent not in FILES:
+        return "dossier de destination introuvable"
+    if any(n == dname for n, _, _ in FILES[dparent]):
+        return "ce nom est déjà utilisé à cet endroit"
+    entry = next((e for e in FILES.get(sparent, []) if e[0] == sname), None)
+    if not entry:
+        return "introuvable"
+    FILES[sparent].remove(entry)
+    FILES[dparent].append((dname, entry[1], entry[2]))
+    for key in [k for k in FILES if k == src or k.startswith(src + "/")]:
+        FILES[dst + key[len(src):]] = FILES.pop(key)
+    return None
 
 CARDS = [
     {"uid": "04A1B2C3D4E5F6", "folder": "Comptines", "exists": True, "resume_s": None, "resume_other": None},
@@ -111,6 +135,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"hostname": "enceinte", "wifi_ssid": "Maison", "ota_url": "",
                                    "ota_interval_h": 24, "max_volume": 80, "mpd_password_set": False,
                                    "resume_s": 600, "resume_after_other": False,
+                                   "https_enabled": STATE.get("https", False), "https_active": STATE.get("https", False),
+                                   "https_pending": False,
                                    "mpd_port": 6600})
         self.send_json({"error": "introuvable"}, 404)
 
@@ -136,6 +162,17 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["volume"] = int(b.get("value", 0))
             if b.get("action") == "toggle":
                 STATE["playing"] = "pause" if STATE["playing"] == "play" else "play"
+            return self.send_json({"ok": True})
+        if u.path == "/api/https":
+            STATE["https"] = bool(b.get("enabled"))
+            return self.send_json({"ok": True})
+        if u.path == "/api/files/rename":
+            err = move(b.get("from", ""), b.get("to", ""))
+            return self.send_json({"error": err}, 400) if err else self.send_json({"ok": True})
+        if u.path == "/api/files/mkdir":
+            parent, name = split(b.get("path", ""))
+            FILES.setdefault(parent, []).append((name, True, 0))
+            FILES[b["path"]] = []
             return self.send_json({"ok": True})
         if u.path == "/api/cards/learn":
             STATE["learning"] = b.get("action") != "cancel"

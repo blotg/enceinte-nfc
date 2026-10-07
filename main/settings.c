@@ -119,6 +119,9 @@ esp_err_t settings_init(void)
         uint8_t other = 0;
         nvs_get_u8(h, "resume_other", &other);
         s_cfg.resume_after_other = other != 0;
+        uint8_t https = 0;
+        nvs_get_u8(h, "https", &https);
+        s_cfg.https_enabled = https != 0;
         s_cfg.admin_set = blob_exists(h, "admin_pw");
         s_cfg.mpd_pass_set = blob_exists(h, "mpd_pw");
         nvs_close(h);
@@ -263,6 +266,17 @@ esp_err_t settings_set_resume(uint32_t timeout_s, bool after_other)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_cfg.resume_timeout_s = timeout_s;
         s_cfg.resume_after_other = after_other;
+        xSemaphoreGive(s_lock);
+    }
+    return err;
+}
+
+esp_err_t settings_set_https(bool enabled)
+{
+    esp_err_t err = save_u8("https", enabled ? 1 : 0);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_cfg.https_enabled = enabled;
         xSemaphoreGive(s_lock);
     }
     return err;

@@ -1,7 +1,9 @@
 #include "controller.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -9,6 +11,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "resume_store.h"
 #include "sdkconfig.h"
 #include "session.h"
 #include "settings.h"
@@ -19,17 +22,30 @@ static const char *TAG = "controller";
 #define LEARN_TIMEOUT_US (60LL * 1000000)
 #define MAX_POINTS 16 /* cartes dont la position est mémorisée */
 
+/*
+ * Mémoire permanente : la position est tenue à jour en mémoire vive chaque seconde, mais
+ * n'est écrite que toutes les 60 s pendant la lecture (si elle a avancé), immédiatement lors
+ * d'un évènement (retrait, nouvelle carte, fin de playlist, pause), et jamais plus d'une fois
+ * toutes les 10 s pour une même carte. Une écriture fait ~600 octets et ne concerne qu'une
+ * carte : en lecture continue, l'usure de la partition (256 Ko) se compte en décennies.
+ */
+#define SAVE_MIN_INTERVAL_US (10LL * 1000000)
+#define SAVE_PERIOD_US (60LL * 1000000)
+#define SAVE_MIN_PROGRESS_MS 5000
+
 typedef enum {
     EV_CARD_ON,
     EV_CARD_OFF,
     EV_QUEUE_END,
     EV_LEARN_START,
     EV_LEARN_CANCEL,
+    EV_RENAMED,
 } ev_type_t;
 
 typedef struct {
     ev_type_t type;
     char uid[UID_STR_MAX];
+    char *from, *to; /* EV_RENAMED (alloués, libérés par la tâche) */
 } ev_t;
 
 static QueueHandle_t s_q;
@@ -42,6 +58,11 @@ static char s_learned[UID_STR_MAX];
 static char s_unknown[UID_STR_MAX];
 static bool s_learning;
 static int64_t s_learn_deadline;
+/* suivi des écritures en mémoire permanente, par emplacement */
+static int64_t s_last_save_us[MAX_POINTS];
+static uint32_t s_saved_pos[MAX_POINTS];
+static uint32_t s_saved_hash[MAX_POINTS];
+static bool s_dirty[MAX_POINTS];
 
 #define LOCK() xSemaphoreTake(s_lock, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(s_lock)
@@ -138,6 +159,58 @@ static bool point_is_live(int i)
     return i >= 0 && i == s_live && s_points[i].queue_version == player_queue_version();
 }
 
+static uint32_t fnv1a(const char *s)
+{
+    uint32_t h = 2166136261u;
+    for (; *s; s++) {
+        h = (h ^ (uint8_t)*s) * 16777619u;
+    }
+    return h;
+}
+
+static bool clock_valid(void)
+{
+    return time(NULL) > 1700000000; /* heure obtenue par NTP */
+}
+
+static void save_now(int i)
+{
+    resume_point_t copy;
+    LOCK();
+    copy = s_points[i];
+    UNLOCK();
+    esp_err_t err = copy.uid[0] ? resume_store_save(i, &copy) : resume_store_erase(i);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "sauvegarde de la position impossible (%s)", esp_err_to_name(err));
+    }
+    s_last_save_us[i] = esp_timer_get_time();
+    s_saved_pos[i] = copy.position_ms;
+    s_saved_hash[i] = fnv1a(copy.track);
+    s_dirty[i] = false;
+}
+
+/* Enregistre dès que possible, sans dépasser une écriture toutes les 10 s par carte. */
+static void persist(int i)
+{
+    if (i < 0) {
+        return;
+    }
+    if (esp_timer_get_time() - s_last_save_us[i] >= SAVE_MIN_INTERVAL_US || s_last_save_us[i] == 0) {
+        save_now(i);
+    } else {
+        s_dirty[i] = true;
+    }
+}
+
+/* Après un redémarrage, le temps écoulé depuis le retrait se déduit de l'heure réelle. */
+static void refresh_removed_at(resume_point_t *p, int64_t now_us)
+{
+    if (p->removed && p->removed_epoch > 0 && clock_valid()) {
+        int64_t elapsed = (int64_t)time(NULL) - p->removed_epoch;
+        p->removed_at_us = now_us - (elapsed > 0 ? elapsed : 0) * 1000000;
+    }
+}
+
 static bool card_folder(const char *uid, char *folder, size_t len)
 {
     card_entry_t e;
@@ -196,9 +269,12 @@ static void play_folder_from(int pi, const char *folder, const char *track, uint
     p->queue_version = player_queue_version();
     p->card_seq = s_card_seq;
     p->removed = false;
+    p->removed_epoch = 0;
     p->finished = false;
+    p->restored = false;
     s_live = pi;
     UNLOCK();
+    persist(pi);
     if (position_ms > 0) {
         ESP_LOGI(TAG, "carte %s : reprise de \"%s\" à %u s", p->uid, first, (unsigned)(position_ms / 1000));
         if (player_seek(index, position_ms) != ESP_OK) {
@@ -239,6 +315,9 @@ static void on_card_on(const char *uid)
     }
 
     int pi = find_point(uid);
+    if (pi >= 0) {
+        refresh_removed_at(&s_points[pi], esp_timer_get_time());
+    }
     resume_policy_t pol = policy_for(uid);
     /* Un point de reprise ne vaut que pour le dossier actuellement associé. */
     const resume_point_t *p = pi >= 0 && strcmp(s_points[pi].folder, folder) == 0 ? &s_points[pi] : NULL;
@@ -249,9 +328,11 @@ static void on_card_on(const char *uid)
     case SESSION_RESUME_LIVE:
         LOCK();
         s_points[pi].removed = false;
+        s_points[pi].removed_epoch = 0;
         s_points[pi].card_seq = s_card_seq;
         s_live = pi;
         UNLOCK();
+        persist(pi);
         if (action == SESSION_RESUME_LIVE) {
             ESP_LOGI(TAG, "reprise de la carte %s", uid);
             player_pause(0);
@@ -297,8 +378,10 @@ static void on_card_off(const char *uid)
     }
     p->removed = true;
     p->removed_at_us = esp_timer_get_time();
+    p->removed_epoch = clock_valid() ? (int64_t)time(NULL) : 0;
     uint32_t position = p->position_ms;
     UNLOCK();
+    persist(pi);
     if (live) {
         resume_policy_t pol = policy_for(uid);
         if (pol.timeout_s) {
@@ -311,20 +394,59 @@ static void on_card_off(const char *uid)
     }
 }
 
+/* Suit la position de la carte en cours et l'enregistre au rythme décrit plus haut. */
+static void track_live_position(int64_t now)
+{
+    if (!point_is_live(s_live)) {
+        return;
+    }
+    player_status_t st;
+    player_get_status(&st);
+    if (st.state == PLAYER_STOPPED || !st.file[0]) {
+        return;
+    }
+    int i = s_live;
+    LOCK();
+    str_copy(s_points[i].track, st.file, sizeof(s_points[i].track));
+    s_points[i].position_ms = st.elapsed_ms;
+    UNLOCK();
+    bool track_changed = fnv1a(st.file) != s_saved_hash[i];
+    uint32_t moved = st.elapsed_ms > s_saved_pos[i] ? st.elapsed_ms - s_saved_pos[i] : s_saved_pos[i] - st.elapsed_ms;
+    if (st.state == PLAYER_PLAYING) {
+        if (now - s_last_save_us[i] >= SAVE_PERIOD_US && (track_changed || moved >= SAVE_MIN_PROGRESS_MS)) {
+            save_now(i);
+        }
+    } else if (track_changed || moved >= 1000) {
+        persist(i); /* pause depuis l'application : position figée, à garder */
+    }
+}
+
 static void tick(int64_t now)
 {
-    /* Carte en pause dont le délai est dépassé : on libère le lecteur. */
-    if (s_live >= 0 && s_points[s_live].uid[0]) {
-        resume_policy_t pol = policy_for(s_points[s_live].uid);
-        if (session_expired(&s_points[s_live], &pol, now)) {
-            ESP_LOGI(TAG, "carte %s : délai de reprise dépassé", s_points[s_live].uid);
-            if (point_is_live(s_live) && player_state() == SESS_PLAYER_PAUSED) {
+    track_live_position(now);
+    for (int i = 0; i < MAX_POINTS; i++) {
+        resume_point_t *p = &s_points[i];
+        if (!p->uid[0]) {
+            continue;
+        }
+        refresh_removed_at(p, now);
+        resume_policy_t pol = policy_for(p->uid);
+        if (session_expired(p, &pol, now)) {
+            ESP_LOGI(TAG, "carte %s : délai de reprise dépassé", p->uid);
+            if (point_is_live(i) && player_state() == SESS_PLAYER_PAUSED) {
                 player_stop();
             }
             LOCK();
-            memset(&s_points[s_live], 0, sizeof(s_points[s_live]));
-            s_live = -1;
+            memset(p, 0, sizeof(*p));
+            if (s_live == i) {
+                s_live = -1;
+            }
             UNLOCK();
+            persist(i); /* effacement */
+            continue;
+        }
+        if (s_dirty[i] && now - s_last_save_us[i] >= SAVE_MIN_INTERVAL_US) {
+            save_now(i);
         }
     }
     LOCK();
@@ -332,6 +454,49 @@ static void tick(int64_t now)
         s_learning = false;
     }
     UNLOCK();
+}
+
+/* Dossier ou fichier déplacé/renommé : les positions mémorisées suivent. */
+static void on_renamed(const char *from, const char *to)
+{
+    /* La file de lecture suit le déplacement ; la carte qui joue reste « la même ». */
+    bool was_live = point_is_live(s_live);
+    if (player_queue_rename(from, to) && was_live) {
+        LOCK();
+        s_points[s_live].queue_version = player_queue_version();
+        UNLOCK();
+    }
+    size_t fl = strlen(from);
+    for (int i = 0; i < MAX_POINTS; i++) {
+        resume_point_t *p = &s_points[i];
+        bool changed = false;
+        char buf[REL_PATH_MAX];
+        LOCK();
+        char *fields[2] = {p->folder, p->track};
+        for (int k = 0; k < 2 && p->uid[0]; k++) {
+            char *v = fields[k];
+            if (strncmp(v, from, fl) == 0 && (v[fl] == '\0' || v[fl] == '/')) {
+                int n = snprintf(buf, sizeof(buf), "%s%s", to, v + fl);
+                if (n > 0 && (size_t)n < sizeof(buf)) {
+                    str_copy(v, buf, REL_PATH_MAX);
+                    changed = true;
+                }
+            }
+        }
+        UNLOCK();
+        if (changed) {
+            persist(i);
+        }
+    }
+}
+
+void controller_on_path_renamed(const char *from, const char *to)
+{
+    ev_t ev = {.type = EV_RENAMED, .from = strdup(from), .to = strdup(to)};
+    if (!ev.from || !ev.to || xQueueSend(s_q, &ev, pdMS_TO_TICKS(100)) != pdTRUE) {
+        free(ev.from);
+        free(ev.to);
+    }
 }
 
 static void controller_task(void *arg)
@@ -352,7 +517,13 @@ static void controller_task(void *arg)
                     LOCK();
                     s_points[s_live].finished = true;
                     UNLOCK();
+                    persist(s_live);
                 }
+                break;
+            case EV_RENAMED:
+                on_renamed(ev.from, ev.to);
+                free(ev.from);
+                free(ev.to);
                 break;
             case EV_LEARN_START:
                 LOCK();
@@ -379,6 +550,11 @@ esp_err_t controller_start(void)
     s_points = calloc(MAX_POINTS, sizeof(resume_point_t));
     if (!s_q || !s_lock || !s_points) {
         return ESP_ERR_NO_MEM;
+    }
+    resume_store_load(s_points, MAX_POINTS);
+    for (int i = 0; i < MAX_POINTS; i++) {
+        s_saved_pos[i] = s_points[i].position_ms;
+        s_saved_hash[i] = fnv1a(s_points[i].track);
     }
     return xTaskCreate(controller_task, "controller", 5120, NULL, 6, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }

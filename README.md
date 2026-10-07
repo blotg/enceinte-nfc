@@ -21,13 +21,16 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Point d'accès + portail captif | ✅ | Sortie d'usine ou Wi-Fi injoignable : réseau `Enceinte-XXXX`, la page de configuration s'ouvre seule. |
 | Mot de passe administrateur en sortie d'usine | ✅ | Stocké haché (PBKDF2-SHA256). |
 | Adresse `enceinte.local` | ✅ | mDNS ; nom modifiable. |
-| Page d'administration | ✅ | Wi-Fi, mots de passe admin et MPD, fichiers, cartes, volume maximum, mises à jour, redémarrage. |
+| Page d'administration | ✅ | Wi-Fi, mots de passe admin et MPD, fichiers (envoi, déplacement, renommage), cartes, volume maximum, HTTPS, mises à jour, redémarrage. |
 | *En plus* | | Bips (carte inconnue, dossier vide), réinitialisation usine (bouton BOOT 10 s), installation manuelle d'un `.bin`, volume maximum. |
 
 **Limites assumées**
 
-- L'interface web est en **HTTP** : un certificat HTTPS sur un objet local déclencherait des
-  alertes du navigateur. Le mot de passe circule donc en clair sur le réseau local.
+- L'interface web est en **HTTP** par défaut. **HTTPS** s'active dans *Réglages → Accès sécurisé* :
+  l'enceinte crée alors son propre certificat (auto-signé, ECDSA P-256, valable 20 ans pour
+  `nom.local`). Le navigateur affiche un avertissement la première fois, qu'il faut accepter ;
+  les accès HTTP depuis le réseau local sont ensuite redirigés vers HTTPS. Le Wi-Fi de
+  configuration (point d'accès) reste en HTTP, comme l'exigent les téléphones.
 - **Reprise en cours de morceau et recherche de position : MP3, FLAC, Opus, Vorbis, WAV.**
   Pas en AAC ni M4A : le morceau y reprend à son début. Le décodeur d'Espressif ne lit
   qu'en continu ; le firmware lui renvoie l'en-tête du fichier puis saute à la position voulue.
@@ -116,7 +119,9 @@ changer celui-ci de canal.
   Pour un sous-dossier : onglet *Musique*, ouvrir le dossier, « Associer une carte ».
 - **Bips** : deux bips = carte inconnue ; trois bips graves = dossier vide ou carte SD absente.
 - **Musique** (onglet *Musique*) : envoyer des fichiers ou des dossiers entiers, créer,
-  renommer, supprimer, écouter un dossier sans carte.
+  renommer, supprimer, écouter un dossier sans carte, et **déplacer** des fichiers ou des
+  dossiers (bouton ↦, ou cases à cocher pour en déplacer ou supprimer plusieurs à la fois).
+  Les associations de cartes et les positions de reprise suivent les dossiers déplacés.
 - **MPD** : serveur `enceinte.local`, port 6600, dans M.A.L.P. (Android), mpc, Cantata,
   ncmpcpp, Rigelian (iOS)… Mot de passe facultatif dans *Réglages*.
   Pris en charge : lecture, pause, morceau suivant ou précédent, recherche de position,
@@ -139,8 +144,20 @@ Retirer une carte met en pause et mémorise sa position (morceau et instant, pou
 Ces deux réglages se trouvent dans *Réglages → Reprise de la lecture*. Chaque carte peut
 les remplacer (*Cartes → ✎*), par exemple « toujours reprendre » pour un livre audio.
 Une commande MPD ou web qui modifie la file d'attente compte comme une autre carte.
-Les positions sont gardées en mémoire vive : elles sont perdues en cas de coupure de
-courant ou de redémarrage.
+Les positions survivent aux coupures de courant et aux mises à jour : idéal pour un long
+podcast ou un livre audio. Elles sont tenues à jour chaque seconde en mémoire vive, et
+enregistrées en mémoire permanente (une clé de ~600 octets par carte) :
+
+- pendant la lecture, toutes les 60 s si la position a avancé (une coupure fait perdre au
+  plus une minute) ;
+- tout de suite au retrait de la carte, en pause, au changement de carte ou en fin de playlist ;
+- jamais plus d'une fois toutes les 10 s pour une même carte, même si on la pose et la
+  retire frénétiquement.
+
+En lecture continue, cela représente environ 0,9 Mo écrits par jour dans une partition de
+256 Ko à répartition d'usure : chaque secteur est effacé environ 3 fois par jour, pour une
+endurance de 100 000 cycles, soit plusieurs décennies. Après un redémarrage, le délai de
+reprise est calculé avec l'heure réelle (NTP).
 
 Une mise à jour automatique attend que l'enceinte soit inactive : pas de carte posée, pas
 d'envoi de fichiers (ni dans les 5 dernières minutes), et lecture arrêtée ou en pause

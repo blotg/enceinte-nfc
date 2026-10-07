@@ -158,6 +158,13 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .list .ico { width: 28px; text-align: center; color: var(--muted); flex: none; }
 .list a, .linkish { color: var(--accent); text-decoration: none; cursor: pointer; font-weight: 600; background: none; border: 0; padding: 0; min-height: 0; text-align: left; }
 
+.selbar {
+  position: sticky; top: 56px; z-index: 2; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  padding: 8px 10px; margin-bottom: 8px; border-radius: 10px; background: var(--surface-2); font-weight: 600;
+}
+.selbar .grow { flex: 1 1 auto; }
+.list input.sel { width: 20px; height: 20px; accent-color: var(--accent); flex: none; margin: 0; }
+
 .crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 8px; font-size: 15px; }
 .crumbs button { min-height: 30px; padding: 0 8px; }
 
