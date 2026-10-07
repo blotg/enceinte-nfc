@@ -23,14 +23,17 @@ static const char *TAG = "controller";
 #define MAX_POINTS 16 /* cartes dont la position est mémorisée */
 
 /*
- * Mémoire permanente : la position est tenue à jour en mémoire vive chaque seconde, mais
- * n'est écrite que toutes les 60 s pendant la lecture (si elle a avancé), immédiatement lors
- * d'un évènement (retrait, nouvelle carte, fin de playlist, pause), et jamais plus d'une fois
- * toutes les 10 s pour une même carte. Une écriture fait ~600 octets et ne concerne qu'une
- * carte : en lecture continue, l'usure de la partition (256 Ko) se compte en décennies.
+ * Mémoire permanente : la position est tenue à jour en mémoire vive chaque seconde.
+ *  - Pendant la lecture d'un même morceau, seule la position est écrite (clé de 32 octets),
+ *    toutes les 10 s si elle a avancé : une coupure fait perdre au plus ~10 s.
+ *  - Le point complet (~600 octets) est écrit au changement de morceau et lors d'un
+ *    évènement (retrait, pause, nouvelle carte, fin de playlist).
+ *  - Jamais plus d'une écriture toutes les 10 s pour une même carte.
+ * En lecture continue : ~280 Ko écrits par jour dans une partition de 256 Ko à répartition
+ * d'usure, soit environ un effacement par secteur et par jour (endurance : 100 000 cycles).
  */
 #define SAVE_MIN_INTERVAL_US (10LL * 1000000)
-#define SAVE_PERIOD_US (60LL * 1000000)
+#define SAVE_PERIOD_US (10LL * 1000000)
 #define SAVE_MIN_PROGRESS_MS 5000
 
 typedef enum {
@@ -187,6 +190,20 @@ static void save_now(int i)
     s_saved_pos[i] = copy.position_ms;
     s_saved_hash[i] = fnv1a(copy.track);
     s_dirty[i] = false;
+}
+
+static void save_position_now(int i)
+{
+    uint32_t pos;
+    LOCK();
+    pos = s_points[i].position_ms;
+    UNLOCK();
+    esp_err_t err = resume_store_save_position(i, pos);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "sauvegarde de la position impossible (%s)", esp_err_to_name(err));
+    }
+    s_last_save_us[i] = esp_timer_get_time();
+    s_saved_pos[i] = pos;
 }
 
 /* Enregistre dès que possible, sans dépasser une écriture toutes les 10 s par carte. */
@@ -412,12 +429,15 @@ static void track_live_position(int64_t now)
     UNLOCK();
     bool track_changed = fnv1a(st.file) != s_saved_hash[i];
     uint32_t moved = st.elapsed_ms > s_saved_pos[i] ? st.elapsed_ms - s_saved_pos[i] : s_saved_pos[i] - st.elapsed_ms;
-    if (st.state == PLAYER_PLAYING) {
-        if (now - s_last_save_us[i] >= SAVE_PERIOD_US && (track_changed || moved >= SAVE_MIN_PROGRESS_MS)) {
-            save_now(i);
-        }
-    } else if (track_changed || moved >= 1000) {
-        persist(i); /* pause depuis l'application : position figée, à garder */
+    if (s_dirty[i]) {
+        return; /* un point complet est déjà en attente d'écriture */
+    }
+    bool due = now - s_last_save_us[i] >= (st.state == PLAYER_PLAYING ? SAVE_PERIOD_US : SAVE_MIN_INTERVAL_US);
+    uint32_t min_move = st.state == PLAYER_PLAYING ? SAVE_MIN_PROGRESS_MS : 1000; /* en pause : position figée */
+    if (due && track_changed) {
+        save_now(i); /* nouveau morceau : point complet */
+    } else if (due && moved >= min_move) {
+        save_position_now(i); /* même morceau : position seule */
     }
 }
 

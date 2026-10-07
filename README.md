@@ -146,18 +146,19 @@ les remplacer (*Cartes → ✎*), par exemple « toujours reprendre » pour un l
 Une commande MPD ou web qui modifie la file d'attente compte comme une autre carte.
 Les positions survivent aux coupures de courant et aux mises à jour : idéal pour un long
 podcast ou un livre audio. Elles sont tenues à jour chaque seconde en mémoire vive, et
-enregistrées en mémoire permanente (une clé de ~600 octets par carte) :
+enregistrées en mémoire permanente :
 
-- pendant la lecture, toutes les 60 s si la position a avancé (une coupure fait perdre au
-  plus une minute) ;
-- tout de suite au retrait de la carte, en pause, au changement de carte ou en fin de playlist ;
-- jamais plus d'une fois toutes les 10 s pour une même carte, même si on la pose et la
+- pendant la lecture d'un même morceau, **la position seule** (clé de 32 octets), toutes
+  les 10 s si elle a avancé : une coupure fait perdre au plus une dizaine de secondes ;
+- le point complet (carte, dossier, morceau, ~600 octets) au changement de morceau, et tout
+  de suite au retrait de la carte, en pause, au changement de carte ou en fin de playlist ;
+- jamais plus d'une écriture toutes les 10 s pour une même carte, même si on la pose et la
   retire frénétiquement.
 
-En lecture continue, cela représente environ 0,9 Mo écrits par jour dans une partition de
-256 Ko à répartition d'usure : chaque secteur est effacé environ 3 fois par jour, pour une
-endurance de 100 000 cycles, soit plusieurs décennies. Après un redémarrage, le délai de
-reprise est calculé avec l'heure réelle (NTP).
+En lecture continue, cela représente environ 280 Ko écrits par jour dans une partition de
+256 Ko à répartition d'usure : environ un effacement par secteur et par jour, pour une
+endurance de 100 000 cycles, soit bien plus que la durée de vie de l'enceinte. Après un
+redémarrage, le délai de reprise est calculé avec l'heure réelle (NTP).
 
 Une mise à jour automatique attend que l'enceinte soit inactive : pas de carte posée, pas
 d'envoi de fichiers (ni dans les 5 dernières minutes), et lecture arrêtée ou en pause

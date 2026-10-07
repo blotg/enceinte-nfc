@@ -22,6 +22,7 @@ void mock_set_resume(uint32_t timeout_s, bool after_other);
 static uint8_t g_store[16][600];
 static size_t g_store_len[16];
 static int g_saves;
+static int g_pos_saves; /* écritures de la position seule */
 
 void resume_store_load(resume_point_t *points, int count)
 {
@@ -36,6 +37,18 @@ esp_err_t resume_store_save(int slot, const resume_point_t *p)
 {
     g_store_len[slot] = resume_encode(p, g_store[slot], sizeof(g_store[slot]));
     g_saves++;
+    return ESP_OK;
+}
+
+esp_err_t resume_store_save_position(int slot, uint32_t position_ms)
+{
+    resume_point_t p;
+    if (g_store_len[slot] && resume_decode(g_store[slot], g_store_len[slot], &p)) {
+        p.position_ms = position_ms;
+        g_store_len[slot] = resume_encode(&p, g_store[slot], sizeof(g_store[slot]));
+    }
+    g_saves++;
+    g_pos_saves++;
     return ESP_OK;
 }
 
@@ -372,6 +385,29 @@ int main(int argc, char **argv)
             card(true, "AA");
         }
         CHECK(g_saves - saves_before <= 2);
+
+        /* 14. Lecture continue (temps réel) : la position seule est enregistrée toutes les
+         * 10 s, carte toujours posée, sans attendre un retrait */
+        setenv("SHIM_SPEEDUP", "1", 1);
+        card(false, "AA");
+        card(true, "EE"); /* délai dépassé : début d'un morceau de 30 s */
+        CHECK(wait_state(PLAYER_PLAYING, 1000));
+        CHECK_STR(status().file, "Audio/Livre/1.wav");
+        uint32_t e0 = status().elapsed_ms;
+        CHECK(e0 < 2000);
+        int pos_before = g_pos_saves;
+        bool periodic = false;
+        for (int i = 0; i < 250 && !periodic; i++) {
+            usleep(100000);
+            player_status_t now = status();
+            resume_point_t sp;
+            periodic = g_pos_saves > pos_before && stored("EE", &sp) && !sp.removed &&
+                       strcmp(sp.track, now.file) == 0 && sp.position_ms >= e0 + 8000 &&
+                       sp.position_ms + 2500 >= now.elapsed_ms;
+        }
+        CHECK(periodic);
+        card(false, "EE");
+        setenv("SHIM_SPEEDUP", "20", 1);
     } else {
         printf("(scénario de reprise après une autre carte ignoré : fichiers d'exemple absents)\n");
     }
