@@ -9,7 +9,7 @@
 static const char *TAG = "resume";
 static const char *NS = "resume";
 
-#define BLOB_MAX (14 + UID_STR_MAX + 2 * REL_PATH_MAX)
+#define BLOB_MAX (18 + UID_STR_MAX + 2 * REL_PATH_MAX)
 
 static void key_for(int slot, char key[16])
 {

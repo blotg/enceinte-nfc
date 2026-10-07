@@ -16,7 +16,8 @@ from urllib.parse import parse_qs, urlparse
 
 WEB = os.path.join(os.path.dirname(__file__), "..", "..", "main", "web")
 
-STATE = {"setup": False, "logged": True, "volume": 35, "playing": "play", "learning": False, "learn_at": 0}
+STATE = {"setup": False, "logged": True, "volume": 35, "playing": "play", "learning": False, "learn_at": 0,
+         "resume_s": 600, "resume_after_other": False, "shuffle": False}
 
 FILES = {
     "": [("Comptines", True, 0), ("Histoires du soir", True, 0), ("Musique classique", True, 0)],
@@ -49,9 +50,14 @@ def move(src, dst):
     return None
 
 CARDS = [
-    {"uid": "04A1B2C3D4E5F6", "folder": "Comptines", "exists": True, "resume_s": None, "resume_other": None},
-    {"uid": "0411223344", "folder": "Histoires du soir", "exists": True, "resume_s": 0, "resume_other": True},
-    {"uid": "04DEADBEEF", "folder": "Ancien dossier", "exists": False, "resume_s": None, "resume_other": None},
+    {"uid": "04A1B2C3D4E5F6", "folder": "Comptines", "exists": True, "resume_s": None, "resume_other": None,
+     "shuffle": None},
+    {"uid": "0411223344", "folder": "Histoires du soir", "exists": True, "resume_s": 0, "resume_other": True,
+     "shuffle": True},
+    {"uid": "04BADA55", "folder": "Comptines", "exists": True, "resume_s": 300, "resume_other": None,
+     "shuffle": False},
+    {"uid": "04DEADBEEF", "folder": "Ancien dossier", "exists": False, "resume_s": None, "resume_other": None,
+     "shuffle": None},
 ]
 
 
@@ -134,7 +140,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/settings":
             return self.send_json({"hostname": "enceinte", "wifi_ssid": "Maison", "ota_url": "",
                                    "ota_interval_h": 24, "max_volume": 80, "mpd_password_set": False,
-                                   "resume_s": 600, "resume_after_other": False,
+                                   "resume_s": STATE["resume_s"], "resume_after_other": STATE["resume_after_other"],
+                                   "shuffle": STATE["shuffle"],
                                    "https_enabled": STATE.get("https", False), "https_active": STATE.get("https", False),
                                    "https_pending": False,
                                    "mpd_port": 6600})
@@ -173,6 +180,19 @@ class Handler(BaseHTTPRequestHandler):
             parent, name = split(b.get("path", ""))
             FILES.setdefault(parent, []).append((name, True, 0))
             FILES[b["path"]] = []
+            return self.send_json({"ok": True})
+        if u.path == "/api/settings":
+            for k in ("resume_s", "resume_after_other", "shuffle"):
+                if k in b:
+                    STATE[k] = b[k]
+            return self.send_json({"ok": True})
+        if u.path == "/api/cards":
+            card = {"uid": b.get("uid"), "folder": b.get("folder"), "exists": True, "resume_s": b.get("resume_s"),
+                    "resume_other": b.get("resume_other"), "shuffle": b.get("shuffle")}
+            CARDS[:] = [c for c in CARDS if c["uid"] != card["uid"]] + [card]
+            return self.send_json({"ok": True})
+        if u.path == "/api/cards/delete":
+            CARDS[:] = [c for c in CARDS if c["uid"] != b.get("uid")]
             return self.send_json({"ok": True})
         if u.path == "/api/cards/learn":
             STATE["learning"] = b.get("action") != "cancel"

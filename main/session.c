@@ -44,9 +44,33 @@ resume_policy_t session_policy(int32_t card_resume_s, int8_t card_resume_other, 
     return pol;
 }
 
-/* Format v1 : version, drapeaux, position (u32), heure du retrait (i64), puis uid,
- * dossier et morceau terminés par un octet nul. Entiers petit-boutistes. */
-#define RESUME_FORMAT 1
+/* Générateur pseudo-aléatoire fixé une fois pour toutes (splitmix32) : un ordre mémorisé doit
+ * se retrouver à l'identique après une mise à jour du firmware. */
+static uint32_t next_rand(uint32_t *state)
+{
+    uint32_t z = (*state += 0x9E3779B9u);
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    return z ^ (z >> 16);
+}
+
+void session_shuffle(char **items, int count, uint32_t seed)
+{
+    uint32_t state = seed;
+    for (int i = count - 1; i > 0; i--) {
+        int j = (int)(next_rand(&state) % (uint32_t)(i + 1));
+        char *t = items[i];
+        items[i] = items[j];
+        items[j] = t;
+    }
+}
+
+/* Format v2 : version, drapeaux, position (u32), heure du retrait (i64), graine de l'ordre
+ * aléatoire (u32), puis uid, dossier et morceau terminés par un octet nul. Entiers
+ * petit-boutistes. Le format v1 (sans graine) est encore lu. */
+#define RESUME_FORMAT 2
+#define HEADER_V1 14
+#define HEADER_V2 18
 
 static void put_le(uint8_t *b, uint64_t v, int n)
 {
@@ -67,17 +91,18 @@ static uint64_t get_le(const uint8_t *b, int n)
 size_t resume_encode(const resume_point_t *p, uint8_t *out, size_t cap)
 {
     size_t lu = strlen(p->uid) + 1, lf = strlen(p->folder) + 1, lt = strlen(p->track) + 1;
-    size_t need = 14 + lu + lf + lt;
+    size_t need = HEADER_V2 + lu + lf + lt;
     if (need > cap) {
         return 0;
     }
     out[0] = RESUME_FORMAT;
-    out[1] = (uint8_t)((p->removed ? 1 : 0) | (p->finished ? 2 : 0));
+    out[1] = (uint8_t)((p->removed ? 1 : 0) | (p->finished ? 2 : 0) | (p->shuffle ? 4 : 0));
     put_le(out + 2, p->position_ms, 4);
     put_le(out + 6, (uint64_t)p->removed_epoch, 8);
-    memcpy(out + 14, p->uid, lu);
-    memcpy(out + 14 + lu, p->folder, lf);
-    memcpy(out + 14 + lu + lf, p->track, lt);
+    put_le(out + 14, p->shuffle_seed, 4);
+    memcpy(out + HEADER_V2, p->uid, lu);
+    memcpy(out + HEADER_V2 + lu, p->folder, lf);
+    memcpy(out + HEADER_V2 + lu + lf, p->track, lt);
     return need;
 }
 
@@ -99,14 +124,19 @@ static bool get_str(const uint8_t *in, size_t len, size_t *pos, char *out, size_
 bool resume_decode(const uint8_t *in, size_t len, resume_point_t *p)
 {
     memset(p, 0, sizeof(*p));
-    if (len < 14 || in[0] != RESUME_FORMAT) {
+    size_t header = len >= 1 && in[0] == 1 ? HEADER_V1 : len >= 1 && in[0] == 2 ? HEADER_V2 : 0;
+    if (!header || len < header) {
         return false;
     }
     p->removed = in[1] & 1;
     p->finished = in[1] & 2;
     p->position_ms = (uint32_t)get_le(in + 2, 4);
     p->removed_epoch = (int64_t)get_le(in + 6, 8);
-    size_t pos = 14;
+    if (header == HEADER_V2) {
+        p->shuffle = in[1] & 4;
+        p->shuffle_seed = (uint32_t)get_le(in + 14, 4);
+    }
+    size_t pos = header;
     if (!get_str(in, len, &pos, p->uid, sizeof(p->uid)) || !get_str(in, len, &pos, p->folder, sizeof(p->folder)) ||
         !get_str(in, len, &pos, p->track, sizeof(p->track)) || !p->uid[0]) {
         memset(p, 0, sizeof(*p));

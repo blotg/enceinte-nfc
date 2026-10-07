@@ -16,14 +16,15 @@ typedef struct {
     char *folder;
     int32_t resume_s;
     int8_t resume_other;
+    int8_t shuffle;
 } entry_t;
 
 static entry_t *s_entries;
 static int s_count;
 static SemaphoreHandle_t s_lock;
 
-/* Format du blob : lignes "UID\tdossier\tdélai\tautre_carte\n" (les deux derniers champs
- * sont absents des associations créées par la version 1.0). */
+/* Format du blob : lignes "UID\tdossier\tdélai\tautre_carte\taléatoire\n" (champs
+ * facultatifs après le dossier : absents des associations créées par les versions 1.0 à 1.3). */
 static esp_err_t save_locked(void)
 {
     size_t size = 1;
@@ -36,8 +37,8 @@ static esp_err_t save_locked(void)
     }
     size_t o = 0;
     for (int i = 0; i < s_count; i++) {
-        o += sprintf(blob + o, "%s\t%s\t%ld\t%d\n", s_entries[i].uid, s_entries[i].folder,
-                     (long)s_entries[i].resume_s, s_entries[i].resume_other);
+        o += sprintf(blob + o, "%s\t%s\t%ld\t%d\t%d\n", s_entries[i].uid, s_entries[i].folder,
+                     (long)s_entries[i].resume_s, s_entries[i].resume_other, s_entries[i].shuffle);
     }
     nvs_handle_t h;
     esp_err_t err = nvs_open_from_partition(CFG_PARTITION, "cards", NVS_READWRITE, &h);
@@ -65,7 +66,7 @@ static int find_locked(const char *uid)
     return -1;
 }
 
-static bool add_locked(const char *uid, const char *folder, int32_t resume_s, int8_t resume_other)
+static bool add_locked(const char *uid, const char *folder, int32_t resume_s, int8_t resume_other, int8_t shuffle)
 {
     entry_t *n = realloc(s_entries, (s_count + 1) * sizeof(entry_t));
     if (!n) {
@@ -80,6 +81,7 @@ static bool add_locked(const char *uid, const char *folder, int32_t resume_s, in
     s_entries[s_count].folder = f;
     s_entries[s_count].resume_s = resume_s;
     s_entries[s_count].resume_other = resume_other;
+    s_entries[s_count].shuffle = shuffle;
     s_count++;
     return true;
 }
@@ -108,8 +110,8 @@ esp_err_t cards_init(void)
     }
     char *save = NULL;
     for (char *line = strtok_r(blob, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        char *fields[4] = {line, NULL, NULL, NULL};
-        for (int i = 1; i < 4; i++) {
+        char *fields[5] = {line, NULL, NULL, NULL, NULL};
+        for (int i = 1; i < 5; i++) {
             char *tab = fields[i - 1] ? strchr(fields[i - 1], '\t') : NULL;
             if (tab) {
                 *tab = '\0';
@@ -121,7 +123,9 @@ esp_err_t cards_init(void)
         }
         int32_t resume_s = fields[2] ? (int32_t)strtol(fields[2], NULL, 10) : CARD_DEFAULT;
         int8_t other = fields[3] ? (int8_t)strtol(fields[3], NULL, 10) : CARD_DEFAULT;
-        add_locked(line, fields[1], resume_s < 0 ? CARD_DEFAULT : resume_s, other < 0 || other > 1 ? CARD_DEFAULT : other);
+        int8_t shuffle = fields[4] ? (int8_t)strtol(fields[4], NULL, 10) : CARD_DEFAULT;
+        add_locked(line, fields[1], resume_s < 0 ? CARD_DEFAULT : resume_s, other < 0 || other > 1 ? CARD_DEFAULT : other,
+                   shuffle < 0 || shuffle > 1 ? CARD_DEFAULT : shuffle);
     }
     free(blob);
     ESP_LOGI(TAG, "%d carte(s) associée(s)", s_count);
@@ -137,6 +141,7 @@ bool cards_get(const char *uid, card_entry_t *out)
         str_copy(out->folder, s_entries[i].folder, sizeof(out->folder));
         out->resume_s = s_entries[i].resume_s;
         out->resume_other = s_entries[i].resume_other;
+        out->shuffle = s_entries[i].shuffle;
     }
     xSemaphoreGive(s_lock);
     return i >= 0;
@@ -146,7 +151,8 @@ esp_err_t cards_set(const card_entry_t *e)
 {
     const char *uid = e->uid, *folder = e->folder;
     if (!uid[0] || strlen(uid) >= UID_STR_MAX || strchr(folder, '\t') || strchr(folder, '\n') ||
-        e->resume_s < CARD_DEFAULT || e->resume_other < CARD_DEFAULT || e->resume_other > 1) {
+        e->resume_s < CARD_DEFAULT || e->resume_other < CARD_DEFAULT || e->resume_other > 1 ||
+        e->shuffle < CARD_DEFAULT || e->shuffle > 1) {
         return ESP_ERR_INVALID_ARG;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -159,12 +165,13 @@ esp_err_t cards_set(const card_entry_t *e)
             s_entries[i].folder = f;
             s_entries[i].resume_s = e->resume_s;
             s_entries[i].resume_other = e->resume_other;
+            s_entries[i].shuffle = e->shuffle;
         } else {
             err = ESP_ERR_NO_MEM;
         }
     } else if (s_count >= CARDS_MAX) {
         err = ESP_ERR_NO_MEM;
-    } else if (!add_locked(uid, folder, e->resume_s, e->resume_other)) {
+    } else if (!add_locked(uid, folder, e->resume_s, e->resume_other, e->shuffle)) {
         err = ESP_ERR_NO_MEM;
     }
     if (err == ESP_OK) {
@@ -202,6 +209,7 @@ int cards_list(card_entry_t **out)
         str_copy((*out)[i].folder, s_entries[i].folder, REL_PATH_MAX);
         (*out)[i].resume_s = s_entries[i].resume_s;
         (*out)[i].resume_other = s_entries[i].resume_other;
+        (*out)[i].shuffle = s_entries[i].shuffle;
     }
     xSemaphoreGive(s_lock);
     return n;

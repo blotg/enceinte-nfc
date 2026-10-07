@@ -20,11 +20,17 @@
 static char s_mpd_password[65];
 static uint32_t s_resume_s = CONFIG_ENC_RESUME_TIMEOUT_S;
 static bool s_resume_other;
+static bool s_shuffle;
 
 void mock_set_resume(uint32_t timeout_s, bool after_other)
 {
     s_resume_s = timeout_s;
     s_resume_other = after_other;
+}
+
+void mock_set_shuffle(bool on)
+{
+    s_shuffle = on;
 }
 
 void mock_set_mpd_password(const char *pw)
@@ -41,6 +47,7 @@ void settings_get(settings_t *out)
     out->admin_set = true;
     out->resume_timeout_s = s_resume_s;
     out->resume_after_other = s_resume_other;
+    out->shuffle = s_shuffle;
     out->mpd_pass_set = s_mpd_password[0] != '\0';
 }
 

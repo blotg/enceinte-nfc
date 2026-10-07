@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -129,6 +130,18 @@ static resume_policy_t policy_for(const char *uid)
     return session_policy(CARD_DEFAULT, CARD_DEFAULT, cfg.resume_timeout_s, cfg.resume_after_other);
 }
 
+/* Ordre aléatoire : réglage de la carte, sinon réglage général. */
+static bool shuffle_for(const char *uid)
+{
+    settings_t cfg;
+    settings_get(&cfg);
+    card_entry_t e;
+    if (cards_get(uid, &e) && e.shuffle != CARD_DEFAULT) {
+        return e.shuffle == 1;
+    }
+    return cfg.shuffle;
+}
+
 static int find_point(const char *uid)
 {
     for (int i = 0; i < MAX_POINTS; i++) {
@@ -245,8 +258,12 @@ static bool card_folder(const char *uid, char *folder, size_t len)
     return false;
 }
 
-/* Charge le dossier et lance la lecture au morceau "track" (ou au début) à "position_ms". */
-static void play_folder_from(int pi, const char *folder, const char *track, uint32_t position_ms)
+/*
+ * Charge le dossier et lance la lecture au morceau "track" (ou au début) à "position_ms".
+ * En ordre aléatoire, la même graine redonne le même ordre (reprise).
+ */
+static void play_folder_from(int pi, const char *folder, const char *track, uint32_t position_ms, bool shuffle,
+                             uint32_t seed)
 {
     path_list_t tracks = {0};
     esp_err_t err = storage_is_mounted() ? storage_list_tracks(folder, &tracks) : ESP_ERR_INVALID_STATE;
@@ -255,6 +272,9 @@ static void play_folder_from(int pi, const char *folder, const char *track, uint
         path_list_free(&tracks);
         player_beep(BEEP_ERROR);
         return;
+    }
+    if (shuffle) {
+        session_shuffle(tracks.items, tracks.count, seed);
     }
     int index = 0;
     if (track && track[0]) {
@@ -290,6 +310,8 @@ static void play_folder_from(int pi, const char *folder, const char *track, uint
     p->removed_epoch = 0;
     p->finished = false;
     p->restored = false;
+    p->shuffle = shuffle;
+    p->shuffle_seed = seed;
     s_live = pi;
     UNLOCK();
     persist(pi);
@@ -299,7 +321,8 @@ static void play_folder_from(int pi, const char *folder, const char *track, uint
             player_play(index);
         }
     } else {
-        ESP_LOGI(TAG, "carte %s -> \"%s\" (%d morceaux, morceau %d)", p->uid, folder, count, index + 1);
+        ESP_LOGI(TAG, "carte %s -> \"%s\" (%d morceaux%s, morceau %d)", p->uid, folder, count,
+                 shuffle ? " en ordre aléatoire" : "", index + 1);
         player_play(index);
     }
 }
@@ -359,17 +382,20 @@ static void on_card_on(const char *uid)
     case SESSION_RESUME_SEEK: {
         char track[REL_PATH_MAX];
         str_copy(track, s_points[pi].track, sizeof(track));
-        play_folder_from(pi, folder, track, s_points[pi].position_ms);
+        play_folder_from(pi, folder, track, s_points[pi].position_ms, s_points[pi].shuffle,
+                         s_points[pi].shuffle_seed);
         break;
     }
-    case SESSION_START_NEW:
+    case SESSION_START_NEW: {
         LOCK();
         pi = alloc_point(uid);
         memset(&s_points[pi], 0, sizeof(s_points[pi]));
         str_copy(s_points[pi].uid, uid, sizeof(s_points[pi].uid));
         UNLOCK();
-        play_folder_from(pi, folder, NULL, 0);
+        bool shuffle = shuffle_for(uid); /* nouvel ordre à chaque nouveau départ */
+        play_folder_from(pi, folder, NULL, 0, shuffle, shuffle ? esp_random() : 0);
         break;
+    }
     }
 }
 

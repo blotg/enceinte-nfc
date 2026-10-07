@@ -660,6 +660,11 @@ static esp_err_t h_cards_get(httpd_req_t *req)
         } else {
             cJSON_AddNullToObject(e, "resume_other");
         }
+        if (list[i].shuffle >= 0) {
+            cJSON_AddBoolToObject(e, "shuffle", list[i].shuffle == 1);
+        } else {
+            cJSON_AddNullToObject(e, "shuffle");
+        }
         cJSON_AddItemToArray(arr, e);
     }
     free(list);
@@ -694,15 +699,19 @@ static esp_err_t h_cards_set(httpd_req_t *req)
     cJSON *body = read_json(req);
     const char *uid = json_str(body, "uid");
     const char *folder = json_str(body, "folder");
-    /* Réglages de reprise propres à la carte : absent ou null = réglage général. */
+    /* Réglages propres à la carte : absent ou null = réglage général. */
     const cJSON *rs = cJSON_GetObjectItem(body, "resume_s");
     const cJSON *ro = cJSON_GetObjectItem(body, "resume_other");
-    card_entry_t e = {.resume_s = CARD_DEFAULT, .resume_other = CARD_DEFAULT};
+    const cJSON *sh = cJSON_GetObjectItem(body, "shuffle");
+    card_entry_t e = {.resume_s = CARD_DEFAULT, .resume_other = CARD_DEFAULT, .shuffle = CARD_DEFAULT};
     if (cJSON_IsNumber(rs) && rs->valuedouble >= 0 && rs->valuedouble <= 30 * 24 * 3600) {
         e.resume_s = (int32_t)rs->valuedouble;
     }
     if (cJSON_IsBool(ro)) {
         e.resume_other = cJSON_IsTrue(ro) ? 1 : 0;
+    }
+    if (cJSON_IsBool(sh)) {
+        e.shuffle = cJSON_IsTrue(sh) ? 1 : 0;
     }
     esp_err_t err = ESP_ERR_INVALID_ARG;
     const char *msg = "carte ou dossier invalide";
@@ -972,6 +981,7 @@ static esp_err_t h_settings_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "max_volume", cfg.max_volume);
     cJSON_AddNumberToObject(root, "resume_s", cfg.resume_timeout_s);
     cJSON_AddBoolToObject(root, "resume_after_other", cfg.resume_after_other);
+    cJSON_AddBoolToObject(root, "shuffle", cfg.shuffle);
     cJSON_AddBoolToObject(root, "https_enabled", cfg.https_enabled);
     cJSON_AddBoolToObject(root, "https_active", s_https != NULL);
     cJSON_AddBoolToObject(root, "https_pending", s_https_busy);
@@ -1021,6 +1031,11 @@ static esp_err_t h_settings_set(httpd_req_t *req)
             cJSON_Delete(body);
             return send_error(req, "400 Bad Request", "délai de reprise invalide (30 jours maximum)");
         }
+    }
+    const cJSON *shuffle = cJSON_GetObjectItem(body, "shuffle");
+    if (cJSON_IsBool(shuffle) && settings_set_shuffle(cJSON_IsTrue(shuffle)) != ESP_OK) {
+        cJSON_Delete(body);
+        return send_error(req, "500 Internal Server Error", "enregistrement impossible");
     }
     const cJSON *maxv = cJSON_GetObjectItem(body, "max_volume");
     if (cJSON_IsNumber(maxv)) {

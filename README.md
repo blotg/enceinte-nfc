@@ -12,8 +12,8 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 
 | Fonction demandée | État | Remarques |
 |---|---|---|
-| Carte NFC → lecture d'un dossier | ✅ | MP3, AAC, M4A, FLAC, WAV, OGG/Opus. Sous-dossiers inclus, ordre « naturel » (2 avant 10). |
-| Pause au retrait, reprise sous 10 min | ✅ | Délai réglable (0 = toujours) et reprise possible même après une autre carte, en réglage général ou carte par carte. Une carte inconnue compte comme « une autre carte ». |
+| Carte NFC → lecture d'un dossier | ✅ | MP3, AAC, M4A, FLAC, WAV, OGG/Opus. Sous-dossiers inclus, ordre « naturel » (2 avant 10) ou aléatoire (réglage général ou carte par carte). |
+| Pause au retrait, reprise sous 10 min | ✅ | Durée de conservation de la progression réglable (0 = sans limite), progression conservée ou non après une autre carte, en réglage général ou carte par carte. Une carte inconnue compte comme « une autre carte ». |
 | Association dossier ↔ carte par l'interface web | ✅ | Mode association : la carte posée est capturée sans lancer la musique. Dossiers nommés librement (accents, espaces). |
 | Dépôt de fichiers par l'interface web | ✅ | Fichiers ou dossiers entiers, glisser-déposer. Débit limité par la carte SD en SPI. |
 | Mises à jour automatiques | ✅ | Depuis les releases GitHub (ou votre serveur), au démarrage (+1 min) et toutes les N heures. Installation seulement quand l'enceinte est inactive. Retour automatique à l'ancienne version si la nouvelle ne démarre pas. |
@@ -117,13 +117,18 @@ changer celui-ci de canal.
   Compatibilité avec l'ancien firmware : une carte non associée joue le dossier nommé d'après
   son identifiant (ex. `04ab53a96f2681`), s'il existe à la racine de la carte SD.
   Pour un sous-dossier : onglet *Musique*, ouvrir le dossier, « Associer une carte ».
+  Le bouton ☰ d'une carte ouvre ses réglages : dossier, ordre de lecture, conservation de
+  la progression. L'onglet *Musique* montre aussi les cartes associées au dossier ouvert
+  (et le nombre de cartes de chaque sous-dossier).
 - **Bips** : deux bips = carte inconnue ; trois bips graves = dossier vide ou carte SD absente.
 - **Musique** (onglet *Musique*) : envoyer des fichiers ou des dossiers entiers, créer,
   renommer, supprimer, écouter un dossier sans carte, et **déplacer** des fichiers ou des
   dossiers (bouton ↦, ou cases à cocher pour en déplacer ou supprimer plusieurs à la fois).
   Les associations de cartes et les positions de reprise suivent les dossiers déplacés.
-- **MPD** : serveur `enceinte.local`, port 6600, dans M.A.L.P. (Android), mpc, Cantata,
-  ncmpcpp, Rigelian (iOS)… Mot de passe facultatif dans *Réglages*.
+- **MPD** : adresse IP de l'enceinte, port 6600 (affichés dans *Réglages → Accès MPD*), dans
+  M.A.L.P. (Android), mpc, Cantata, ncmpcpp, Rigelian (iOS)… Beaucoup d'applications, dont
+  M.A.L.P., ne savent pas résoudre `enceinte.local` : mieux vaut réserver l'adresse IP de
+  l'enceinte dans la box. Mot de passe facultatif dans *Réglages*.
   Pris en charge : lecture, pause, morceau suivant ou précédent, recherche de position,
   volume, aléatoire, répétition, single, consume. Aussi la file d'attente (`add`, `delete`,
   `move`, `swap`, `playlistinfo`, `plchanges`…), le parcours de la carte (`lsinfo`,
@@ -136,13 +141,19 @@ changer celui-ci de canal.
 Retirer une carte met en pause et mémorise sa position (morceau et instant, pour les
 16 dernières cartes). Reposée, la carte reprend si sa playlist n'était pas finie et si :
 
-- le **délai** n'est pas dépassé : 10 min par défaut, 0 = toujours ;
-- aucune **autre carte** n'a été posée entre-temps, sauf si la règle « reprendre même si
-  une autre carte a été posée » est active : le dossier est alors rechargé et la lecture
-  repart au morceau et à l'instant mémorisés.
+- la progression est encore **conservée** : 10 min par défaut après le retrait, 0 = sans
+  limite ;
+- aucune **autre carte** n'a été posée entre-temps, sauf si la règle « conserver la
+  progression même si une autre carte est posée » est active : le dossier est alors
+  rechargé et la lecture repart au morceau et à l'instant mémorisés.
 
-Ces deux réglages se trouvent dans *Réglages → Reprise de la lecture*. Chaque carte peut
-les remplacer (*Cartes → ✎*), par exemple « toujours reprendre » pour un livre audio.
+Ces réglages, et l'ordre de lecture (dans l'ordre ou aléatoire), se trouvent dans
+*Réglages → Lecture des cartes*. Chaque carte peut les remplacer (*Cartes → ☰*), par
+exemple « sans limite » pour un livre audio, « aléatoire » pour des comptines.
+
+En **ordre aléatoire**, l'ordre est tiré quand la playlist commence (un nouvel ordre à
+chaque fois qu'elle recommence) et mémorisé avec la position : une reprise retrouve la même
+suite, sans rejouer ni sauter de morceau, même après une coupure de courant.
 Une commande MPD ou web qui modifie la file d'attente compte comme une autre carte.
 Les positions survivent aux coupures de courant et aux mises à jour : idéal pour un long
 podcast ou un livre audio. Elles sont tenues à jour chaque seconde en mémoire vive, et
@@ -243,7 +254,7 @@ test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame ; python-mpd2 pour l
    filtres MPD.
 2. Le contrôleur de cartes avec le **vrai** lecteur ; FreeRTOS, l'I2S et le décodeur sont
    simulés. Scénarios : reprise, autre carte, carte inconnue, délai dépassé, playlist
-   terminée, mode association.
+   terminée, mode association, ordre aléatoire retrouvé à la reprise.
 3. Le **vrai** serveur MPD et le **vrai** lecteur, pilotés par un vrai client MPD (python-mpd2).
 
 Le tout est compilé avec AddressSanitizer et UndefinedBehaviorSanitizer.

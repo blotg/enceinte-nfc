@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "session.h"
 #include "test.h"
 
@@ -97,6 +100,43 @@ void test_session(void)
     blob[0] = 99;
     CHECK(!resume_decode(blob, n, &dst)); /* version inconnue */
     CHECK(resume_encode(&src, blob, 20) == 0);    /* tampon trop petit */
+
+    /* Ordre aléatoire mémorisé avec le point */
+    src.shuffle = true;
+    src.shuffle_seed = 0xC0FFEE42;
+    n = resume_encode(&src, blob, sizeof(blob));
+    CHECK(n > 0 && resume_decode(blob, n, &dst));
+    CHECK(dst.shuffle && dst.shuffle_seed == 0xC0FFEE42 && dst.position_ms == 3725000);
+    CHECK_STR(dst.track, src.track);
+
+    /* Format v1 (versions 1.3.x, sans graine) toujours lu */
+    const uint8_t v1[] = {1, 1, 0x10, 0x27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'A', 'A', 0, 'F', 0, 'F', '/', 't', 0};
+    CHECK(resume_decode(v1, sizeof(v1), &dst));
+    CHECK(dst.removed && !dst.shuffle && dst.shuffle_seed == 0 && dst.position_ms == 10000);
+    CHECK_STR(dst.uid, "AA");
+    CHECK_STR(dst.track, "F/t");
+
+    /* Mélange : permutation complète, identique pour une même graine, différente sinon */
+    char names[10][12];
+    char *a[10], *b[10], *c[10];
+    for (int i = 0; i < 10; i++) {
+        snprintf(names[i], sizeof(names[i]), "%02d", i);
+        a[i] = b[i] = c[i] = names[i];
+    }
+    session_shuffle(a, 10, 1234);
+    session_shuffle(b, 10, 1234);
+    session_shuffle(c, 10, 1235);
+    bool same = true, other_differs = false, moved = false;
+    int seen = 0;
+    for (int i = 0; i < 10; i++) {
+        same = same && a[i] == b[i];
+        other_differs = other_differs || a[i] != c[i];
+        moved = moved || a[i] != names[i];
+        seen |= 1 << atoi(a[i]);
+    }
+    CHECK(same && other_differs && moved && seen == 0x3FF);
+    session_shuffle(a, 1, 99); /* un seul morceau : rien à faire */
+    session_shuffle(a, 0, 99);
 
     /* Règles : réglage de la carte prioritaire sur le réglage général */
     resume_policy_t r = session_policy(CARD_DEFAULT, CARD_DEFAULT, 600, false);

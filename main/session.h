@@ -9,6 +9,9 @@
  *  - aucune autre carte n'a été posée entre-temps, sauf si la règle de la carte
  *    autorise la reprise après une autre carte.
  * Sinon, elle recommence au début de son dossier.
+ *
+ * En lecture aléatoire, l'ordre des morceaux est tiré au début de la playlist et mémorisé
+ * (graine) : une reprise retrouve la même suite, sans rejouer ni sauter de morceau.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -39,6 +42,8 @@ typedef struct {
     bool removed;
     bool finished;            /* playlist jouée jusqu'au bout */
     bool restored;            /* rechargé depuis la mémoire permanente au démarrage */
+    bool shuffle;             /* playlist en ordre aléatoire */
+    uint32_t shuffle_seed;    /* graine de cet ordre */
 } resume_point_t;
 
 typedef enum {
@@ -66,6 +71,9 @@ bool session_expired(const resume_point_t *p, const resume_policy_t *pol, int64_
  */
 size_t resume_encode(const resume_point_t *p, uint8_t *out, size_t cap);
 bool resume_decode(const uint8_t *in, size_t len, resume_point_t *p);
+
+/* Mélange "items" dans un ordre qui ne dépend que de la graine (et de la liste). */
+void session_shuffle(char **items, int count, uint32_t seed);
 
 /* Règle effective d'une carte : réglage de la carte, sinon réglage général. */
 resume_policy_t session_policy(int32_t card_resume_s, int8_t card_resume_other, uint32_t default_timeout_s,

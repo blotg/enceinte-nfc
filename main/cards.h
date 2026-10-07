@@ -19,6 +19,7 @@ typedef struct {
     char folder[REL_PATH_MAX];
     int32_t resume_s;    /* délai de reprise : CARD_DEFAULT, 0 = toujours, sinon secondes */
     int8_t resume_other; /* après une autre carte : CARD_DEFAULT, 0 = recommencer, 1 = reprendre */
+    int8_t shuffle;      /* ordre de lecture : CARD_DEFAULT, 0 = dans l'ordre, 1 = aléatoire */
 } card_entry_t;
 
 esp_err_t cards_init(void);

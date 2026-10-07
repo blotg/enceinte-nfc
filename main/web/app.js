@@ -95,13 +95,26 @@ function fmtSize(b) {
 }
 
 function fmtDelay(s) {
-  if (!s) return 'toujours';
+  if (!s) return 'sans limite';
   if (s < 3600) return Math.round(s / 60) + ' min';
   const hh = s / 3600;
   return (Number.isInteger(hh) ? hh : hh.toFixed(1).replace('.', ',')) + ' h';
 }
 
 const DELAY_CHOICES = [0, 60, 300, 600, 1800, 3600, 10800, 86400];
+const GENERAL_DEFAULTS = { resume_s: 600, resume_after_other: false, shuffle: false };
+
+const isSet = (v) => v !== null && v !== undefined;
+
+/* Réglages propres à une carte, en clair (vide : réglages généraux). */
+function cardRules(c) {
+  const rules = [];
+  if (isSet(c.shuffle)) rules.push(c.shuffle ? 'ordre aléatoire' : 'dans l\'ordre');
+  const other = !isSet(c.resume_other) ? '' : c.resume_other ? 'même après une autre carte' : 'sauf si une autre carte est posée';
+  if (isSet(c.resume_s)) rules.push(`progression conservée ${fmtDelay(c.resume_s)}` + (other ? ', ' + other : ''));
+  else if (other) rules.push('progression conservée ' + other);
+  return rules;
+}
 
 function joinPath(a, b) { return a ? a + '/' + b : b; }
 function baseName(p) { return p.split('/').pop(); }
@@ -460,7 +473,7 @@ function folderSelect(folders, current) {
 
 async function renderCards() {
   const [data, folders, defaults] = await Promise.all([api('/api/cards'), topFolders().catch(() => []),
-    api('/api/settings').catch(() => ({ resume_s: 600, resume_after_other: false }))]);
+    api('/api/settings').catch(() => GENERAL_DEFAULTS)]);
   const list = h('ul', { class: 'list' });
   if (!data.cards.length) list.append(h('li', { class: 'muted' }, 'Aucune carte associée pour l\'instant.'));
   for (const c of data.cards) {
@@ -469,13 +482,9 @@ async function renderCards() {
       if (!confirm(`Supprimer l'association de la carte ${c.uid} ?`)) return;
       busy(del, async () => { await post('/api/cards/delete', { uid: c.uid }); toast('Association supprimée'); renderCards(); });
     });
-    const edit = h('button', { class: 'small', 'aria-label': 'Modifier', title: 'Modifier' }, '✎');
+    const edit = h('button', { class: 'small', 'aria-label': 'Réglages de la carte', title: 'Réglages de la carte' }, '☰');
     edit.addEventListener('click', () => learnFlow(c.folder, c.uid, folders, c, defaults));
-    const rules = [];
-    if (c.resume_s !== null && c.resume_s !== undefined) rules.push(`reprise : ${fmtDelay(c.resume_s)}`);
-    if (c.resume_other !== null && c.resume_other !== undefined) {
-      rules.push(c.resume_other ? 'reprend même après une autre carte' : 'recommence après une autre carte');
-    }
+    const rules = cardRules(c);
     list.append(h('li', null,
       h('span', { class: 'ico' }, '▣'),
       h('div', { class: 'name' },
@@ -503,32 +512,38 @@ async function renderCards() {
  * Association : capture d'une carte (mode association de l'enceinte, la musique ne
  * démarre pas) puis choix du dossier. knownUid permet de sauter la capture.
  */
-function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null) {
+function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null, onDone = renderCards) {
   let stopped = false;
   const box = h('div', { class: 'card stack' });
   const cancel = h('button', null, 'Annuler');
   cancel.addEventListener('click', () => {
     stopped = true;
     post('/api/cards/learn', { action: 'cancel' }).catch(() => {});
-    renderCards();
+    onDone();
   });
   setKids(root, box);
   app.view = null;
 
   const chooseFolder = async (uid) => {
     const sel = folderSelect(folders, presetFolder);
-    if (!defaults) defaults = await api('/api/settings').catch(() => ({ resume_s: 600, resume_after_other: false }));
-    const curDelay = card && card.resume_s !== null && card.resume_s !== undefined ? card.resume_s : null;
-    const curOther = card && card.resume_other !== null && card.resume_other !== undefined ? card.resume_other : null;
+    if (!defaults) defaults = await api('/api/settings').catch(() => GENERAL_DEFAULTS);
+    const curDelay = card && isSet(card.resume_s) ? card.resume_s : null;
+    const curOther = card && isSet(card.resume_other) ? card.resume_other : null;
+    const curShuffle = card && isSet(card.shuffle) ? card.shuffle : null;
+    const shuffleSel = h('select', null,
+      h('option', { value: '', selected: curShuffle === null },
+        `Réglage général (${defaults.shuffle ? 'aléatoire' : 'dans l\'ordre'})`),
+      h('option', { value: '0', selected: curShuffle === false }, 'Dans l\'ordre'),
+      h('option', { value: '1', selected: curShuffle === true }, 'Aléatoire'));
     const delays = DELAY_CHOICES.includes(curDelay) || curDelay === null ? DELAY_CHOICES : [...DELAY_CHOICES, curDelay].sort((a, b) => a - b);
     const delaySel = h('select', null,
       h('option', { value: '', selected: curDelay === null }, `Réglage général (${fmtDelay(defaults.resume_s)})`),
       ...delays.map((d) => h('option', { value: String(d), selected: d === curDelay },
-        d === 0 ? 'Toujours reprendre' : fmtDelay(d))));
+        d === 0 ? 'Sans limite' : fmtDelay(d))));
     const otherSel = h('select', null,
       h('option', { value: '', selected: curOther === null },
-        `Réglage général (${defaults.resume_after_other ? 'reprendre' : 'recommencer'})`),
-      h('option', { value: '1', selected: curOther === true }, 'Reprendre où on en était'),
+        `Réglage général (${defaults.resume_after_other ? 'conserver' : 'recommencer'})`),
+      h('option', { value: '1', selected: curOther === true }, 'Conserver la progression'),
       h('option', { value: '0', selected: curOther === false }, 'Recommencer au début'));
     const save = h('button', { class: 'primary' }, card ? 'Enregistrer' : 'Associer');
     save.addEventListener('click', () => busy(save, async () => {
@@ -537,17 +552,19 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
         uid, folder: sel.value,
         resume_s: delaySel.value === '' ? null : Number(delaySel.value),
         resume_other: otherSel.value === '' ? null : otherSel.value === '1',
+        shuffle: shuffleSel.value === '' ? null : shuffleSel.value === '1',
       });
       toast(card ? 'Carte modifiée' : 'Carte associée');
-      renderCards();
+      onDone();
     }));
     setKids(box,
       h('h2', null, card ? 'Modifier la carte' : 'Choisir la musique'),
       h('div', { class: 'big-uid mono' }, uid),
       h('label', null, 'Dossier de la carte SD'), sel,
       h('p', { class: 'muted small' }, 'Pour un sous-dossier, utilisez « Associer une carte » depuis l\'onglet Musique.'),
-      h('label', null, 'Reprise après retrait de la carte'), delaySel,
-      h('label', null, 'Si une autre carte a été posée entre-temps'), otherSel,
+      h('label', null, 'Ordre de lecture'), shuffleSel,
+      h('label', null, 'Après le retrait, conserver la progression pendant'), delaySel,
+      h('label', null, 'Si une autre carte est posée entre-temps'), otherSel,
       h('div', { class: 'row end actions' }, cancel, save));
   };
 
@@ -579,7 +596,7 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
       if (!d.learning && (seenLearning || Date.now() - started > 4000)) {
         setKids(box, h('h2', null, 'Aucune carte détectée'),
           h('p', { class: 'muted' }, 'Le délai d\'une minute est écoulé.'),
-          h('div', { class: 'row end' }, cancel, h('button', { class: 'primary', onclick: () => learnFlow(presetFolder, '', folders, card, defaults) }, 'Réessayer')));
+          h('div', { class: 'row end' }, cancel, h('button', { class: 'primary', onclick: () => learnFlow(presetFolder, '', folders, card, defaults, onDone) }, 'Réessayer')));
         return;
       }
     }
@@ -590,6 +607,7 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
 
 async function renderMusic(path = app.path) {
   let data;
+  const cardsReq = api('/api/cards').catch(() => ({ cards: [] }));
   try {
     data = await api('/api/files?path=' + encodeURIComponent(path));
   } catch (e) {
@@ -599,6 +617,9 @@ async function renderMusic(path = app.path) {
   }
   if (app.path !== data.path) app.selected.clear();
   app.path = data.path;
+  /* FAT ignore la casse des noms */
+  const allCards = (await cardsReq).cards || [];
+  const cardsOf = (folder) => allCards.filter((c) => c.folder.toLowerCase() === folder.toLowerCase());
 
   const crumbs = h('div', { class: 'crumbs' });
   crumbs.append(h('button', { class: 'small', onclick: () => renderMusic('') }, 'Carte SD'));
@@ -655,9 +676,11 @@ async function renderMusic(path = app.path) {
       busy(del, async () => { await post('/api/files/delete', { path: full }); toast('Supprimé'); renderMusic(); });
     });
     if (e.dir) {
+      const nCards = cardsOf(full).length;
       list.append(h('li', null, check,
         h('span', { class: 'ico' }, '📁'),
-        h('div', { class: 'name' }, h('button', { class: 'linkish', onclick: () => renderMusic(full) }, e.name)),
+        h('div', { class: 'name' }, h('button', { class: 'linkish', onclick: () => renderMusic(full) }, e.name),
+          nCards ? h('small', null, `▣ ${nCards} carte${nCards > 1 ? 's' : ''} associée${nCards > 1 ? 's' : ''}`) : null),
         h('button', { class: 'small', 'aria-label': 'Lire', title: 'Lire', onclick: () => playFolder(full) }, '▶'),
         ren, mv, del));
     } else {
@@ -700,9 +723,27 @@ async function renderMusic(path = app.path) {
     h('button', { class: 'small', onclick: () => playFolder(data.path) }, '▶ Lire ce dossier'),
     h('button', { class: 'small', onclick: async () => learnFlowFromMusic(data.path) }, '▣ Associer une carte')) : null;
 
+  let folderCards = null;
+  if (data.path) {
+    const here = cardsOf(data.path);
+    const cl = h('ul', { class: 'list' });
+    for (const c of here) {
+      const rules = cardRules(c);
+      cl.append(h('li', null,
+        h('span', { class: 'ico' }, '▣'),
+        h('div', { class: 'name' }, h('span', { class: 'mono' }, c.uid),
+          h('small', null, rules.length ? rules.join(' · ') : 'réglages généraux')),
+        h('button', { class: 'small', 'aria-label': 'Réglages de la carte', title: 'Réglages de la carte',
+          onclick: () => learnFlowFromMusic(data.path, c) }, '☰')));
+    }
+    folderCards = h('div', { class: 'folder-cards' },
+      h('div', { class: 'small muted' }, here.length ? 'Cartes associées à ce dossier :' : 'Aucune carte associée à ce dossier.'),
+      here.length ? cl : null);
+  }
+
   setKids(root, 
     h('div', { class: 'card' },
-      crumbs, folderActions,
+      crumbs, folderActions, folderCards,
       h('div', { class: 'row actions' },
         mkdir,
         h('button', { class: 'small', onclick: () => filesInput.click() }, '↑ Fichiers'),
@@ -789,11 +830,13 @@ async function collectEntry(entry, prefix, out) {
   }
 }
 
-async function learnFlowFromMusic(folder) {
+/* Association ou réglages d'une carte depuis l'onglet Musique ; on revient ensuite au dossier. */
+async function learnFlowFromMusic(folder, card = null) {
   app.tab = 'cards';
   for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('active', b.dataset.tab === 'cards');
   const folders = await topFolders().catch(() => []);
-  learnFlow(folder, '', folders.includes(folder) ? folders : [folder, ...folders]);
+  const back = () => switchTab('music');
+  learnFlow(folder, card ? card.uid : '', folders.includes(folder) ? folders : [folder, ...folders], card, null, back);
 }
 
 async function playFolder(folder) {
@@ -908,15 +951,17 @@ async function renderSettings() {
     refreshStatus();
   }));
 
-  /* Reprise */
-  const resumeMin = h('input', { type: 'number', min: 0, max: 43200, step: 1, value: Math.round(s.resume_s / 60) });
+  /* Lecture des cartes */
+  const shuffle = h('input', { type: 'checkbox', checked: !!s.shuffle });
+  const resumeMin = h('input', { type: 'number', class: 'short', min: 0, max: 43200, step: 1, value: Math.round(s.resume_s / 60),
+    'aria-label': 'Durée de conservation de la progression, en minutes' });
   const resumeOther = h('input', { type: 'checkbox', checked: !!s.resume_after_other, id: 'resume-other' });
   const saveResume = h('button', { class: 'primary' }, 'Enregistrer');
   saveResume.addEventListener('click', () => busy(saveResume, async () => {
     const m = Number(resumeMin.value);
-    if (!Number.isFinite(m) || m < 0) { toast('Délai invalide', true); return; }
-    await post('/api/settings', { resume_s: Math.round(m * 60), resume_after_other: resumeOther.checked });
-    toast('Réglages de reprise enregistrés');
+    if (!Number.isFinite(m) || m < 0) { toast('Durée invalide', true); return; }
+    await post('/api/settings', { shuffle: shuffle.checked, resume_s: Math.round(m * 60), resume_after_other: resumeOther.checked });
+    toast('Réglages de lecture enregistrés');
   }));
 
   /* HTTPS */
@@ -1027,12 +1072,14 @@ async function renderSettings() {
       h('label', null, 'Volume maximum'), h('div', { class: 'vol' }, maxVol, maxLbl),
       h('div', { class: 'row end actions' }, saveDev)),
     h('div', { class: 'card' },
-      h('h2', null, 'Reprise de la lecture'),
-      h('p', { class: 'small muted' }, 'Réglage général, modifiable carte par carte dans l\'onglet Cartes.'),
-      h('label', null, 'Délai pour reprendre après le retrait d\'une carte (minutes)'), resumeMin,
-      h('p', { class: 'small muted' }, '0 : toujours reprendre où on en était, quel que soit le délai.'),
+      h('h2', null, 'Lecture des cartes'),
+      h('p', { class: 'small muted' }, 'Réglages généraux, modifiables carte par carte (bouton ☰ de l\'onglet Cartes).'),
+      h('label', { class: 'check' }, shuffle, ' Lire les morceaux dans un ordre aléatoire'),
+      h('label', null, 'Après le retrait de la carte, conserver la progression pendant'),
+      h('div', { class: 'row' }, resumeMin, h('span', null, 'minutes')),
+      h('p', { class: 'small muted' }, '0 : sans limite, la carte reprend toujours où elle en était.'),
       h('label', { class: 'check' }, resumeOther,
-        ' Reprendre même si une autre carte a été posée entre-temps'),
+        ' Conserver la progression même si une autre carte est posée entre-temps'),
       h('div', { class: 'row end actions' }, saveResume)),
     h('div', { class: 'card' },
       h('h2', null, 'Mot de passe administrateur'),
@@ -1051,7 +1098,9 @@ async function renderSettings() {
     h('div', { class: 'card' },
       h('h2', null, 'Accès MPD'),
       h('p', { class: 'small muted' },
-        `Pilotez l'enceinte avec une application MPD (M.A.L.P., mpc, Cantata…) : serveur ${w.hostname}.local, port ${s.mpd_port}. `,
+        'Pilotez l\'enceinte avec une application MPD (M.A.L.P., mpc, Cantata…) à l\'adresse ',
+        h('b', { class: 'mono' }, `${w.ip || location.hostname}:${s.mpd_port}`), '. ',
+        'L\'adresse IP est attribuée par votre box : réservez-la dans ses réglages pour qu\'elle ne change pas. ',
         'Le protocole MPD ne connaît qu\'un mot de passe, sans identifiant.'),
       h('p', { class: 'small' }, s.mpd_password_set ? 'Un mot de passe est défini.' : 'Aucun mot de passe : accès libre depuis le réseau local.'),
       h('label', null, 'Mot de passe MPD ', h('span', { class: 'muted' }, '(vide = aucun)')), mpdPw,

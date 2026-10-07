@@ -110,6 +110,8 @@ input[type=text], input[type=password], input[type=number], input[type=url], sel
   color: var(--text);
   font: inherit;
 }
+input.short { width: 7em; flex: none; }
+
 input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 button, .btn {
@@ -164,6 +166,9 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 }
 .selbar .grow { flex: 1 1 auto; }
 .list input.sel { width: 20px; height: 20px; accent-color: var(--accent); flex: none; margin: 0; }
+
+.folder-cards { margin: 10px 0 4px; padding: 8px 10px; border-radius: 10px; background: var(--surface-2); }
+.folder-cards .list li { padding: 6px 0; }
 
 .crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 8px; font-size: 15px; }
 .crumbs button { min-height: 30px; padding: 0 8px; }
