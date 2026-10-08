@@ -10,6 +10,7 @@
 
 #include "changes.h"
 #include "driver/i2s_std.h"
+#include "dsp.h"
 #include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
@@ -91,6 +92,8 @@ static uint32_t s_rate = 44100;
 static uint8_t s_bits = 16, s_channels = 2;
 static int s_volume, s_max_volume = 100;
 static volatile int32_t s_gain_q15;
+static volatile uint8_t s_normalize, s_compress;
+static volatile bool s_dsp_reset; /* nouvelle playlist : la normalisation repart de zéro */
 static bool s_repeat, s_random, s_consume, s_seekable;
 static uint8_t s_single;
 static char s_error[96];
@@ -119,6 +122,8 @@ static bool s_skip_pending;
 static int s_chunk_size, s_nchunks;
 static uint8_t *s_bounce; /* tampon interne compatible DMA pour la lecture SD */
 static player_event_cb_t s_cb;
+static dsp_t s_dsp;
+static float *s_fpcm; /* PCM_FRAMES échantillons mono pour la normalisation et la compression */
 
 #define LOCK() xSemaphoreTake(s_lock, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(s_lock)
@@ -450,15 +455,13 @@ static void i2s_write_frames(const int16_t *pcm, uint32_t frames)
 
 static void play_beep(beep_t beep)
 {
-    int count = beep == BEEP_OK ? 1 : (beep == BEEP_UNKNOWN ? 2 : 3);
-    float freq = beep == BEEP_OK ? 880.0f : (beep == BEEP_UNKNOWN ? 660.0f : 330.0f);
+    int count = beep == BEEP_UNKNOWN ? 2 : (beep == BEEP_ERROR ? 3 : 1);
+    float freq = beep == BEEP_OK ? 880.0f : (beep == BEEP_UNKNOWN ? 660.0f : (beep == BEEP_ERROR ? 330.0f : 1000.0f));
     uint32_t rate = s_i2s_rate;
-    int32_t gain = s_gain_q15;
-    if (gain < 6500) {
-        gain = 6500; /* toujours audible, même à faible volume (~ -14 dB) */
-    }
-    float amp = gain * 0.6f;
-    uint32_t tone = rate * 120 / 1000, gap = rate * 90 / 1000;
+    /* Au volume réglé : crête à 25 % de la pleine échelle, soit à peu près le niveau moyen
+     * d'une musique (-15 dBFS), multipliée par le gain du volume. Volume 0 : silence. */
+    float amp = s_gain_q15 * 0.25f;
+    uint32_t tone = rate * (beep == BEEP_TICK ? 45 : 120) / 1000, gap = rate * (beep == BEEP_TICK ? 20 : 90) / 1000;
     ESP_LOGI(TAG, "bip x%d (%.0f Hz, amplitude %d/32767, %u Hz)", count, freq, (int)amp, (unsigned)rate);
     for (int b = 0; b < count; b++) {
         for (uint32_t done = 0; done < tone + gap;) {
@@ -685,6 +688,7 @@ static void output_pcm(const uint8_t *buf, uint32_t size)
         }
         UNLOCK();
         i2s_set_rate(info.sample_rate);
+        dsp_set_rate(&s_dsp, info.sample_rate);
         s_need_info = false;
         changes_notify(CHG_PLAYER);
     }
@@ -693,6 +697,14 @@ static void output_pcm(const uint8_t *buf, uint32_t size)
     if (bps < 2 || bps > 4 || ch < 1) {
         return;
     }
+    if (s_normalize != s_dsp.normalize || s_compress != s_dsp.compress) {
+        dsp_set_levels(&s_dsp, s_normalize, s_compress);
+    }
+    if (s_dsp_reset) {
+        s_dsp_reset = false;
+        dsp_reset(&s_dsp);
+    }
+    bool processing = s_fpcm && dsp_active(&s_dsp);
     uint32_t frames = size / (uint32_t)(bps * ch);
     const uint8_t *p = buf;
     int32_t gain = s_gain_q15;
@@ -704,9 +716,24 @@ static void output_pcm(const uint8_t *buf, uint32_t size)
             p += bps * ch;
             /* Un seul haut-parleur : mixage mono sur les deux canaux, ainsi le MAX98357A joue
              * tout le morceau quel que soit le câblage de sa broche SD (gauche, droite ou mixage). */
-            int16_t m = (int16_t)((((l + r) / 2) * gain) >> 15);
-            s_pcm[2 * i] = m;
-            s_pcm[2 * i + 1] = m;
+            if (processing) {
+                s_fpcm[i] = (float)((l + r) / 2) * (1.0f / 32768.0f);
+            } else {
+                int16_t m = (int16_t)((((l + r) / 2) * gain) >> 15);
+                s_pcm[2 * i] = m;
+                s_pcm[2 * i + 1] = m;
+            }
+        }
+        if (processing) {
+            /* Normalisation, compression et limiteur (crêtes sous -1 dBFS), puis volume */
+            dsp_process(&s_dsp, s_fpcm, n);
+            float g = (float)gain;
+            for (uint32_t i = 0; i < n; i++) {
+                int32_t m = (int32_t)lrintf(s_fpcm[i] * g);
+                m = m > 32767 ? 32767 : (m < -32768 ? -32768 : m);
+                s_pcm[2 * i] = (int16_t)m;
+                s_pcm[2 * i + 1] = (int16_t)m;
+            }
         }
         i2s_write_frames(s_pcm, n);
         frames -= n;
@@ -970,9 +997,10 @@ esp_err_t player_init(uint8_t volume, uint8_t max_volume, player_event_cb_t cb)
     s_cb = cb;
     s_lock = xSemaphoreCreateMutex();
     s_post_lock = xSemaphoreCreateMutex();
-    s_volume = volume;
-    s_max_volume = max_volume ? max_volume : 100;
+    s_max_volume = max_volume && max_volume <= 100 ? max_volume : 100;
+    s_volume = volume < s_max_volume ? volume : s_max_volume;
     update_gain_locked();
+    dsp_init(&s_dsp, 44100);
 
     esp_audio_dec_register_default();
     esp_audio_simple_dec_register_default();
@@ -988,6 +1016,7 @@ esp_err_t player_init(uint8_t volume, uint8_t max_volume, player_event_cb_t cb)
     s_out_cap = 8192;
     s_out = heap_caps_malloc(s_out_cap, MALLOC_CAP_8BIT);
     s_pcm = heap_caps_malloc(PCM_FRAMES * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_fpcm = heap_caps_malloc(PCM_FRAMES * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s_cmd_q || !s_req_q || !s_free_q || !s_filled_q || !s_bounce || !s_out || !s_pcm) {
         return ESP_ERR_NO_MEM;
     }
@@ -1227,6 +1256,7 @@ esp_err_t player_queue_replace(const path_list_t *list)
     s_removed_pos = -1;
     queue_changed_locked();
     UNLOCK();
+    s_dsp_reset = true;
     if (had_current) {
         post(CMD_CURRENT_REMOVED, 0, 0, false);
     }
@@ -1333,10 +1363,10 @@ void player_set_volume(int volume)
     if (volume < 0) {
         volume = 0;
     }
-    if (volume > 100) {
-        volume = 100;
-    }
     LOCK();
+    if (volume > s_max_volume) {
+        volume = s_max_volume;
+    }
     bool changed = s_volume != volume;
     s_volume = volume;
     update_gain_locked();
@@ -1358,10 +1388,38 @@ int player_get_volume(void)
 void player_set_max_volume(uint8_t max_volume)
 {
     LOCK();
-    s_max_volume = max_volume ? max_volume : 100;
+    s_max_volume = max_volume && max_volume <= 100 ? max_volume : 100;
+    bool lowered = s_volume > s_max_volume;
+    if (lowered) {
+        s_volume = s_max_volume;
+    }
+    int v = s_volume;
     update_gain_locked();
     UNLOCK();
+    if (lowered) {
+        settings_set_volume_deferred((uint8_t)v);
+    }
     changes_notify(CHG_MIXER);
+}
+
+int player_get_max_volume(void)
+{
+    LOCK();
+    int v = s_max_volume;
+    UNLOCK();
+    return v;
+}
+
+void player_set_sound(uint8_t normalize, uint8_t compress)
+{
+    s_normalize = normalize > DSP_LEVEL_MAX ? DSP_LEVEL_MAX : normalize;
+    s_compress = compress > DSP_LEVEL_MAX ? DSP_LEVEL_MAX : compress;
+}
+
+void player_get_sound(uint8_t *normalize, uint8_t *compress)
+{
+    *normalize = s_normalize;
+    *compress = s_compress;
 }
 
 #define SET_OPTION(var, value)        \

@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "backup.h"
 #include "cJSON.h"
 #include "cards.h"
 #include "changes.h"
@@ -36,6 +37,7 @@
 static const char *TAG = "web";
 
 #define BODY_MAX 4096
+#define IMPORT_MAX (160 * 1024) /* 300 cartes aux noms de dossier très longs */
 #define UPLOAD_BUF 8192
 #define MAX_SESSIONS 8
 #define SESSION_IDLE_US (30LL * 24 * 3600 * 1000000) /* 30 jours */
@@ -65,6 +67,11 @@ bool web_server_busy(void)
 {
     /* Le navigateur envoie les fichiers l'un après l'autre : on attend aussi un peu après le dernier. */
     return s_transfers > 0 || (s_last_transfer_us && esp_timer_get_time() - s_last_transfer_us < 5LL * 60 * 1000000);
+}
+
+bool web_server_transfers_active(void)
+{
+    return s_transfers > 0 || (s_last_transfer_us && esp_timer_get_time() - s_last_transfer_us < 10LL * 1000000);
 }
 
 static void transfer_begin(void)
@@ -112,9 +119,9 @@ static esp_err_t send_ok(httpd_req_t *req)
     return send_json(req, root);
 }
 
-static cJSON *read_json(httpd_req_t *req)
+static cJSON *read_json_max(httpd_req_t *req, size_t max)
 {
-    if (req->content_len == 0 || req->content_len > BODY_MAX) {
+    if (req->content_len == 0 || req->content_len > max) {
         return NULL;
     }
     char *buf = malloc(req->content_len + 1);
@@ -140,6 +147,11 @@ static cJSON *read_json(httpd_req_t *req)
     return root;
 }
 
+static cJSON *read_json(httpd_req_t *req)
+{
+    return read_json_max(req, BODY_MAX);
+}
+
 static const char *json_str(const cJSON *obj, const char *key)
 {
     const cJSON *it = cJSON_GetObjectItem(obj, key);
@@ -159,6 +171,20 @@ static bool get_query(httpd_req_t *req, const char *key, char *out, size_t len)
     free(q);
     free(raw);
     return ok;
+}
+
+/* Adresse IPv4 (ordre « hôte ») de l'enceinte par laquelle la requête est arrivée. */
+static uint32_t local_ip(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    struct sockaddr_in6 addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) {
+        return 0;
+    }
+    uint32_t ip = addr.sin6_family == AF_INET ? ((struct sockaddr_in *)&addr)->sin_addr.s_addr
+                                              : addr.sin6_addr.un.u32_addr[3]; /* IPv4 mappée */
+    return ntohl(ip);
 }
 
 static bool client_on_ap(httpd_req_t *req)
@@ -301,6 +327,9 @@ static bool require_auth(httpd_req_t *req)
     if (!find_session(req)) {
         send_error(req, "401 Unauthorized", "connexion requise");
         return false;
+    }
+    if (wifi_mgr_ip_testing()) {
+        wifi_mgr_ip_confirm(local_ip(req)); /* administrateur connecté à la nouvelle adresse */
     }
     return true;
 }
@@ -507,8 +536,6 @@ static esp_err_t h_status(httpd_req_t *req)
     wifi_mgr_get_status(&ws);
     ota_status_t os;
     ota_get_status(&os);
-    settings_t cfg;
-    settings_get(&cfg);
     current_tags(ps.file);
 
     cJSON *root = cJSON_CreateObject();
@@ -524,7 +551,11 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(p, "song", ps.song);
     cJSON_AddNumberToObject(p, "queue_len", ps.queue_len);
     cJSON_AddNumberToObject(p, "volume", ps.volume);
-    cJSON_AddNumberToObject(p, "max_volume", cfg.max_volume);
+    cJSON_AddNumberToObject(p, "max_volume", player_get_max_volume());
+    uint8_t normalize, compress;
+    player_get_sound(&normalize, &compress);
+    cJSON_AddNumberToObject(p, "normalize", normalize);
+    cJSON_AddNumberToObject(p, "compress", compress);
     cJSON_AddBoolToObject(p, "repeat", ps.repeat);
     cJSON_AddBoolToObject(p, "random", ps.random);
     cJSON_AddStringToObject(p, "error", ps.error);
@@ -545,6 +576,10 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddBoolToObject(w, "ap", ws.ap_active);
     cJSON_AddStringToObject(w, "ap_ssid", ws.ap_ssid);
     cJSON_AddStringToObject(w, "hostname", ws.hostname);
+    cJSON_AddBoolToObject(w, "sta_available", ws.sta_available);
+    cJSON_AddBoolToObject(w, "on_ap", client_on_ap(req));
+    cJSON_AddNumberToObject(w, "ip_test_remaining", ws.ip_test_remaining);
+    cJSON_AddStringToObject(w, "ip_test_address", ws.ip_test_address);
 
     cJSON *sd = cJSON_AddObjectToObject(root, "sd");
     uint64_t total = 0, freeb = 0;
@@ -665,6 +700,16 @@ static esp_err_t h_cards_get(httpd_req_t *req)
         } else {
             cJSON_AddNullToObject(e, "shuffle");
         }
+        if (list[i].normalize >= 0) {
+            cJSON_AddNumberToObject(e, "normalize", list[i].normalize);
+        } else {
+            cJSON_AddNullToObject(e, "normalize");
+        }
+        if (list[i].compress >= 0) {
+            cJSON_AddNumberToObject(e, "compress", list[i].compress);
+        } else {
+            cJSON_AddNullToObject(e, "compress");
+        }
         cJSON_AddItemToArray(arr, e);
     }
     free(list);
@@ -703,7 +748,13 @@ static esp_err_t h_cards_set(httpd_req_t *req)
     const cJSON *rs = cJSON_GetObjectItem(body, "resume_s");
     const cJSON *ro = cJSON_GetObjectItem(body, "resume_other");
     const cJSON *sh = cJSON_GetObjectItem(body, "shuffle");
-    card_entry_t e = {.resume_s = CARD_DEFAULT, .resume_other = CARD_DEFAULT, .shuffle = CARD_DEFAULT};
+    const cJSON *no = cJSON_GetObjectItem(body, "normalize");
+    const cJSON *co = cJSON_GetObjectItem(body, "compress");
+    card_entry_t e = {.resume_s = CARD_DEFAULT,
+                      .resume_other = CARD_DEFAULT,
+                      .shuffle = CARD_DEFAULT,
+                      .normalize = CARD_DEFAULT,
+                      .compress = CARD_DEFAULT};
     if (cJSON_IsNumber(rs) && rs->valuedouble >= 0 && rs->valuedouble <= 30 * 24 * 3600) {
         e.resume_s = (int32_t)rs->valuedouble;
     }
@@ -712,6 +763,12 @@ static esp_err_t h_cards_set(httpd_req_t *req)
     }
     if (cJSON_IsBool(sh)) {
         e.shuffle = cJSON_IsTrue(sh) ? 1 : 0;
+    }
+    if (cJSON_IsNumber(no) && no->valueint >= 0 && no->valueint <= SOUND_LEVEL_MAX) {
+        e.normalize = (int8_t)no->valueint;
+    }
+    if (cJSON_IsNumber(co) && co->valueint >= 0 && co->valueint <= SOUND_LEVEL_MAX) {
+        e.compress = (int8_t)co->valueint;
     }
     esp_err_t err = ESP_ERR_INVALID_ARG;
     const char *msg = "carte ou dossier invalide";
@@ -958,8 +1015,14 @@ static esp_err_t h_delete(httpd_req_t *req)
     cJSON *body = read_json(req);
     const char *path = json_str(body, "path");
     char rel[REL_PATH_MAX];
-    esp_err_t err =
-        (path && path_sanitize(path, rel, sizeof(rel)) && rel[0]) ? storage_remove_recursive(rel) : ESP_ERR_INVALID_ARG;
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    if (path && path_sanitize(path, rel, sizeof(rel)) && rel[0]) {
+        bool was_dir = storage_is_dir(rel);
+        err = storage_remove_recursive(rel);
+        if (was_dir && !storage_exists(rel)) {
+            cards_remove_under(rel); /* leur fichier d'associations est parti avec le dossier */
+        }
+    }
     cJSON_Delete(body);
     return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", "suppression impossible");
 }
@@ -979,6 +1042,28 @@ static esp_err_t h_settings_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "ota_url", cfg.ota_url);
     cJSON_AddNumberToObject(root, "ota_interval_h", cfg.ota_interval_h);
     cJSON_AddNumberToObject(root, "max_volume", cfg.max_volume);
+    cJSON_AddNumberToObject(root, "normalize", cfg.normalize);
+    cJSON_AddNumberToObject(root, "compress", cfg.compress);
+    char a[16];
+    cJSON *ip = cJSON_AddObjectToObject(root, "ip");
+    cJSON_AddStringToObject(ip, "mode", cfg.ip.static_ip ? "static" : "dhcp");
+    const uint32_t vals[] = {cfg.ip.address, cfg.ip.netmask, cfg.ip.gateway, cfg.ip.dns};
+    const char *keys[] = {"address", "netmask", "gateway", "dns"};
+    for (int i = 0; i < 4; i++) {
+        a[0] = '\0';
+        if (cfg.ip.static_ip && vals[i]) {
+            ip4_format(vals[i], a);
+        }
+        cJSON_AddStringToObject(ip, keys[i], a);
+    }
+    wifi_status_t ws;
+    wifi_mgr_get_status(&ws);
+    cJSON *cur = cJSON_AddObjectToObject(root, "ip_current"); /* pour pré-remplir une adresse fixe */
+    cJSON_AddStringToObject(cur, "address", ws.sta_ip);
+    cJSON_AddStringToObject(cur, "netmask", ws.sta_netmask);
+    cJSON_AddStringToObject(cur, "gateway", ws.sta_gateway);
+    cJSON_AddStringToObject(cur, "dns", ws.sta_dns);
+    cJSON_AddNumberToObject(root, "ip_test_s", IP_TEST_S);
     cJSON_AddNumberToObject(root, "resume_s", cfg.resume_timeout_s);
     cJSON_AddBoolToObject(root, "resume_after_other", cfg.resume_after_other);
     cJSON_AddBoolToObject(root, "shuffle", cfg.shuffle);
@@ -1036,6 +1121,17 @@ static esp_err_t h_settings_set(httpd_req_t *req)
     if (cJSON_IsBool(shuffle) && settings_set_shuffle(cJSON_IsTrue(shuffle)) != ESP_OK) {
         cJSON_Delete(body);
         return send_error(req, "500 Internal Server Error", "enregistrement impossible");
+    }
+    const cJSON *norm = cJSON_GetObjectItem(body, "normalize");
+    const cJSON *comp = cJSON_GetObjectItem(body, "compress");
+    if (cJSON_IsNumber(norm) || cJSON_IsNumber(comp)) {
+        int n = cJSON_IsNumber(norm) ? norm->valueint : cfg.normalize;
+        int c = cJSON_IsNumber(comp) ? comp->valueint : cfg.compress;
+        if (n < 0 || n > SOUND_LEVEL_MAX || c < 0 || c > SOUND_LEVEL_MAX ||
+            settings_set_sound((uint8_t)n, (uint8_t)c) != ESP_OK) {
+            cJSON_Delete(body);
+            return send_error(req, "400 Bad Request", "réglage du son invalide");
+        }
     }
     const cJSON *maxv = cJSON_GetObjectItem(body, "max_volume");
     if (cJSON_IsNumber(maxv)) {
@@ -1135,6 +1231,114 @@ static esp_err_t h_wifi_set(httpd_req_t *req)
     return send_ok(req);
 }
 
+static esp_err_t h_wifi_switch(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    wifi_mgr_switch_now();
+    return send_ok(req);
+}
+
+static bool json_ip(const cJSON *body, const char *key, uint32_t *out, bool optional)
+{
+    const char *v = json_str(body, key);
+    if (!v || !v[0]) {
+        *out = 0;
+        return optional;
+    }
+    return ip4_parse(v, out);
+}
+
+/* Nouvelle configuration IP : essayée, puis enregistrée à la première connexion administrateur
+ * à la nouvelle adresse ; sinon retour à l'ancienne au bout de 5 minutes. */
+static esp_err_t h_network(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *mode = json_str(body, "mode");
+    ip_config_t ip = {0};
+    const char *why = "configuration invalide";
+    bool ok = false;
+    if (mode && strcmp(mode, "dhcp") == 0) {
+        ok = true;
+    } else if (mode && strcmp(mode, "static") == 0) {
+        ip.static_ip = true;
+        if (!json_ip(body, "address", &ip.address, false)) {
+            why = "adresse IP mal écrite (exemple : 192.168.1.50)";
+        } else if (!json_ip(body, "netmask", &ip.netmask, false)) {
+            why = "masque de sous-réseau mal écrit (exemple : 255.255.255.0)";
+        } else if (!json_ip(body, "gateway", &ip.gateway, false)) {
+            why = "passerelle mal écrite (exemple : 192.168.1.1)";
+        } else if (!json_ip(body, "dns", &ip.dns, true)) {
+            why = "serveur DNS mal écrit";
+        } else {
+            ok = settings_ip_valid(&ip, &why);
+        }
+    }
+    cJSON_Delete(body);
+    if (!ok) {
+        return send_error(req, "400 Bad Request", why ? why : "configuration invalide");
+    }
+    wifi_mgr_ip_test(&ip);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddNumberToObject(root, "test_s", IP_TEST_S);
+    return send_json(req, root);
+}
+
+/* ================= Export / import ================= */
+
+static esp_err_t h_config_export(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    char v[4] = "";
+    bool secrets = get_query(req, "secrets", v, sizeof(v)) && strcmp(v, "1") == 0;
+    cJSON *doc = backup_export(secrets);
+    char *txt = doc ? cJSON_Print(doc) : NULL;
+    cJSON_Delete(doc);
+    if (!txt) {
+        return send_error(req, "500 Internal Server Error", "mémoire insuffisante");
+    }
+    settings_t cfg;
+    settings_get(&cfg);
+    char disp[96];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"reglages-%s.json\"", cfg.hostname);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+    esp_err_t err = httpd_resp_sendstr(req, txt);
+    free(txt);
+    return err;
+}
+
+static esp_err_t h_config_import(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *doc = read_json_max(req, IMPORT_MAX);
+    if (!doc) {
+        return send_error(req, "400 Bad Request", "fichier illisible (JSON attendu, 160 Ko maximum)");
+    }
+    char msg[200];
+    bool ip_test = false;
+    esp_err_t err = backup_import(doc, msg, sizeof(msg), &ip_test);
+    cJSON_Delete(doc);
+    if (err != ESP_OK) {
+        return send_error(req, "400 Bad Request", msg);
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "message", msg);
+    cJSON_AddBoolToObject(root, "ip_test", ip_test);
+    return send_json(req, root);
+}
+
 /* ================= Système ================= */
 
 static esp_err_t h_ota_check(httpd_req_t *req)
@@ -1155,6 +1359,7 @@ static esp_err_t h_ota_upload(httpd_req_t *req)
     if (err != ESP_OK) {
         return send_error(req, "400 Bad Request", "taille de firmware invalide");
     }
+    transfer_begin();
     char *buf = malloc(4096);
     size_t remaining = req->content_len;
     int timeouts = 0;
@@ -1172,6 +1377,7 @@ static esp_err_t h_ota_upload(httpd_req_t *req)
         remaining -= n;
     }
     free(buf);
+    transfer_end();
     char msg[96];
     if (err == ESP_ERR_INVALID_VERSION) {
         ota_upload_end(false, msg, sizeof(msg));
@@ -1207,6 +1413,7 @@ static esp_err_t h_factory_reset(httpd_req_t *req)
         return send_error(req, "400 Bad Request", "mot de passe incorrect");
     }
     send_ok(req);
+    backup_factory_reset(); /* sinon la carte SD rétablirait réglages et mot de passe */
     settings_factory_reset();
     ota_schedule_restart(1000);
     return ESP_OK;
@@ -1243,6 +1450,10 @@ static const httpd_uri_t s_uris[] = {
     {"/api/https", HTTP_POST, h_https, NULL},
     {"/api/wifi/scan", HTTP_GET, h_wifi_scan, NULL},
     {"/api/wifi", HTTP_POST, h_wifi_set, NULL},
+    {"/api/wifi/switch", HTTP_POST, h_wifi_switch, NULL},
+    {"/api/network", HTTP_POST, h_network, NULL},
+    {"/api/config/export", HTTP_GET, h_config_export, NULL},
+    {"/api/config/import", HTTP_POST, h_config_import, NULL},
     {"/api/ota/check", HTTP_POST, h_ota_check, NULL},
     {"/api/ota/upload", HTTP_PUT, h_ota_upload, NULL},
     {"/api/reboot", HTTP_POST, h_reboot, NULL},
@@ -1260,7 +1471,7 @@ static void register_handlers(httpd_handle_t srv, bool secure)
 
 static void base_config(httpd_config_t *cfg)
 {
-    cfg->max_uri_handlers = 36;
+    cfg->max_uri_handlers = 40;
     cfg->lru_purge_enable = true;
     cfg->recv_wait_timeout = 10;
     cfg->send_wait_timeout = 10;
@@ -1305,7 +1516,7 @@ static void https_apply_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static void https_apply(void)
+void web_server_https_apply(void)
 {
     s_https_busy = true;
     if (xTaskCreate(https_apply_task, "https_apply", 8192, NULL, 4, NULL) != pdPASS) {
@@ -1325,7 +1536,7 @@ static esp_err_t h_https(httpd_req_t *req)
     if (err != ESP_OK) {
         return send_error(req, "400 Bad Request", "réglage invalide");
     }
-    https_apply();
+    web_server_https_apply();
     return send_ok(req);
 }
 
@@ -1345,7 +1556,7 @@ esp_err_t web_server_start(void)
     settings_t st;
     settings_get(&st);
     if (st.https_enabled) {
-        https_apply();
+        web_server_https_apply();
     }
     ESP_LOGI(TAG, "interface web prête");
     return ESP_OK;

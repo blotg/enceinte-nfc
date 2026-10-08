@@ -42,3 +42,5 @@ void test_session(void);
 void test_dns(void);
 void test_mpd_proto(void);
 void test_media(const char *fixtures);
+void test_dsp(void);
+void test_config_json(void);

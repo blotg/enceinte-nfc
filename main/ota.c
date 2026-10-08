@@ -56,6 +56,7 @@ static void set_state(ota_state_t state, int progress, const char *fmt, ...)
 
 static void restart_cb(void *arg)
 {
+    settings_flush(); /* volume modifié dans la dernière seconde */
     esp_restart();
 }
 

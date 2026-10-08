@@ -20,7 +20,7 @@ jobs:
       - name: Dépendances
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg lame
+          sudo apt-get install -y --no-install-recommends ffmpeg lame flac libcjson-dev
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --quiet python-mpd2
       - name: Tests (unitaires, contrôleur de cartes, intégration MPD)

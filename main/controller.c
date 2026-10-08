@@ -142,6 +142,25 @@ static bool shuffle_for(const char *uid)
     return cfg.shuffle;
 }
 
+/* Normalisation et compression : réglage de la carte qui joue, sinon réglage général
+ * (aussi pour la lecture lancée depuis l'interface web ou une application MPD). */
+static void apply_sound(const char *uid)
+{
+    settings_t cfg;
+    settings_get(&cfg);
+    uint8_t normalize = cfg.normalize, compress = cfg.compress;
+    card_entry_t e;
+    if (uid && cards_get(uid, &e)) {
+        if (e.normalize != CARD_DEFAULT) {
+            normalize = (uint8_t)e.normalize;
+        }
+        if (e.compress != CARD_DEFAULT) {
+            compress = (uint8_t)e.compress;
+        }
+    }
+    player_set_sound(normalize, compress);
+}
+
 static int find_point(const char *uid)
 {
     for (int i = 0; i < MAX_POINTS; i++) {
@@ -315,6 +334,7 @@ static void play_folder_from(int pi, const char *folder, const char *track, uint
     s_live = pi;
     UNLOCK();
     persist(pi);
+    apply_sound(p->uid);
     if (position_ms > 0) {
         ESP_LOGI(TAG, "carte %s : reprise de \"%s\" à %u s", p->uid, first, (unsigned)(position_ms / 1000));
         if (player_seek(index, position_ms) != ESP_OK) {
@@ -376,6 +396,7 @@ static void on_card_on(const char *uid)
         persist(pi);
         if (action == SESSION_RESUME_LIVE) {
             ESP_LOGI(TAG, "reprise de la carte %s", uid);
+            apply_sound(uid);
             player_pause(0);
         }
         break;
@@ -469,6 +490,7 @@ static void track_live_position(int64_t now)
 static void tick(int64_t now)
 {
     track_live_position(now);
+    apply_sound(point_is_live(s_live) ? s_points[s_live].uid : NULL); /* réglages modifiés entre-temps */
     for (int i = 0; i < MAX_POINTS; i++) {
         resume_point_t *p = &s_points[i];
         if (!p->uid[0]) {

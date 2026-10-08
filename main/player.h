@@ -60,10 +60,12 @@ typedef enum {
 
 typedef void (*player_event_cb_t)(player_event_t evt);
 
+/* Bips joués au volume réglé (et jamais au-delà du volume maximum). */
 typedef enum {
     BEEP_OK,      /* un bip aigu */
     BEEP_UNKNOWN, /* deux bips : carte inconnue */
     BEEP_ERROR,   /* trois bips graves : dossier vide ou introuvable */
+    BEEP_TICK,    /* bip très court : nouveau volume (boutons, hors lecture) */
 } beep_t;
 
 esp_err_t player_init(uint8_t volume, uint8_t max_volume, player_event_cb_t cb);
@@ -102,9 +104,15 @@ void player_beep(beep_t beep);
 void player_clear_error(void);
 
 /* ---- Volume et options ---- */
+/* Volume borné entre 0 et le volume maximum ; enregistré en flash (cf. settings). */
 void player_set_volume(int volume);
 int player_get_volume(void);
+/* Un volume au-dessus du nouveau maximum est abaissé. */
 void player_set_max_volume(uint8_t max_volume);
+int player_get_max_volume(void);
+/* Normalisation et compression (0 à 3, cf. dsp.h), appliquées dès le bloc suivant. */
+void player_set_sound(uint8_t normalize, uint8_t compress);
+void player_get_sound(uint8_t *normalize, uint8_t *compress);
 void player_set_repeat(bool on);
 void player_set_random(bool on);
 void player_set_single(uint8_t mode);

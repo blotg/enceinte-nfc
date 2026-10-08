@@ -21,6 +21,10 @@ idf_component_register(
         "ota.c"
         "changes.c"
         "util.c"
+        "dsp.c"
+        "buttons.c"
+        "config_json.c"
+        "backup.c"
     INCLUDE_DIRS "."
     EMBED_TXTFILES
         "web/index.html"

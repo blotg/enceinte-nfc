@@ -21,10 +21,26 @@ static const char *NS = "settings";
 #define PW_HASH_LEN 32
 #define PW_ITERATIONS 10000
 #define PW_BLOB_LEN (4 + PW_SALT_LEN + PW_HASH_LEN)
+_Static_assert(PW_BLOB_LEN == SETTINGS_PW_HASH_LEN, "taille de l'empreinte");
+
+#define VOLUME_SAVE_DELAY_US (1000 * 1000)
 
 static settings_t s_cfg;
 static SemaphoreHandle_t s_lock;
 static esp_timer_handle_t s_volume_timer;
+static void (*s_observer)(void);
+
+static void notify(void)
+{
+    if (s_observer) {
+        s_observer();
+    }
+}
+
+void settings_set_observer(void (*cb)(void))
+{
+    s_observer = cb;
+}
 
 static esp_err_t open_ns(nvs_open_mode_t mode, nvs_handle_t *h)
 {
@@ -125,6 +141,15 @@ esp_err_t settings_init(void)
         uint8_t https = 0;
         nvs_get_u8(h, "https", &https);
         s_cfg.https_enabled = https != 0;
+        nvs_get_u8(h, "normalize", &s_cfg.normalize);
+        nvs_get_u8(h, "compress", &s_cfg.compress);
+        uint8_t st = 0;
+        nvs_get_u8(h, "ip_static", &st);
+        s_cfg.ip.static_ip = st != 0;
+        nvs_get_u32(h, "ip_addr", &s_cfg.ip.address);
+        nvs_get_u32(h, "ip_mask", &s_cfg.ip.netmask);
+        nvs_get_u32(h, "ip_gw", &s_cfg.ip.gateway);
+        nvs_get_u32(h, "ip_dns", &s_cfg.ip.dns);
         s_cfg.admin_set = blob_exists(h, "admin_pw");
         s_cfg.mpd_pass_set = blob_exists(h, "mpd_pw");
         nvs_close(h);
@@ -143,12 +168,26 @@ esp_err_t settings_init(void)
     if (s_cfg.volume > 100) {
         s_cfg.volume = CONFIG_ENC_DEFAULT_VOLUME;
     }
+    if (s_cfg.normalize > SOUND_LEVEL_MAX) {
+        s_cfg.normalize = 0;
+    }
+    if (s_cfg.compress > SOUND_LEVEL_MAX) {
+        s_cfg.compress = 0;
+    }
+    if (s_cfg.ip.static_ip && !settings_ip_valid(&s_cfg.ip, NULL)) {
+        ESP_LOGW(TAG, "adresse IP fixe enregistrée invalide : DHCP");
+        s_cfg.ip.static_ip = false;
+    }
 
     const esp_timer_create_args_t targs = {.callback = volume_timer_cb, .name = "vol_save"};
     esp_timer_create(&targs, &s_volume_timer);
 
-    ESP_LOGI(TAG, "nom=%s wifi=%s admin=%s mpd_pw=%s maj=%s", s_cfg.hostname,
-             s_cfg.wifi_ssid[0] ? s_cfg.wifi_ssid : "(aucun)", s_cfg.admin_set ? "oui" : "non",
+    char ip[16] = "DHCP";
+    if (s_cfg.ip.static_ip) {
+        ip4_format(s_cfg.ip.address, ip);
+    }
+    ESP_LOGI(TAG, "nom=%s wifi=%s ip=%s admin=%s mpd_pw=%s maj=%s", s_cfg.hostname,
+             s_cfg.wifi_ssid[0] ? s_cfg.wifi_ssid : "(aucun)", ip, s_cfg.admin_set ? "oui" : "non",
              s_cfg.mpd_pass_set ? "oui" : "non", s_cfg.ota_url[0] ? s_cfg.ota_url : "(aucune)");
     return ESP_OK;
 }
@@ -171,6 +210,7 @@ esp_err_t settings_set_hostname(const char *hostname)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         str_copy(s_cfg.hostname, norm, sizeof(s_cfg.hostname));
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -199,6 +239,7 @@ esp_err_t settings_set_wifi(const char *ssid, const char *pass)
         str_copy(s_cfg.wifi_ssid, ssid, sizeof(s_cfg.wifi_ssid));
         str_copy(s_cfg.wifi_pass, pass, sizeof(s_cfg.wifi_pass));
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -229,6 +270,7 @@ esp_err_t settings_set_ota(const char *url, uint16_t interval_h)
         str_copy(s_cfg.ota_url, url, sizeof(s_cfg.ota_url));
         s_cfg.ota_interval_h = interval_h;
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -243,6 +285,7 @@ esp_err_t settings_set_max_volume(uint8_t max_volume)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_cfg.max_volume = max_volume;
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -270,6 +313,7 @@ esp_err_t settings_set_resume(uint32_t timeout_s, bool after_other)
         s_cfg.resume_timeout_s = timeout_s;
         s_cfg.resume_after_other = after_other;
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -281,6 +325,7 @@ esp_err_t settings_set_shuffle(bool on)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_cfg.shuffle = on;
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -292,6 +337,7 @@ esp_err_t settings_set_https(bool enabled)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_cfg.https_enabled = enabled;
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -304,8 +350,151 @@ void settings_set_volume_deferred(uint8_t volume)
     xSemaphoreGive(s_lock);
     if (changed && s_volume_timer) {
         esp_timer_stop(s_volume_timer);
-        esp_timer_start_once(s_volume_timer, 5 * 1000 * 1000);
+        esp_timer_start_once(s_volume_timer, VOLUME_SAVE_DELAY_US);
     }
+}
+
+void settings_flush(void)
+{
+    if (s_volume_timer && esp_timer_is_active(s_volume_timer)) {
+        esp_timer_stop(s_volume_timer);
+        volume_timer_cb(NULL);
+    }
+}
+
+esp_err_t settings_set_sound(uint8_t normalize, uint8_t compress)
+{
+    if (normalize > SOUND_LEVEL_MAX || compress > SOUND_LEVEL_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = open_ns(NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "normalize", normalize);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, "compress", compress);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_cfg.normalize = normalize;
+        s_cfg.compress = compress;
+        xSemaphoreGive(s_lock);
+        notify();
+    }
+    return err;
+}
+
+static esp_err_t write_ip(nvs_handle_t h, const ip_config_t *ip)
+{
+    esp_err_t err = nvs_set_u8(h, "ip_static", ip->static_ip ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, "ip_addr", ip->address);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, "ip_mask", ip->netmask);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, "ip_gw", ip->gateway);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, "ip_dns", ip->dns);
+    }
+    return err;
+}
+
+esp_err_t settings_set_ip(const ip_config_t *ip)
+{
+    if (!settings_ip_valid(ip, NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = open_ns(NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = write_ip(h, ip);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_cfg.ip = *ip;
+        xSemaphoreGive(s_lock);
+        notify();
+    }
+    return err;
+}
+
+esp_err_t settings_set_all(const settings_t *in)
+{
+    settings_t c = *in;
+    size_t sl = strlen(c.wifi_ssid), pl = strlen(c.wifi_pass);
+    if (!hostname_normalize(in->hostname, c.hostname, sizeof(c.hostname)) || sl > 32 || pl > 64 ||
+        (sl == 0 && pl > 0) || (pl > 0 && pl < 8) || strlen(c.ota_url) >= sizeof(c.ota_url) ||
+        (c.ota_url[0] && strncmp(c.ota_url, "http://", 7) != 0 && strncmp(c.ota_url, "https://", 8) != 0) ||
+        c.ota_interval_h == 0 || c.ota_interval_h > 24 * 30 || c.resume_timeout_s > 30 * 24 * 3600 ||
+        c.max_volume == 0 || c.max_volume > 100 || c.normalize > SOUND_LEVEL_MAX || c.compress > SOUND_LEVEL_MAX ||
+        !settings_ip_valid(&c.ip, NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = open_ns(NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    const struct {
+        const char *key;
+        uint8_t value;
+    } u8s[] = {
+        {"max_vol", c.max_volume},       {"resume_other", c.resume_after_other}, {"shuffle", c.shuffle},
+        {"https", c.https_enabled},      {"normalize", c.normalize},             {"compress", c.compress},
+    };
+    for (size_t i = 0; err == ESP_OK && i < sizeof(u8s) / sizeof(u8s[0]); i++) {
+        err = nvs_set_u8(h, u8s[i].key, u8s[i].value);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "hostname", c.hostname);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "wifi_ssid", c.wifi_ssid);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "wifi_pass", c.wifi_pass);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "ota_url", c.ota_url);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u16(h, "ota_int_h", c.ota_interval_h);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, "resume_s", c.resume_timeout_s);
+    }
+    if (err == ESP_OK) {
+        err = write_ip(h, &c.ip);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    c.volume = s_cfg.volume;
+    c.admin_set = s_cfg.admin_set;
+    c.mpd_pass_set = s_cfg.mpd_pass_set;
+    s_cfg = c;
+    xSemaphoreGive(s_lock);
+    notify();
+    return ESP_OK;
 }
 
 /* ---- Mots de passe ---- */
@@ -343,24 +532,26 @@ static esp_err_t pw_store(const char *key, const char *password)
     return err;
 }
 
-static bool pw_check(const char *key, const char *password)
+static bool pw_load(const char *key, uint8_t blob[PW_BLOB_LEN])
 {
     nvs_handle_t h;
     if (open_ns(NVS_READONLY, &h) != ESP_OK) {
         return false;
     }
-    uint8_t blob[PW_BLOB_LEN];
-    size_t sz = sizeof(blob);
+    size_t sz = PW_BLOB_LEN;
     esp_err_t err = nvs_get_blob(h, key, blob, &sz);
     nvs_close(h);
-    if (err != ESP_OK || sz != sizeof(blob)) {
+    return err == ESP_OK && sz == PW_BLOB_LEN && settings_password_hash_valid(blob);
+}
+
+static bool pw_check(const char *key, const char *password)
+{
+    uint8_t blob[PW_BLOB_LEN];
+    if (!pw_load(key, blob)) {
         return false;
     }
     uint32_t it;
     memcpy(&it, blob, 4);
-    if (it == 0 || it > 1000000) {
-        return false;
-    }
     uint8_t hash[PW_HASH_LEN];
     pw_derive(password, blob + 4, it, hash);
     uint8_t diff = 0; /* comparaison en temps constant */
@@ -368,6 +559,57 @@ static bool pw_check(const char *key, const char *password)
         diff |= hash[i] ^ blob[4 + PW_SALT_LEN + i];
     }
     return diff == 0;
+}
+
+static esp_err_t pw_store_blob(const char *key, const uint8_t *blob)
+{
+    nvs_handle_t h;
+    esp_err_t err = open_ns(NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (blob) {
+        err = nvs_set_blob(h, key, blob, PW_BLOB_LEN);
+    } else {
+        err = nvs_erase_key(h, key);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;
+        }
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+bool settings_get_password_hash(bool admin, uint8_t out[SETTINGS_PW_HASH_LEN])
+{
+    return pw_load(admin ? "admin_pw" : "mpd_pw", out);
+}
+
+esp_err_t settings_set_password_hash(bool admin, const uint8_t *hash)
+{
+    if ((admin && !hash) || (hash && !settings_password_hash_valid(hash))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t current[PW_BLOB_LEN];
+    bool had = pw_load(admin ? "admin_pw" : "mpd_pw", current);
+    if ((!hash && !had) || (hash && had && memcmp(hash, current, PW_BLOB_LEN) == 0)) {
+        return ESP_OK; /* inchangé : pas d'écriture */
+    }
+    esp_err_t err = pw_store_blob(admin ? "admin_pw" : "mpd_pw", hash);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        if (admin) {
+            s_cfg.admin_set = true;
+        } else {
+            s_cfg.mpd_pass_set = hash != NULL;
+        }
+        xSemaphoreGive(s_lock);
+        notify();
+    }
+    return err;
 }
 
 esp_err_t settings_set_admin_password(const char *password)
@@ -381,6 +623,7 @@ esp_err_t settings_set_admin_password(const char *password)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_cfg.admin_set = true;
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -400,6 +643,7 @@ esp_err_t settings_set_mpd_password(const char *password)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_cfg.mpd_pass_set = password[0] != '\0';
         xSemaphoreGive(s_lock);
+        notify();
     }
     return err;
 }
@@ -412,6 +656,9 @@ bool settings_check_mpd_password(const char *password)
 esp_err_t settings_factory_reset(void)
 {
     ESP_LOGW(TAG, "réinitialisation usine");
+    if (s_volume_timer) {
+        esp_timer_stop(s_volume_timer);
+    }
     nvs_flash_deinit_partition(CFG_PARTITION);
     esp_err_t err = nvs_flash_erase_partition(CFG_PARTITION);
     nvs_flash_init_partition(CFG_PARTITION);

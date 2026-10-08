@@ -195,6 +195,26 @@ BaseType_t xSemaphoreGive(SemaphoreHandle_t s)
     return pdTRUE;
 }
 
+SemaphoreHandle_t xSemaphoreCreateRecursiveMutex(void)
+{
+    struct shim_sem *s = calloc(1, sizeof(*s));
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s->m, &a);
+    return s;
+}
+
+BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t s, TickType_t ticks)
+{
+    return pthread_mutex_lock(&s->m) == 0 ? pdTRUE : pdFALSE;
+}
+
+BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t s)
+{
+    return pthread_mutex_unlock(&s->m) == 0 ? pdTRUE : pdFALSE;
+}
+
 /* ---------- Tâches ---------- */
 
 struct shim_task {
