@@ -19,6 +19,7 @@ int g_checks;
 
 void mock_set_resume(uint32_t timeout_s, bool after_other);
 void mock_set_shuffle(bool on);
+void mock_set_sound(uint8_t normalize, uint8_t compress);
 
 /* Mémoire permanente simulée : passe par la vraie sérialisation */
 static uint8_t g_store[16][600];
@@ -93,7 +94,7 @@ static bool wait_stored(const char *uid, const char *track, bool removed, resume
 }
 
 /* Associations simulées ; la carte EE reprend même après une autre carte (réglage propre),
- * la carte SS aussi, et lit son dossier dans un ordre aléatoire. */
+ * la carte SS aussi, lit son dossier dans un ordre aléatoire et compresse le son (niveau 2). */
 static char g_ee_folder[64] = "Livre";
 
 bool cards_get(const char *uid, card_entry_t *out)
@@ -111,6 +112,8 @@ bool cards_get(const char *uid, card_entry_t *out)
     out->resume_s = CARD_DEFAULT;
     out->resume_other = strcmp(uid, "EE") == 0 || strcmp(uid, "SS") == 0 ? 1 : CARD_DEFAULT;
     out->shuffle = strcmp(uid, "SS") == 0 ? 1 : CARD_DEFAULT;
+    out->normalize = CARD_DEFAULT;
+    out->compress = strcmp(uid, "SS") == 0 ? 2 : CARD_DEFAULT;
     return true;
 }
 
@@ -483,6 +486,10 @@ int main(int argc, char **argv)
     CHECK(same_order);
     CHECK(status().song == at_removal.song);
     CHECK_STR(status().file, at_removal.file);
+    /* Son : compression propre à la carte SS, normalisation du réglage général */
+    uint8_t norm = 9, comp = 9;
+    player_get_sound(&norm, &comp);
+    CHECK(norm == 0 && comp == 2);
     card(false, "SS");
     /* réglage général : la carte AA (sans réglage propre) passe en ordre aléatoire */
     mock_set_shuffle(true);
@@ -497,8 +504,27 @@ int main(int argc, char **argv)
         usleep(100000);
     }
     CHECK(flagged);
+    /* Carte sans réglage de son : réglage général, appliqué en cours de lecture (tic d'1 s) */
+    player_get_sound(&norm, &comp);
+    CHECK(norm == 0 && comp == 0);
+    mock_set_sound(3, 1);
+    usleep(1300000);
+    player_get_sound(&norm, &comp);
+    CHECK(norm == 3 && comp == 1);
+    mock_set_sound(0, 0);
     card(false, "AA");
     mock_set_shuffle(false);
+
+    /* 16. Volume borné par le volume maximum, y compris quand celui-ci baisse */
+    player_set_max_volume(60);
+    player_set_volume(90);
+    CHECK(player_get_volume() == 60);
+    player_set_volume(45);
+    player_set_max_volume(40);
+    CHECK(player_get_volume() == 40);
+    player_set_volume(-5);
+    CHECK(player_get_volume() == 0);
+    player_set_max_volume(100);
 
     printf("contrôleur : %d vérifications, %d échec(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

@@ -27,6 +27,7 @@ static const char *TAG = "storage";
 
 static sdmmc_card_t *s_card;
 static volatile bool s_mounted;
+static volatile uint32_t s_mounts;
 static volatile int s_io_errors;
 static char s_drive[8] = "0:";
 static spi_host_device_t s_host = SPI2_HOST;
@@ -48,6 +49,7 @@ static esp_err_t do_mount(void)
     if (err == ESP_OK) {
         snprintf(s_drive, sizeof(s_drive), "%u:", ff_diskio_get_pdrv_card(s_card));
         s_mounted = true;
+        s_mounts++;
         s_io_errors = 0;
         ESP_LOGI(TAG, "carte SD montée (%s, %llu Mo)", s_card->cid.name,
                  ((uint64_t)s_card->csd.capacity) * s_card->csd.sector_size / (1024 * 1024));
@@ -119,6 +121,11 @@ esp_err_t storage_init(void)
 bool storage_is_mounted(void)
 {
     return s_mounted;
+}
+
+uint32_t storage_mount_count(void)
+{
+    return s_mounts;
 }
 
 void storage_report_io_error(void)

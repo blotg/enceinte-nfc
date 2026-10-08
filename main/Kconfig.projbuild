@@ -54,6 +54,22 @@ menu "Enceinte"
             default 0
             help
                 Par défaut le bouton BOOT de la carte de développement.
+
+        config ENC_VOL_UP_GPIO
+            int "Bouton volume + (-1 : aucun)"
+            range -1 48
+            default 7
+            help
+                Bouton poussoir entre cette broche et GND (résistance de tirage interne).
+                Éviter les broches de démarrage (0, 3, 45, 46), de la PSRAM octale (33 à 37)
+                et de l'USB (19, 20).
+
+        config ENC_VOL_DOWN_GPIO
+            int "Bouton volume - (-1 : aucun)"
+            range -1 48
+            default 6
+            help
+                Bouton poussoir entre cette broche et GND (résistance de tirage interne).
     endmenu
 
     menu "Comportement"
@@ -80,6 +96,11 @@ menu "Enceinte"
             int "Volume maximum par défaut (0-100)"
             range 1 100
             default 100
+
+        config ENC_VOL_STEP
+            int "Cran de volume des boutons"
+            range 1 20
+            default 5
 
         config ENC_WIFI_TX_POWER_DBM
             int "Puissance d'émission Wi-Fi maximale (dBm)"

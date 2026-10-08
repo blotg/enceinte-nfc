@@ -283,3 +283,111 @@ bool hostname_normalize(const char *in, char *out, size_t outlen)
     out[len] = '\0';
     return out[0] != '-' && out[len - 1] != '-';
 }
+
+bool ip4_parse(const char *s, uint32_t *out)
+{
+    uint32_t ip = 0;
+    for (int part = 0; part < 4; part++) {
+        if (part > 0 && *s++ != '.') {
+            return false;
+        }
+        if (*s < '0' || *s > '9' || (s[0] == '0' && s[1] >= '0' && s[1] <= '9')) {
+            return false;
+        }
+        unsigned v = 0;
+        int digits = 0;
+        while (*s >= '0' && *s <= '9' && digits < 4) {
+            v = v * 10 + (unsigned)(*s++ - '0');
+            digits++;
+        }
+        if (v > 255) {
+            return false;
+        }
+        ip = ip << 8 | v;
+    }
+    if (*s) {
+        return false;
+    }
+    *out = ip;
+    return true;
+}
+
+void ip4_format(uint32_t ip, char out[16])
+{
+    snprintf(out, 16, "%u.%u.%u.%u", (unsigned)(ip >> 24), (unsigned)(ip >> 16 & 0xFF), (unsigned)(ip >> 8 & 0xFF),
+             (unsigned)(ip & 0xFF));
+}
+
+bool ip4_config_check(uint32_t ip, uint32_t netmask, uint32_t gateway, const char **why)
+{
+    const char *msg = NULL;
+    uint32_t host = ~netmask;
+    if ((host & (host + 1)) != 0 || netmask < 0xFF000000u || netmask > 0xFFFFFFFCu) {
+        msg = "masque de sous-réseau invalide (exemple : 255.255.255.0)";
+    } else if (ip == 0 || (ip >> 24) == 127 || (ip >> 24) >= 224) {
+        msg = "adresse IP invalide";
+    } else if ((ip & host) == 0 || (ip & host) == host) {
+        msg = "adresse réservée au réseau ou à la diffusion : choisissez-en une autre";
+    } else if ((gateway & netmask) != (ip & netmask)) {
+        msg = "la passerelle doit être dans le même sous-réseau que l'adresse";
+    } else if (gateway == ip || (gateway & host) == 0 || (gateway & host) == host) {
+        msg = "passerelle invalide";
+    }
+    if (why) {
+        *why = msg;
+    }
+    return msg == NULL;
+}
+
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+void base64_encode(const uint8_t *in, size_t n, char *out)
+{
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) {
+            v |= (uint32_t)in[i + 1] << 8;
+        }
+        if (i + 2 < n) {
+            v |= in[i + 2];
+        }
+        out[o++] = B64[v >> 18 & 63];
+        out[o++] = B64[v >> 12 & 63];
+        out[o++] = i + 1 < n ? B64[v >> 6 & 63] : '=';
+        out[o++] = i + 2 < n ? B64[v & 63] : '=';
+    }
+    out[o] = '\0';
+}
+
+int base64_decode(const char *in, uint8_t *out, size_t outlen)
+{
+    size_t len = strlen(in), o = 0;
+    if (len % 4) {
+        return -1;
+    }
+    for (size_t i = 0; i < len; i += 4) {
+        uint32_t v = 0;
+        int pad = 0;
+        for (int k = 0; k < 4; k++) {
+            char c = in[i + k];
+            const char *p = c ? strchr(B64, c) : NULL;
+            if (c == '=' && i + 4 == len && k >= 2) {
+                pad++;
+                v <<= 6;
+                continue;
+            }
+            if (!p || pad) {
+                return -1;
+            }
+            v = v << 6 | (uint32_t)(p - B64);
+        }
+        for (int k = 0; k < 3 - pad; k++) {
+            if (o >= outlen) {
+                return -1;
+            }
+            out[o++] = (uint8_t)(v >> (16 - 8 * k));
+        }
+    }
+    return (int)o;
+}

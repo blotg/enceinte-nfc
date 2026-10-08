@@ -75,6 +75,10 @@ body {
 .chip.bad { color: var(--danger); }
 
 main { max-width: 720px; margin: 0 auto; padding: 16px; }
+.alerts { max-width: 720px; margin: 0 auto; padding: 0 16px; }
+.alerts:empty { display: none; }
+.alerts .notice { margin: 12px 0 0; }
+.alerts .row.actions { margin-top: 8px; }
 
 .loading { color: var(--muted); text-align: center; margin-top: 40px; }
 
@@ -143,6 +147,13 @@ button.icon { width: 44px; padding: 0; font-size: 18px; }
 input[type=range] { width: 100%; accent-color: var(--accent); }
 .vol { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .vol > span { white-space: nowrap; }
+.vol-track { flex: 1 1 auto; min-width: 0; }
+.vol-track input[type=range] { display: block; margin: 0; }
+.vol-scale {
+  display: flex; justify-content: space-between; margin-top: 2px;
+  font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.vol-val { min-width: 2.2em; text-align: right; font-weight: 650; font-variant-numeric: tabular-nums; }
 
 .notice { border-left: 4px solid var(--accent); padding: 10px 12px; background: var(--surface-2); border-radius: 8px; margin: 10px 0; }
 .notice.warn { border-color: var(--warn); }
@@ -209,6 +220,7 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .toast.bad { background: var(--danger); color: #fff; }
 
 details summary { cursor: pointer; font-weight: 600; }
+a { color: var(--accent); }
 
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }

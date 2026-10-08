@@ -18,14 +18,21 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Dépôt de fichiers par l'interface web | ✅ | Fichiers ou dossiers entiers, glisser-déposer. Débit limité par la carte SD en SPI. |
 | Mises à jour automatiques | ✅ | Depuis les releases GitHub (ou votre serveur), au démarrage (+1 min) et toutes les N heures. Installation seulement quand l'enceinte est inactive. Retour automatique à l'ancienne version si la nouvelle ne démarre pas. |
 | Protocole MPD | ✅ partiel | Large sous-ensemble (cf. plus bas). MPD ne connaît qu'un **mot de passe**, pas d'identifiant. |
-| Point d'accès + portail captif | ✅ | Sortie d'usine ou Wi-Fi injoignable : réseau `Enceinte-XXXX`, la page de configuration s'ouvre seule. |
+| Point d'accès + portail captif | ✅ | Sortie d'usine ou Wi-Fi injoignable : réseau `Enceinte-XXXX`, la page de configuration s'ouvre seule. L'enceinte continue de chercher le Wi-Fi de la maison et y revient dès que possible (cf. plus bas). |
+| Boutons de volume sur l'enceinte | ✅ | Deux boutons poussoirs (+ et −), appui long = répétition. Volume entre 0 et le volume maximum, conservé après un redémarrage. |
+| Normalisation et compression | ✅ | Trois intensités chacune, en réglage général et carte par carte. Niveau égalisé entre playlists et morceaux, écarts réduits dans un morceau. |
+| Adresse IP fixe | ✅ | Adresse, masque, passerelle, DNS. Sans connexion administrateur à la nouvelle adresse sous 5 min, retour à l'ancienne configuration. |
+| Réglages et cartes sur la carte SD | ✅ | Une carte SD clonée se comporte dans une autre enceinte exactement comme dans la première. Export et import des réglages en JSON. |
 | Mot de passe administrateur en sortie d'usine | ✅ | Stocké haché (PBKDF2-SHA256). |
 | Adresse `enceinte.local` | ✅ | mDNS ; nom modifiable. |
-| Page d'administration | ✅ | Wi-Fi, mots de passe admin et MPD, fichiers (envoi, déplacement, renommage), cartes, volume maximum, HTTPS, mises à jour, redémarrage. |
-| *En plus* | | Bips (carte inconnue, dossier vide), réinitialisation usine (bouton BOOT 10 s), installation manuelle d'un `.bin`, volume maximum. |
+| Page d'administration | ✅ | Wi-Fi, adresse IP, mots de passe admin et MPD, fichiers (envoi, déplacement, renommage), cartes, volume maximum, son, HTTPS, mises à jour, sauvegarde, redémarrage. |
+| *En plus* | | Bips au volume réglé (carte inconnue, dossier vide), réinitialisation usine (bouton BOOT 10 s), installation manuelle d'un `.bin`, volume maximum. |
 
 **Limites assumées**
 
+- La carte SD contient le **mot de passe du Wi-Fi en clair** (`/.enceinte.json`) : c'est ce qui
+  permet à une copie de fonctionner telle quelle dans une autre enceinte. Les mots de passe
+  administrateur et MPD n'y figurent que sous forme d'empreintes.
 - L'interface web est en **HTTP** par défaut. **HTTPS** s'active dans *Réglages → Accès sécurisé* :
   l'enceinte crée alors son propre certificat (auto-signé, ECDSA P-256, valable 20 ans pour
   `nom.local`). Le navigateur affiche un avertissement la première fois, qu'il faut accepter ;
@@ -49,9 +56,16 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Carte SD (SPI) | CS 5, MOSI 16, MISO 15, SCK 12 | 3V3 ; **5V** si le module a un régulateur (AMS1117) |
 | MAX98357A (I2S) | BCLK 3, LRC 1, DIN 9 | **5V** (puissance, ménage le régulateur 3,3 V) + 220 à 470 µF |
 | Réinitialisation usine | bouton BOOT (GPIO0) | |
+| Boutons de volume | **GPIO7** (+) et **GPIO6** (−), chacun relié à **GND** | aucune (tirage interne) |
 
 Les GPIO de l'ESP32-S3 ne tolèrent pas le 5 V. Les entrées I2S du MAX98357A acceptent le
 3,3 V même s'il est alimenté en 5 V.
+
+Boutons de volume : de simples boutons poussoirs (contact à la fermeture) entre la broche et
+GND, sans résistance (celle de l'ESP32 suffit). Avec des fils longs, un condensateur de 100 nF
+en parallèle sur chaque bouton évite les faux appuis. Broches et cran (5 par défaut) se
+règlent dans menuconfig ; -1 désactive un bouton. Éviter les broches de démarrage (0, 3, 45,
+46), de la PSRAM octale (33 à 37) et de l'USB (19, 20).
 
 ### Quel port USB-C ?
 
@@ -104,12 +118,20 @@ La version du firmware est dans `version.txt`.
    son adresse IP, affichée à la fin de l'assistant).
 
 Si le Wi-Fi configuré reste injoignable (2 min en fonctionnement, 30 s au démarrage), le
-point d'accès se rouvre en secours. Les nouvelles tentatives de connexion continuent, mais
-sont suspendues tant qu'un appareil est connecté au point d'accès : chaque tentative ferait
-changer celui-ci de canal.
+point d'accès se rouvre en secours, et l'enceinte continue de chercher le Wi-Fi de la maison
+toutes les 30 s (une analyse ne coupe pas le point d'accès). Quand il réapparaît :
+
+- si aucun appareil n'est connecté au point d'accès et qu'aucun envoi de fichier n'est en
+  cours, l'enceinte s'y reconnecte aussitôt ;
+- sinon, l'interface propose de basculer (« Basculer maintenant » ou « Plus tard ») : la
+  connexion ferait changer le point d'accès de canal et couperait l'appareil. Sans réponse,
+  la bascule se fait d'elle-même dès que le dernier appareil a quitté le point d'accès et
+  que les envois sont terminés.
 
 **Mot de passe oublié** : maintenir le bouton BOOT **10 secondes** (un bip à 3 s, trois bips à
-10 s). Réglages et associations sont effacés, la musique est conservée.
+10 s, au volume réglé). Réglages et associations sont effacés, dans l'enceinte comme sur la
+carte SD (fichiers `.enceinte.json` et `.cartes.json`), la musique est conservée. Une carte SD
+absente à ce moment rapporterait ses réglages à son retour.
 
 ## Utilisation
 
@@ -121,6 +143,12 @@ changer celui-ci de canal.
   la progression. L'onglet *Musique* montre aussi les cartes associées au dossier ouvert
   (et le nombre de cartes de chaque sous-dossier).
 - **Bips** : deux bips = carte inconnue ; trois bips graves = dossier vide ou carte SD absente.
+  Ils sont joués au volume réglé (volume 0 : aucun bip), à un niveau proche de celui de la musique.
+- **Volume** : curseur de l'onglet *Lecture*, boutons de l'enceinte ou application MPD. Il va
+  de 0 au **volume maximum** (*Réglages → Enceinte*), affiché au bout du curseur, que rien ne
+  peut dépasser ; baisser le maximum baisse aussi le volume s'il était au-dessus. Le volume
+  est enregistré en flash une seconde après le dernier changement et retrouvé au démarrage.
+  Hors lecture, chaque appui sur un bouton fait un bip court au nouveau volume.
 - **Musique** (onglet *Musique*) : envoyer des fichiers ou des dossiers entiers, créer,
   renommer, supprimer, écouter un dossier sans carte, et **déplacer** des fichiers ou des
   dossiers (bouton ↦, ou cases à cocher pour en déplacer ou supprimer plusieurs à la fois).
@@ -135,6 +163,56 @@ changer celui-ci de canal.
   `listall[info]`, `listfiles`), `list`/`find`/`search`/`count` (filtres classiques et
   expressions), `idle`/`noidle`, les listes de commandes et `albumart` (`cover.jpg`/`.png`
   dans le dossier).
+
+### Son : normalisation et compression
+
+*Réglages → Son*, et carte par carte (*Cartes → ☰*, « Réglage général » par défaut). Le
+traitement se fait avant le volume ; un limiteur empêche toute saturation.
+
+| Réglage | Effet | Légère | Moyenne | Forte |
+|---|---|---|---|---|
+| **Normalisation** | Égalise le niveau d'une playlist et d'un morceau à l'autre. Le niveau est mesuré en continu (silences et passages calmes ignorés) : un morceau plus fort est baissé en moins d'une seconde, un plus calme remonté en quelques secondes. Chaque nouvelle playlist repart d'un gain neutre : jamais plus fort qu'à l'origine. | écart corrigé de moitié, +6 dB au plus | 75 %, +9 dB | en totalité, +12 dB |
+| **Compression** | Réduit les écarts de volume dans un morceau : passages calmes remontés, passages forts atténués, sans remonter le souffle des silences. Pour les histoires et livres audio. | 2:1 | 3:1 | 5:1 |
+
+Sur un signal alternant passages forts et calmes (30 dB d'écart), il reste environ 22, 15 et
+7 dB d'écart selon l'intensité de la compression. Pour une lecture lancée depuis l'interface
+web ou une application MPD, ce sont les réglages généraux qui s'appliquent.
+
+### Adresse IP fixe
+
+*Réglages → Adresse IP* : automatique (DHCP) ou fixe (adresse, masque, passerelle, DNS
+facultatif, sinon la passerelle). Les champs sont pré-remplis avec la configuration du moment.
+Une nouvelle configuration est d'abord **essayée sans être enregistrée** : il faut se connecter
+à l'interface **à la nouvelle adresse dans les 5 minutes** (le mot de passe est sans doute
+redemandé). Sans connexion administrateur à cette adresse dans ce délai, ou après une coupure
+de courant, l'enceinte revient d'elle-même à l'ancienne configuration. Un avertissement le
+rappelle avant l'application, puis un compte à rebours s'affiche.
+
+### Sauvegarde, carte SD clonée
+
+Réglages et associations sont recopiés sur la carte SD à chaque modification :
+
+- `/.enceinte.json` (racine) : réglages généraux, y compris le Wi-Fi et l'adresse IP, et les
+  mots de passe administrateur et MPD sous forme d'empreintes (PBKDF2, jamais en clair) ;
+- `<dossier>/.cartes.json` : les cartes associées à ce dossier et leurs réglages propres. Le
+  fichier suit le dossier quand on le déplace, depuis l'interface ou sur un ordinateur.
+
+Au démarrage, et quand une carte SD est remise en place, l'enceinte charge ces fichiers : la
+carte SD **fait foi**. Une copie de la carte SD placée dans une autre enceinte (même sortie
+d'usine) s'y comporte exactement comme dans la première : même Wi-Fi, mêmes mots de passe,
+mêmes cartes. Sans `/.enceinte.json` (carte neuve, ou mise à jour depuis la version 1.3), les
+réglages et associations de l'enceinte y sont recopiés. Une modification faite pendant
+l'absence de la carte SD lui est recopiée à son retour. Un fichier abîmé est ignoré et réécrit.
+Supprimer un dossier depuis l'interface supprime aussi ses associations.
+
+Le volume courant et les positions de reprise restent dans la flash interne (écrits bien trop
+souvent pour une carte SD). Si deux enceintes clonées fonctionnent en même temps, changez le
+nom et l'éventuelle adresse IP fixe de l'une d'elles.
+
+*Réglages → Sauvegarde des réglages* : **exporter** un fichier JSON (réglages et associations,
+mots de passe compris ou non) et l'**importer** dans la même enceinte ou une autre. L'import
+remplace les associations ; celles dont le dossier n'existe pas sur la carte SD sont ignorées.
+Une adresse IP fixe importée est essayée comme ci-dessus.
 
 ### Reprise d'une carte
 
@@ -234,10 +312,13 @@ il doit s'agir d'un firmware de ce projet.
 | `main.c` | Démarrage, bouton de réinitialisation, validation du firmware après 30 s |
 | `pn532*.c`, `nfc.c` | Pilote PN532 (trames vérifiées, nombre d'essais borné, réinitialisation automatique), détection pose/retrait avec anti-rebond |
 | `player.c` | File d'attente, lecture SD anticipée (réservoir de 2 à 16 s), décodage, I2S, volume |
+| `dsp.c` | Normalisation, compression, limiteur |
+| `buttons.c` | Boutons de volume |
 | `controller.c`, `session.c` | Règles carte ↔ lecture (reprise, délai de 10 min) |
 | `cards.c`, `settings.c` | Associations et réglages en NVS (résistants aux coupures de courant) |
+| `backup.c`, `config_json.c` | Copie des réglages et associations sur la carte SD, export et import JSON |
 | `storage.c`, `media_info.c` | Carte SD, tags ID3/Vorbis, durée, positions de recherche MP3 |
-| `wifi_mgr.c`, `dns_server.c` | Wi-Fi, point d'accès de secours, portail captif, mDNS, NTP |
+| `wifi_mgr.c`, `dns_server.c` | Wi-Fi, adresse IP fixe à l'essai, point d'accès de secours, portail captif, mDNS, NTP |
 | `web_server.c`, `web/` | API et interface web (sessions, protection CSRF) |
 | `mpd_server.c`, `mpd_proto.c` | Serveur MPD |
 | `ota.c` | Mises à jour automatiques et manuelles |
@@ -245,19 +326,24 @@ il doit s'agir d'un firmware de ce projet.
 ## Tests (sur PC, sans le matériel)
 
 ```bash
-test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame ; python-mpd2 pour l'intégration MPD
+test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 (MPD), libcjson-dev (JSON)
 ```
 
 1. Tests unitaires des modules purs, avec de vrais fichiers audio générés par ffmpeg/lame :
    ID3v2.3/2.4/v1, pochette intégrée, FLAC, WAV, fichiers corrompus. Couvre aussi les trames
-   PN532, la règle de reprise, le DNS captif, les chemins (traversée de répertoire) et les
-   filtres MPD.
+   PN532, la règle de reprise, le DNS captif, les chemins (traversée de répertoire), les
+   filtres MPD, la normalisation et la compression (signaux de synthèse), les adresses IP et
+   les réglages en JSON (valeurs invalides refusées).
 2. Le contrôleur de cartes avec le **vrai** lecteur ; FreeRTOS, l'I2S et le décodeur sont
    simulés. Scénarios : reprise, autre carte, carte inconnue, délai dépassé, playlist
    terminée, mode association, ordre aléatoire retrouvé à la reprise.
 3. Le **vrai** serveur MPD et le **vrai** lecteur, pilotés par un vrai client MPD (python-mpd2).
+4. La copie sur carte SD, avec deux enceintes simulées : première copie, carte clonée dans une
+   enceinte sortie d'usine, dossiers déplacés et fichiers ajoutés sur un ordinateur, fichier
+   abîmé, modifications pendant l'absence de la carte, export et import, réinitialisation.
 
 Le tout est compilé avec AddressSanitizer et UndefinedBehaviorSanitizer.
 
 L'interface web peut être développée sans l'enceinte : `python3 test/web/mock_api.py`, puis
-http://127.0.0.1:8080 (`--setup` pour l'assistant ; mot de passe de connexion : `secret`).
+http://127.0.0.1:8080 (`--setup` pour l'assistant, `--ap` pour le Wi-Fi de secours ; mot de
+passe de connexion : `secret`).

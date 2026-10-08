@@ -26,6 +26,8 @@ typedef struct {
 /* Lance le montage (et les nouvelles tentatives si la carte est absente). */
 esp_err_t storage_init(void);
 bool storage_is_mounted(void);
+/* Nombre de montages réussis depuis le démarrage (détection d'une carte remise en place). */
+uint32_t storage_mount_count(void);
 bool storage_get_usage(uint64_t *total_bytes, uint64_t *free_bytes);
 /* Signale une erreur d'E/S : au-delà d'un seuil la carte est remontée. */
 void storage_report_io_error(void);

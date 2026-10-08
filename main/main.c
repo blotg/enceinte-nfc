@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "backup.h"
+#include "buttons.h"
 #include "cards.h"
 #include "controller.h"
 #include "driver/gpio.h"
@@ -62,6 +64,7 @@ static void system_task(void *arg)
                 ESP_LOGW(TAG, "réinitialisation usine");
                 player_beep(BEEP_ERROR);
                 vTaskDelay(pdMS_TO_TICKS(1000));
+                backup_factory_reset(); /* sinon la carte SD rétablirait réglages et mot de passe */
                 settings_factory_reset();
                 esp_restart();
             }
@@ -91,6 +94,7 @@ void app_main(void)
     ESP_ERROR_CHECK(settings_init());
     cards_init();
     storage_init();
+    backup_boot(); /* réglages de la carte SD (carte clonée : comme dans l'enceinte d'origine) */
 
     settings_t cfg;
     settings_get(&cfg);
@@ -100,12 +104,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(controller_start());
     nfc_start(controller_on_nfc);
+    buttons_start();
 
     wifi_mgr_start();
     web_server_start();
     mpd_server_start();
     ota_start();
+    backup_start(); /* associations de la carte SD, cartes remises en place */
 
-    xTaskCreate(system_task, "system", 3072, NULL, 2, NULL);
+    xTaskCreate(system_task, "system", 6144, NULL, 2, NULL); /* réinitialisation usine : parcours de la carte SD */
     ESP_LOGI(TAG, "démarrage terminé");
 }

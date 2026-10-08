@@ -102,7 +102,8 @@ function fmtDelay(s) {
 }
 
 const DELAY_CHOICES = [0, 60, 300, 600, 1800, 3600, 10800, 86400];
-const GENERAL_DEFAULTS = { resume_s: 600, resume_after_other: false, shuffle: false };
+const SOUND_LEVELS = ['désactivée', 'légère', 'moyenne', 'forte'];
+const GENERAL_DEFAULTS = { resume_s: 600, resume_after_other: false, shuffle: false, normalize: 0, compress: 0 };
 
 const isSet = (v) => v !== null && v !== undefined;
 
@@ -113,6 +114,8 @@ function cardRules(c) {
   const other = !isSet(c.resume_other) ? '' : c.resume_other ? 'même après une autre carte' : 'sauf si une autre carte est posée';
   if (isSet(c.resume_s)) rules.push(`progression conservée ${fmtDelay(c.resume_s)}` + (other ? ', ' + other : ''));
   else if (other) rules.push('progression conservée ' + other);
+  if (isSet(c.normalize)) rules.push('normalisation ' + SOUND_LEVELS[c.normalize]);
+  if (isSet(c.compress)) rules.push('compression ' + SOUND_LEVELS[c.compress]);
   return rules;
 }
 
@@ -164,8 +167,48 @@ async function refreshStatus() {
     if (!(e instanceof AuthError)) setChips(null);
     return;
   }
+  if (!app.timer) return; // déconnecté entre-temps
   setChips(app.status);
+  setAlerts(app.status);
   if (app.view && app.view.update) app.view.update(app.status);
+}
+
+/* Messages affichés sur tous les onglets : réseau Wi-Fi de nouveau à portée, adresse IP à l'essai. */
+function setAlerts(st) {
+  const box = $('#alerts');
+  const w = st && st.wifi;
+  const list = [];
+  if (w && w.ip_test_remaining > 0) {
+    list.push(h('div', { class: 'notice warn' },
+      `Nouvelle adresse IP à l'essai${w.ip_test_address ? ' (' + w.ip_test_address + ')' : ''}. `,
+      'Elle sera conservée dès qu\'une connexion administrateur aura lieu à cette adresse ; sinon l\'enceinte reviendra à l\'ancienne configuration dans ',
+      h('b', null, fmtTime(w.ip_test_remaining)), '.'));
+  }
+  if (w && w.sta_available && w.on_ap && !app.switchDismissed) {
+    const go = h('button', { class: 'small primary' }, 'Basculer maintenant');
+    go.addEventListener('click', () => busy(go, async () => {
+      await post('/api/wifi/switch');
+      showSwitching(w);
+    }));
+    const later = h('button', { class: 'small', onclick: () => { app.switchDismissed = true; setAlerts(app.status); } }, 'Plus tard');
+    list.push(h('div', { class: 'notice' },
+      `Le Wi-Fi « ${w.ssid} » est de nouveau disponible. L'enceinte s'y reconnectera d'elle-même dès que plus aucun appareil ne sera connecté à son point d'accès et qu'aucun envoi ne sera en cours. Basculer maintenant ?`,
+      h('div', { class: 'row actions' }, go, later)));
+  }
+  setKids(box, ...list);
+}
+
+function showSwitching(w) {
+  stopPolling();
+  $('#tabs').hidden = true;
+  setKids($('#alerts'));
+  app.view = null;
+  setKids(root, h('div', { class: 'card stack' },
+    h('h2', null, 'Bascule vers le Wi-Fi de la maison'),
+    h('p', { class: 'pulse' }, `L'enceinte se connecte au réseau « ${w.ssid} » et va quitter son point d'accès.`),
+    h('p', null, 'Reconnectez ce téléphone ou cet ordinateur au Wi-Fi « ', h('b', null, w.ssid), ' », puis ouvrez ',
+      h('b', null, `http://${w.hostname}.local`), '.'),
+    h('button', { onclick: boot }, 'Recharger')));
 }
 
 function setChips(st) {
@@ -387,8 +430,11 @@ function renderPlay() {
   });
   const cmd = (action) => () => post('/api/player', { action }).then(refreshStatus).catch(reportError);
   v.toggle = h('button', { class: 'main', 'aria-label': 'Lecture / pause', onclick: cmd('toggle') }, '▶');
+  /* Curseur de 0 au volume maximum : il ne peut pas aller au-delà. */
   v.vol = h('input', { type: 'range', min: 0, max: 100, step: 1, 'aria-label': 'Volume' });
-  v.volLabel = h('span', { class: 'small muted' });
+  v.volLabel = h('span', { class: 'vol-val' });
+  v.volMax = h('span', { title: 'Volume maximum, réglable dans Réglages → Enceinte' });
+  v.sound = h('p', { class: 'small muted', hidden: true });
   let volTimer = null;
   v.vol.addEventListener('input', () => {
     v.volDragging = true;
@@ -418,9 +464,15 @@ function renderPlay() {
     }
     v.duration.textContent = p.duration ? fmtTime(p.duration) : '–:––';
     if (!v.volDragging) {
+      if (Number(v.vol.max) !== p.max_volume) v.vol.max = p.max_volume;
       v.vol.value = p.volume;
-      v.volLabel.textContent = p.volume + (p.max_volume < 100 ? ` (max ${p.max_volume})` : '');
+      v.volLabel.textContent = p.volume;
+      v.volMax.textContent = p.max_volume < 100 ? `max ${p.max_volume}` : 'max 100';
     }
+    const sound = [p.normalize ? 'normalisation ' + SOUND_LEVELS[p.normalize] : '',
+      p.compress ? 'compression ' + SOUND_LEVELS[p.compress] : ''].filter(Boolean);
+    v.sound.hidden = !sound.length;
+    v.sound.textContent = 'Son : ' + sound.join(', ');
     v.err.hidden = !p.error;
     v.err.textContent = p.error;
     const c = st.card;
@@ -449,7 +501,10 @@ function renderPlay() {
         h('button', { 'aria-label': 'Suivant', onclick: cmd('next') }, '⏭')),
       h('div', { class: 'row', style: 'justify-content:center' },
         h('button', { class: 'small', onclick: cmd('stop') }, '■ Arrêter')),
-      h('div', { class: 'vol' }, h('span', { 'aria-hidden': 'true' }, '🔈'), v.vol, v.volLabel)),
+      h('div', { class: 'vol' }, h('span', { 'aria-hidden': 'true' }, '🔈'),
+        h('div', { class: 'vol-track' }, v.vol, h('div', { class: 'vol-scale' }, h('span', null, '0'), v.volMax)),
+        v.volLabel),
+      v.sound),
     v.card, v.err);
   app.view = v;
   if (app.status) v.update(app.status);
@@ -545,6 +600,12 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
         `Réglage général (${defaults.resume_after_other ? 'conserver' : 'recommencer'})`),
       h('option', { value: '1', selected: curOther === true }, 'Conserver la progression'),
       h('option', { value: '0', selected: curOther === false }, 'Recommencer au début'));
+    const levelSel = (cur, general) => h('select', null,
+      h('option', { value: '', selected: !isSet(cur) }, `Réglage général (${SOUND_LEVELS[general || 0]})`),
+      ...SOUND_LEVELS.map((name, i) => h('option', { value: String(i), selected: cur === i },
+        name[0].toUpperCase() + name.slice(1))));
+    const normSel = levelSel(card ? card.normalize : null, defaults.normalize);
+    const compSel = levelSel(card ? card.compress : null, defaults.compress);
     const save = h('button', { class: 'primary' }, card ? 'Enregistrer' : 'Associer');
     save.addEventListener('click', () => busy(save, async () => {
       if (!sel.value) { toast('Choisissez un dossier', true); return; }
@@ -553,6 +614,8 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
         resume_s: delaySel.value === '' ? null : Number(delaySel.value),
         resume_other: otherSel.value === '' ? null : otherSel.value === '1',
         shuffle: shuffleSel.value === '' ? null : shuffleSel.value === '1',
+        normalize: normSel.value === '' ? null : Number(normSel.value),
+        compress: compSel.value === '' ? null : Number(compSel.value),
       });
       toast(card ? 'Carte modifiée' : 'Carte associée');
       onDone();
@@ -565,6 +628,8 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
       h('label', null, 'Ordre de lecture'), shuffleSel,
       h('label', null, 'Après le retrait, conserver la progression pendant'), delaySel,
       h('label', null, 'Si une autre carte est posée entre-temps'), otherSel,
+      h('label', null, 'Normalisation ', h('span', { class: 'muted' }, '(volume égalisé entre les morceaux)')), normSel,
+      h('label', null, 'Compression ', h('span', { class: 'muted' }, '(écarts de volume réduits dans un morceau)')), compSel,
       h('div', { class: 'row end actions' }, cancel, save));
   };
 
@@ -672,7 +737,10 @@ async function renderMusic(path = app.path) {
     });
     const del = h('button', { class: 'small danger', 'aria-label': 'Supprimer' }, '✕');
     del.addEventListener('click', () => {
-      if (!confirm(e.dir ? `Supprimer le dossier « ${e.name} » et tout son contenu ?` : `Supprimer « ${e.name} » ?`)) return;
+      const linked = e.dir ? allCards.filter((c) => c.folder.toLowerCase() === full.toLowerCase() ||
+        c.folder.toLowerCase().startsWith(full.toLowerCase() + '/')).length : 0;
+      const warnCards = linked ? `\n\n${linked} carte${linked > 1 ? 's' : ''} associée${linked > 1 ? 's' : ''} à ce dossier ne joueront plus rien (association supprimée).` : '';
+      if (!confirm(e.dir ? `Supprimer le dossier « ${e.name} » et tout son contenu ?${warnCards}` : `Supprimer « ${e.name} » ?`)) return;
       busy(del, async () => { await post('/api/files/delete', { path: full }); toast('Supprimé'); renderMusic(); });
     });
     if (e.dir) {
@@ -964,6 +1032,38 @@ async function renderSettings() {
     toast('Réglages de lecture enregistrés');
   }));
 
+  /* Son */
+  const levelSelect = (value) => h('select', null, ...SOUND_LEVELS.map((name, i) =>
+    h('option', { value: String(i), selected: value === i }, name[0].toUpperCase() + name.slice(1))));
+  const normalize = levelSelect(s.normalize || 0);
+  const compress = levelSelect(s.compress || 0);
+  const saveSound = h('button', { class: 'primary' }, 'Enregistrer');
+  saveSound.addEventListener('click', () => busy(saveSound, async () => {
+    await post('/api/settings', { normalize: Number(normalize.value), compress: Number(compress.value) });
+    toast('Réglages du son enregistrés');
+  }));
+
+  /* Adresse IP */
+  const ipCard = networkCard(s, w);
+
+  /* Sauvegarde */
+  const withSecrets = h('input', { type: 'checkbox', checked: true });
+  const exportBtn = h('button', null, '↓ Exporter les réglages');
+  exportBtn.addEventListener('click', () => {
+    const a = h('a', { href: '/api/config/export' + (withSecrets.checked ? '?secrets=1' : ''), download: `reglages-${s.hostname}.json` });
+    document.body.append(a);
+    a.click();
+    a.remove();
+  });
+  const importInput = h('input', { type: 'file', accept: '.json,application/json', hidden: true });
+  const importBtn = h('button', null, '↑ Importer des réglages…');
+  importBtn.addEventListener('click', () => importInput.click());
+  importInput.addEventListener('change', () => {
+    const f = importInput.files[0];
+    importInput.value = '';
+    if (f) busy(importBtn, () => importSettings(f));
+  });
+
   /* HTTPS */
   const httpsBox = h('input', { type: 'checkbox', checked: !!s.https_enabled });
   const httpsMsg = h('p', { class: 'small' });
@@ -1066,10 +1166,12 @@ async function renderSettings() {
       h('p', { class: w.connected ? 'ok-text small' : 'small error-text' }, wifiState),
       w.ap ? h('p', { class: 'small muted' }, `Point d'accès de configuration actif : « ${w.ap_ssid} »`) : null,
       h('details', null, h('summary', null, 'Changer de réseau'), wifi.el, h('div', { class: 'row end actions' }, saveWifi))),
+    ipCard,
     h('div', { class: 'card' },
       h('h2', null, 'Enceinte'),
       h('label', null, 'Nom ', h('span', { class: 'muted' }, '(adresse http://nom.local)')), host,
       h('label', null, 'Volume maximum'), h('div', { class: 'vol' }, maxVol, maxLbl),
+      h('p', { class: 'small muted' }, 'Le curseur de l\'onglet Lecture, les boutons de l\'enceinte et les applications MPD ne peuvent pas dépasser ce volume.'),
       h('div', { class: 'row end actions' }, saveDev)),
     h('div', { class: 'card' },
       h('h2', null, 'Lecture des cartes'),
@@ -1081,6 +1183,14 @@ async function renderSettings() {
       h('label', { class: 'check' }, resumeOther,
         ' Conserver la progression même si une autre carte est posée entre-temps'),
       h('div', { class: 'row end actions' }, saveResume)),
+    h('div', { class: 'card' },
+      h('h2', null, 'Son'),
+      h('p', { class: 'small muted' }, 'Réglages généraux, modifiables carte par carte (bouton ☰ de l\'onglet Cartes).'),
+      h('label', null, 'Normalisation'), normalize,
+      h('p', { class: 'small muted' }, 'Égalise le volume d\'une playlist et d\'un morceau à l\'autre : les morceaux trop forts sont baissés en moins d\'une seconde, les plus calmes remontés en quelques secondes. Plus elle est forte, plus l\'écart est corrigé.'),
+      h('label', null, 'Compression'), compress,
+      h('p', { class: 'small muted' }, 'Réduit les écarts de volume à l\'intérieur d\'un morceau : passages calmes remontés, passages forts atténués, sans remonter le souffle des silences. Pratique pour les histoires et les livres audio.'),
+      h('div', { class: 'row end actions' }, saveSound)),
     h('div', { class: 'card' },
       h('h2', null, 'Mot de passe administrateur'),
       h('label', null, 'Mot de passe actuel'), cur,
@@ -1114,10 +1224,111 @@ async function renderSettings() {
       h('div', { class: 'row end actions' }, check, saveOta),
       h('div', { class: 'row actions' }, fwBtn), fw),
     h('div', { class: 'card' },
+      h('h2', null, 'Sauvegarde des réglages'),
+      h('p', { class: 'small muted' },
+        'Les réglages sont aussi enregistrés sur la carte SD (fichier .enceinte.json à la racine) avec, dans le dossier de chaque playlist, ses cartes associées (fichier .cartes.json). ',
+        'Au démarrage, l\'enceinte les recharge : une copie de la carte SD placée dans une autre enceinte s\'y comporte exactement comme ici.'),
+      h('label', { class: 'check' }, withSecrets, ' Inclure les mots de passe (Wi-Fi en clair, administrateur et MPD chiffrés)'),
+      h('div', { class: 'row actions' }, exportBtn, importBtn), importInput),
+    h('div', { class: 'card' },
       h('h2', null, 'Système'),
       h('p', { class: 'small muted' }, `Allumée depuis ${fmtTime(st.uptime)} · mémoire libre ${fmtSize(st.heap)}`),
       h('div', { class: 'row' }, reboot, logout, reset)));
   app.view = { update: updateOta };
+}
+
+/* Adresse IP : DHCP ou fixe. Une nouvelle adresse est essayée 5 minutes avant d'être gardée. */
+function networkCard(s, w) {
+  const testMin = Math.round((s.ip_test_s || 300) / 60);
+  const isStatic = s.ip && s.ip.mode === 'static';
+  const cur = s.ip_current || {};
+  const pick = (k) => (isStatic && s.ip[k]) || cur[k] || '';
+  const field = (k, ph) => h('input', { type: 'text', inputmode: 'decimal', value: pick(k), placeholder: ph,
+    autocapitalize: 'off', spellcheck: false });
+  const address = field('address', '192.168.1.50'), netmask = field('netmask', '255.255.255.0');
+  const gateway = field('gateway', '192.168.1.1'), dns = field('dns', 'facultatif : la passerelle');
+  if (!isStatic) dns.value = '';
+  const dhcp = h('input', { type: 'radio', name: 'ipmode', value: 'dhcp', checked: !isStatic });
+  const fixed = h('input', { type: 'radio', name: 'ipmode', value: 'static', checked: isStatic });
+  const fields = h('div', { hidden: !isStatic },
+    h('label', null, 'Adresse IP'), address,
+    h('label', null, 'Masque de sous-réseau'), netmask,
+    h('label', null, 'Passerelle par défaut ', h('span', { class: 'muted' }, '(la box)')), gateway,
+    h('label', null, 'Serveur DNS'), dns);
+  const toggle = () => { fields.hidden = !fixed.checked; };
+  dhcp.addEventListener('change', toggle);
+  fixed.addEventListener('change', toggle);
+  const apply = h('button', { class: 'primary' }, 'Appliquer');
+  apply.addEventListener('click', () => busy(apply, async () => {
+    const body = fixed.checked
+      ? { mode: 'static', address: address.value.trim(), netmask: netmask.value.trim(), gateway: gateway.value.trim(), dns: dns.value.trim() }
+      : { mode: 'dhcp' };
+    const target = fixed.checked ? body.address : `${w.hostname}.local`;
+    if (!confirm(`L'enceinte va passer ${fixed.checked ? 'à l\'adresse ' + body.address : 'en adresse automatique (DHCP)'}.\n\n` +
+      `Connectez-vous à l'interface à http://${target} dans les ${testMin} minutes : sans connexion administrateur à cette adresse, l'enceinte reviendra d'elle-même à l'ancienne configuration.`)) return;
+    await post('/api/network', body);
+    showIpTest(target, s.ip_test_s || 300);
+  }));
+  return h('div', { class: 'card' },
+    h('h2', null, 'Adresse IP'),
+    h('p', { class: 'small' }, w.connected ? `Adresse actuelle : ${w.ip}` : 'Wi-Fi non connecté.'),
+    h('label', { class: 'check' }, dhcp, ' Automatique (DHCP, attribuée par la box)'),
+    h('label', { class: 'check' }, fixed, ' Fixe'),
+    fields,
+    h('p', { class: 'notice warn small' },
+      `Après un changement, connectez-vous à l'interface à la nouvelle adresse dans les ${testMin} minutes. `,
+      'Sans connexion administrateur à cette adresse dans ce délai, l\'enceinte revient d\'elle-même à l\'ancienne configuration.'),
+    h('div', { class: 'row end actions' }, apply));
+}
+
+function showIpTest(target, seconds) {
+  stopPolling();
+  $('#tabs').hidden = true;
+  app.view = null;
+  const scheme = location.protocol === 'https:' ? 'https' : 'http';
+  const url = `${scheme}://${target}/`;
+  const left = h('b', null, fmtTime(seconds));
+  const end = Date.now() + seconds * 1000;
+  const timer = setInterval(() => {
+    const r = Math.max(0, Math.round((end - Date.now()) / 1000));
+    left.textContent = fmtTime(r);
+    if (!r) clearInterval(timer);
+  }, 1000);
+  const same = target === location.hostname;
+  setKids(root, h('div', { class: 'card stack' },
+    h('h2', null, 'Nouvelle adresse à l\'essai'),
+    same
+      ? h('p', null, 'L\'adresse de cette page ne change pas : dans quelques secondes, revenez à l\'interface pour confirmer la nouvelle configuration.')
+      : h('p', null, 'Ouvrez l\'interface à la nouvelle adresse et connectez-vous : ', h('a', { href: url }, url)),
+    h('p', null, 'Temps restant : ', left, '. Sans connexion administrateur à cette adresse d\'ici là, l\'enceinte revient à l\'ancienne configuration, et cette page fonctionnera de nouveau.'),
+    h('p', { class: 'small muted' }, 'Le mot de passe administrateur sera sans doute redemandé : le navigateur ne garde pas la connexion d\'une adresse à l\'autre.'),
+    h('button', { onclick: () => { clearInterval(timer); boot(); } }, 'Revenir à l\'interface')));
+}
+
+async function importSettings(file) {
+  let doc;
+  try {
+    doc = JSON.parse(await file.text());
+  } catch (e) {
+    toast('Ce fichier n\'est pas un fichier JSON valide', true);
+    return;
+  }
+  if (!doc || doc.format !== 'enceinte-reglages') {
+    toast('Ce fichier n\'est pas un fichier de réglages d\'enceinte', true);
+    return;
+  }
+  const st = doc.settings || {};
+  const parts = [];
+  if (doc.settings) parts.push('les réglages généraux' + (st.hostname ? ` (enceinte « ${st.hostname} »)` : ''));
+  if (Array.isArray(doc.cards)) parts.push(`les associations de cartes (${doc.cards.length}), qui remplaceront les actuelles`);
+  if (st.wifi && 'password' in st.wifi) parts.push(`le Wi-Fi « ${st.wifi.ssid} »`);
+  if (st.admin_password_hash) parts.push('le mot de passe administrateur');
+  if (st.ip && st.ip.mode === 'static') parts.push(`l'adresse IP fixe ${st.ip.address} (à confirmer sous 5 minutes)`);
+  if (!confirm('Importer ' + parts.join(', ') + ' ?')) return;
+  const r = await api('/api/config/import', { method: 'POST', body: doc });
+  toast(r.message || 'Réglages importés');
+  if (r.ip_test) showIpTest(st.ip.address, 300);
+  else renderSettings();
 }
 
 function uploadFirmware(file, bar, msg) {

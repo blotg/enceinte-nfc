@@ -107,6 +107,79 @@ static void test_hostname(void)
     CHECK_STR(hex, "04A1FF00");
 }
 
+
+static void test_ip4(void)
+{
+    uint32_t ip;
+    char buf[16];
+    CHECK(ip4_parse("192.168.1.50", &ip) && ip == 0xC0A80132u);
+    ip4_format(ip, buf);
+    CHECK_STR(buf, "192.168.1.50");
+    CHECK(ip4_parse("0.0.0.0", &ip) && ip == 0);
+    CHECK(ip4_parse("255.255.255.255", &ip) && ip == 0xFFFFFFFFu);
+    CHECK(!ip4_parse("256.1.1.1", &ip));
+    CHECK(!ip4_parse("1.2.3", &ip));
+    CHECK(!ip4_parse("1.2.3.4.5", &ip));
+    CHECK(!ip4_parse("01.2.3.4", &ip));
+    CHECK(!ip4_parse("1.2.3.4 ", &ip));
+    CHECK(!ip4_parse("1..3.4", &ip));
+    CHECK(!ip4_parse("", &ip));
+    CHECK(!ip4_parse("1234.1.1.1", &ip));
+
+    const char *why = NULL;
+    uint32_t a, m, g;
+    ip4_parse("192.168.1.50", &a);
+    ip4_parse("255.255.255.0", &m);
+    ip4_parse("192.168.1.1", &g);
+    CHECK(ip4_config_check(a, m, g, &why) && why == NULL);
+    uint32_t bad;
+    ip4_parse("255.0.255.0", &bad);
+    CHECK(!ip4_config_check(a, bad, g, &why) && why != NULL); /* masque non contigu */
+    ip4_parse("192.168.1.255", &bad);
+    CHECK(!ip4_config_check(bad, m, g, &why));                 /* diffusion */
+    ip4_parse("192.168.1.0", &bad);
+    CHECK(!ip4_config_check(bad, m, g, &why));                 /* réseau */
+    ip4_parse("192.168.2.1", &bad);
+    CHECK(!ip4_config_check(a, m, bad, &why));                 /* passerelle hors du sous-réseau */
+    CHECK(!ip4_config_check(a, m, a, &why));                   /* passerelle = adresse */
+    ip4_parse("10.0.0.7", &a);
+    ip4_parse("255.0.0.0", &m);
+    ip4_parse("10.254.0.1", &g);
+    CHECK(ip4_config_check(a, m, g, NULL));                    /* /8 */
+    ip4_parse("255.255.255.254", &m);
+    CHECK(!ip4_config_check(a, m, g, NULL));                   /* /31 refusé */
+}
+
+static void test_base64(void)
+{
+    char enc[64];
+    uint8_t dec[64];
+    base64_encode((const uint8_t *)"Man", 3, enc);
+    CHECK_STR(enc, "TWFu");
+    base64_encode((const uint8_t *)"Ma", 2, enc);
+    CHECK_STR(enc, "TWE=");
+    base64_encode((const uint8_t *)"M", 1, enc);
+    CHECK_STR(enc, "TQ==");
+    base64_encode((const uint8_t *)"", 0, enc);
+    CHECK_STR(enc, "");
+    CHECK(base64_decode("TWFu", dec, sizeof(dec)) == 3 && memcmp(dec, "Man", 3) == 0);
+    CHECK(base64_decode("TWE=", dec, sizeof(dec)) == 2 && memcmp(dec, "Ma", 2) == 0);
+    CHECK(base64_decode("TQ==", dec, sizeof(dec)) == 1 && dec[0] == 'M');
+    CHECK(base64_decode("", dec, sizeof(dec)) == 0);
+    CHECK(base64_decode("TQ=", dec, sizeof(dec)) == -1);
+    CHECK(base64_decode("T=Q=", dec, sizeof(dec)) == -1);
+    CHECK(base64_decode("TQ==TWFu", dec, sizeof(dec)) == -1);
+    CHECK(base64_decode("TW*u", dec, sizeof(dec)) == -1);
+    CHECK(base64_decode("TWFu", dec, 2) == -1);
+    uint8_t all[52];
+    for (int i = 0; i < 52; i++) {
+        all[i] = (uint8_t)(i * 37 + 11);
+    }
+    char e2[80];
+    base64_encode(all, sizeof(all), e2);
+    CHECK(base64_decode(e2, dec, sizeof(dec)) == 52 && memcmp(dec, all, 52) == 0);
+}
+
 void test_util(void)
 {
     test_url_decode();
@@ -115,4 +188,6 @@ void test_util(void)
     test_natural();
     test_semver();
     test_hostname();
+    test_ip4();
+    test_base64();
 }
