@@ -103,7 +103,7 @@ function fmtDelay(s) {
 
 const DELAY_CHOICES = [0, 60, 300, 600, 1800, 3600, 10800, 86400];
 const SOUND_LEVELS = ['désactivée', 'légère', 'moyenne', 'forte'];
-const GENERAL_DEFAULTS = { resume_s: 600, resume_after_other: false, shuffle: false, normalize: 0, compress: 0 };
+const GENERAL_DEFAULTS = { resume_s: 600, resume_after_other: false, shuffle: false, normalize: 2, compress: 2 };
 
 const isSet = (v) => v !== null && v !== undefined;
 
@@ -132,6 +132,28 @@ function uploadable(name) {
 
 function passwordInput(autocomplete) {
   return h('input', { type: 'password', autocomplete, autocapitalize: 'off', spellcheck: false });
+}
+
+/* ================= Version de l'interface ================= */
+
+/* Identifiant du firmware qui a servi cette page (balise meta insérée par l'enceinte). */
+const PAGE_BUILD = (document.querySelector('meta[name=build]') || {}).content || '';
+
+/*
+ * L'enceinte a changé de firmware (mise à jour) depuis le chargement de la page : on
+ * recharge pour obtenir la nouvelle interface. Une seule fois par firmware, au cas où le
+ * navigateur servirait encore l'ancienne page.
+ */
+function reloadIfUpdated(build) {
+  if (!build || !PAGE_BUILD || PAGE_BUILD.startsWith('{{') || build === PAGE_BUILD) return false;
+  try {
+    if (sessionStorage.getItem('reloaded-for') === build) return false;
+    sessionStorage.setItem('reloaded-for', build);
+  } catch (e) { /* stockage indisponible : on recharge quand même */ }
+  stopPolling();
+  toast('Nouvelle version de l\'enceinte : rechargement de l\'interface…');
+  setTimeout(() => location.reload(), 800);
+  return true;
 }
 
 /* ================= État global ================= */
@@ -168,6 +190,7 @@ async function refreshStatus() {
     return;
   }
   if (!app.timer) return; // déconnecté entre-temps
+  if (reloadIfUpdated(app.status.build)) return;
   setChips(app.status);
   setAlerts(app.status);
   if (app.view && app.view.update) app.view.update(app.status);
@@ -240,6 +263,7 @@ async function boot() {
       h('button', { onclick: boot }, 'Réessayer')));
     return;
   }
+  if (reloadIfUpdated(app.state.build)) return;
   $('#dev-name').textContent = app.state.hostname;
   if (app.state.setup_required) showSetup();
   else if (!app.state.logged_in) showLogin();
@@ -1114,7 +1138,9 @@ async function renderSettings() {
   }));
 
   /* Mises à jour */
-  const otaUrl = h('input', { type: 'url', value: s.ota_url, placeholder: 'https://github.com/compte/depot', autocapitalize: 'off', spellcheck: false });
+  const otaUrl = h('input', { type: 'url', value: s.ota_url, placeholder: s.ota_default_url || 'https://github.com/compte/depot', autocapitalize: 'off', spellcheck: false });
+  const otaDefault = h('button', { type: 'button', class: 'small', hidden: !s.ota_default_url }, 'Valeur d\'usine');
+  otaDefault.addEventListener('click', () => { otaUrl.value = s.ota_default_url; otaUrl.focus(); });
   const otaInt = h('input', { type: 'number', min: 1, max: 720, value: s.ota_interval_h });
   const saveOta = h('button', { class: 'primary' }, 'Enregistrer');
   saveOta.addEventListener('click', () => busy(saveOta, async () => {
@@ -1218,8 +1244,10 @@ async function renderSettings() {
     h('div', { class: 'card' },
       h('h2', null, 'Mises à jour'),
       otaMsg, otaBar,
-      h('label', null, 'Source des mises à jour'), otaUrl,
-      h('p', { class: 'small muted' }, 'Un dépôt GitHub (dernière release stable) ou l\'adresse d\'un manifeste JSON. Vide : pas de mise à jour automatique.'),
+      h('label', null, 'Source des mises à jour'),
+      h('div', { class: 'row' }, h('div', { class: 'grow' }, otaUrl), otaDefault),
+      h('p', { class: 'small muted' }, 'Un dépôt GitHub (dernière release stable) ou l\'adresse d\'un manifeste JSON. Vide : pas de mise à jour automatique. ',
+        s.ota_default_url ? `Valeur d'usine : ${s.ota_default_url}` : ''),
       h('label', null, 'Vérifier toutes les (heures)'), otaInt,
       h('div', { class: 'row end actions' }, check, saveOta),
       h('div', { class: 'row actions' }, fwBtn), fw),

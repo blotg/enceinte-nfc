@@ -141,8 +141,12 @@ esp_err_t settings_init(void)
         uint8_t https = 0;
         nvs_get_u8(h, "https", &https);
         s_cfg.https_enabled = https != 0;
-        nvs_get_u8(h, "normalize", &s_cfg.normalize);
-        nvs_get_u8(h, "compress", &s_cfg.compress);
+        if (nvs_get_u8(h, "normalize", &s_cfg.normalize) != ESP_OK) {
+            s_cfg.normalize = CONFIG_ENC_DEFAULT_NORMALIZE;
+        }
+        if (nvs_get_u8(h, "compress", &s_cfg.compress) != ESP_OK) {
+            s_cfg.compress = CONFIG_ENC_DEFAULT_COMPRESS;
+        }
         uint8_t st = 0;
         nvs_get_u8(h, "ip_static", &st);
         s_cfg.ip.static_ip = st != 0;
@@ -161,6 +165,8 @@ esp_err_t settings_init(void)
         s_cfg.volume = CONFIG_ENC_DEFAULT_VOLUME;
         s_cfg.max_volume = CONFIG_ENC_DEFAULT_MAX_VOLUME;
         s_cfg.resume_timeout_s = CONFIG_ENC_RESUME_TIMEOUT_S;
+        s_cfg.normalize = CONFIG_ENC_DEFAULT_NORMALIZE;
+        s_cfg.compress = CONFIG_ENC_DEFAULT_COMPRESS;
     }
     if (s_cfg.max_volume == 0 || s_cfg.max_volume > 100) {
         s_cfg.max_volume = 100;
@@ -169,10 +175,10 @@ esp_err_t settings_init(void)
         s_cfg.volume = CONFIG_ENC_DEFAULT_VOLUME;
     }
     if (s_cfg.normalize > SOUND_LEVEL_MAX) {
-        s_cfg.normalize = 0;
+        s_cfg.normalize = CONFIG_ENC_DEFAULT_NORMALIZE;
     }
     if (s_cfg.compress > SOUND_LEVEL_MAX) {
-        s_cfg.compress = 0;
+        s_cfg.compress = CONFIG_ENC_DEFAULT_COMPRESS;
     }
     if (s_cfg.ip.static_ip && !settings_ip_valid(&s_cfg.ip, NULL)) {
         ESP_LOGW(TAG, "adresse IP fixe enregistrée invalide : DHCP");

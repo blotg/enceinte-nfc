@@ -16,9 +16,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 WEB = os.path.join(os.path.dirname(__file__), "..", "..", "main", "web")
+BUILD = "simulation"  # identifiant du firmware : le changer pendant que la page est ouverte la recharge
 
 STATE = {"setup": False, "logged": True, "volume": 35, "playing": "play", "learning": False, "learn_at": 0,
-         "resume_s": 600, "resume_after_other": False, "shuffle": False, "normalize": 2, "compress": 0,
+         "resume_s": 600, "resume_after_other": False, "shuffle": False, "normalize": 2, "compress": 2,
          "max_volume": 80, "ap": False, "ip": {"mode": "dhcp", "address": "", "netmask": "", "gateway": "", "dns": ""},
          "ip_test_until": 0, "ip_test_address": ""}
 
@@ -84,7 +85,7 @@ def status():
         "sd": {"mounted": True, "total": 15_931_539_456, "free": 12_002_000_000},
         "ota": {"state": 0, "message": "à jour (dernière version : 1.0.0)", "current": "1.0.0", "available": "",
                 "progress": 0, "last_check": time.time()},
-        "uptime": 7322, "heap": 152000,
+        "uptime": 7322, "heap": 152000, "build": BUILD,
     }
 
 
@@ -100,9 +101,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def static(self, name, ctype):
+    def static(self, name, ctype, subst=None):
         with open(os.path.join(WEB, name), "rb") as f:
             data = f.read()
+        for k, v in (subst or {}).items():
+            data = data.replace(k.encode(), v.encode())
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -121,14 +124,15 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path in ("/", "/index.html"):
-            return self.static("index.html", "text/html; charset=utf-8")
+            return self.static("index.html", "text/html; charset=utf-8", {"{{build}}": BUILD})
         if u.path == "/app.js":
             return self.static("app.js", "application/javascript")
         if u.path == "/style.css":
             return self.static("style.css", "text/css")
         if u.path == "/api/state":
             return self.send_json({"setup_required": STATE["setup"], "logged_in": STATE["logged"],
-                                   "version": "1.0.0", "hostname": "enceinte", "on_ap": STATE["setup"]})
+                                   "version": "1.0.0", "build": BUILD, "hostname": "enceinte",
+                                   "on_ap": STATE["setup"]})
         if u.path == "/api/wifi/scan":
             time.sleep(0.3)
             return self.send_json({"networks": [{"ssid": "Maison", "rssi": -48, "secure": True},
@@ -169,6 +173,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/settings":
             return self.send_json({"hostname": "enceinte", "wifi_ssid": "Maison", "ota_url": "",
+                                   "ota_default_url": "https://github.com/blotg/enceinte-nfc",
                                    "ota_interval_h": 24, "max_volume": STATE["max_volume"], "mpd_password_set": False,
                                    "normalize": STATE["normalize"], "compress": STATE["compress"], "ip": STATE["ip"],
                                    "ip_current": {"address": "192.168.1.42", "netmask": "255.255.255.0",
@@ -186,6 +191,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "requête refusée"}, 403)
         u = urlparse(self.path)
         b = self.body()
+        if u.path == "/api/_mock/build":  # simule une mise à jour du firmware
+            global BUILD
+            BUILD = b.get("build", "nouvelle")
+            return self.send_json({"ok": True})
         if u.path == "/api/setup":
             STATE["setup"] = False
             STATE["logged"] = True
