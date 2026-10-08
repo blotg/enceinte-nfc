@@ -14,6 +14,9 @@
 #define CFG_PARTITION "cfg"
 
 #define SOUND_LEVEL_MAX 3        /* normalisation et compression : 0 = désactivée, 1 à 3 */
+#define TOUCH_THRESHOLD_MIN 3     /* touches tactiles : seuil en millièmes (0,3 % à 30 %) */
+#define TOUCH_THRESHOLD_MAX 300
+#define TOUCH_HOLD_MAX_MS 3000
 #define SETTINGS_PW_HASH_LEN 52  /* empreinte d'un mot de passe : itérations, sel, PBKDF2 */
 
 /* Adresse IP de l'enceinte sur le réseau Wi-Fi (ordre « hôte », cf. ip4_parse). */
@@ -38,6 +41,9 @@ typedef struct {
     uint8_t normalize;         /* égalisation du niveau entre morceaux et playlists, 0-3 */
     uint8_t compress;          /* réduction des écarts de volume dans un morceau, 0-3 */
     ip_config_t ip;
+    bool vol_touch;            /* volume : touches tactiles (sinon boutons poussoirs) */
+    uint16_t touch_threshold;  /* touches tactiles : seuil, millièmes de la valeur de repos */
+    uint16_t touch_hold_ms;    /* touches tactiles : maintien avant le premier cran */
     uint8_t volume;     /* 0-max_volume, dernier volume utilisé */
     uint8_t max_volume; /* 1-100 */
     bool admin_set;     /* false = sortie d'usine, assistant de configuration */
@@ -56,6 +62,7 @@ esp_err_t settings_set_shuffle(bool on);
 esp_err_t settings_set_https(bool enabled);
 esp_err_t settings_set_sound(uint8_t normalize, uint8_t compress);
 esp_err_t settings_set_ip(const ip_config_t *ip);
+esp_err_t settings_set_controls(bool touch, uint16_t threshold, uint16_t hold_ms);
 
 /* Adresse fixe cohérente (DHCP : toujours valide). why : message d'erreur en français. */
 static inline bool settings_ip_valid(const ip_config_t *ip, const char **why)

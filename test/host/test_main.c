@@ -14,6 +14,7 @@ int main(int argc, char **argv)
     test_mpd_proto();
     test_dsp();
     test_config_json();
+    test_touch();
     if (argc > 1) {
         test_media(argv[1]);
     } else {

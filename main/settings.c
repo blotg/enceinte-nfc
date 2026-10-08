@@ -25,6 +25,12 @@ _Static_assert(PW_BLOB_LEN == SETTINGS_PW_HASH_LEN, "taille de l'empreinte");
 
 #define VOLUME_SAVE_DELAY_US (1000 * 1000)
 
+#ifdef CONFIG_ENC_DEFAULT_VOL_TOUCH
+#define DEFAULT_VOL_TOUCH 1
+#else
+#define DEFAULT_VOL_TOUCH 0
+#endif
+
 static settings_t s_cfg;
 static SemaphoreHandle_t s_lock;
 static esp_timer_handle_t s_volume_timer;
@@ -154,6 +160,15 @@ esp_err_t settings_init(void)
         nvs_get_u32(h, "ip_mask", &s_cfg.ip.netmask);
         nvs_get_u32(h, "ip_gw", &s_cfg.ip.gateway);
         nvs_get_u32(h, "ip_dns", &s_cfg.ip.dns);
+        uint8_t touch = DEFAULT_VOL_TOUCH;
+        nvs_get_u8(h, "vol_touch", &touch);
+        s_cfg.vol_touch = touch != 0;
+        if (nvs_get_u16(h, "touch_thr", &s_cfg.touch_threshold) != ESP_OK) {
+            s_cfg.touch_threshold = CONFIG_ENC_DEFAULT_TOUCH_THRESHOLD;
+        }
+        if (nvs_get_u16(h, "touch_hold", &s_cfg.touch_hold_ms) != ESP_OK) {
+            s_cfg.touch_hold_ms = CONFIG_ENC_DEFAULT_TOUCH_HOLD_MS;
+        }
         s_cfg.admin_set = blob_exists(h, "admin_pw");
         s_cfg.mpd_pass_set = blob_exists(h, "mpd_pw");
         nvs_close(h);
@@ -167,6 +182,15 @@ esp_err_t settings_init(void)
         s_cfg.resume_timeout_s = CONFIG_ENC_RESUME_TIMEOUT_S;
         s_cfg.normalize = CONFIG_ENC_DEFAULT_NORMALIZE;
         s_cfg.compress = CONFIG_ENC_DEFAULT_COMPRESS;
+        s_cfg.vol_touch = DEFAULT_VOL_TOUCH;
+        s_cfg.touch_threshold = CONFIG_ENC_DEFAULT_TOUCH_THRESHOLD;
+        s_cfg.touch_hold_ms = CONFIG_ENC_DEFAULT_TOUCH_HOLD_MS;
+    }
+    if (s_cfg.touch_threshold < TOUCH_THRESHOLD_MIN || s_cfg.touch_threshold > TOUCH_THRESHOLD_MAX) {
+        s_cfg.touch_threshold = CONFIG_ENC_DEFAULT_TOUCH_THRESHOLD;
+    }
+    if (s_cfg.touch_hold_ms > TOUCH_HOLD_MAX_MS) {
+        s_cfg.touch_hold_ms = CONFIG_ENC_DEFAULT_TOUCH_HOLD_MS;
     }
     if (s_cfg.max_volume == 0 || s_cfg.max_volume > 100) {
         s_cfg.max_volume = 100;
@@ -438,6 +462,38 @@ esp_err_t settings_set_ip(const ip_config_t *ip)
     return err;
 }
 
+esp_err_t settings_set_controls(bool touch, uint16_t threshold, uint16_t hold_ms)
+{
+    if (threshold < TOUCH_THRESHOLD_MIN || threshold > TOUCH_THRESHOLD_MAX || hold_ms > TOUCH_HOLD_MAX_MS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = open_ns(NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "vol_touch", touch ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_set_u16(h, "touch_thr", threshold);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u16(h, "touch_hold", hold_ms);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_cfg.vol_touch = touch;
+        s_cfg.touch_threshold = threshold;
+        s_cfg.touch_hold_ms = hold_ms;
+        xSemaphoreGive(s_lock);
+        notify();
+    }
+    return err;
+}
+
 esp_err_t settings_set_all(const settings_t *in)
 {
     settings_t c = *in;
@@ -447,7 +503,8 @@ esp_err_t settings_set_all(const settings_t *in)
         (c.ota_url[0] && strncmp(c.ota_url, "http://", 7) != 0 && strncmp(c.ota_url, "https://", 8) != 0) ||
         c.ota_interval_h == 0 || c.ota_interval_h > 24 * 30 || c.resume_timeout_s > 30 * 24 * 3600 ||
         c.max_volume == 0 || c.max_volume > 100 || c.normalize > SOUND_LEVEL_MAX || c.compress > SOUND_LEVEL_MAX ||
-        !settings_ip_valid(&c.ip, NULL)) {
+        !settings_ip_valid(&c.ip, NULL) || c.touch_threshold < TOUCH_THRESHOLD_MIN ||
+        c.touch_threshold > TOUCH_THRESHOLD_MAX || c.touch_hold_ms > TOUCH_HOLD_MAX_MS) {
         return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t h;
@@ -461,6 +518,7 @@ esp_err_t settings_set_all(const settings_t *in)
     } u8s[] = {
         {"max_vol", c.max_volume},       {"resume_other", c.resume_after_other}, {"shuffle", c.shuffle},
         {"https", c.https_enabled},      {"normalize", c.normalize},             {"compress", c.compress},
+        {"vol_touch", c.vol_touch},
     };
     for (size_t i = 0; err == ESP_OK && i < sizeof(u8s) / sizeof(u8s[0]); i++) {
         err = nvs_set_u8(h, u8s[i].key, u8s[i].value);
@@ -482,6 +540,12 @@ esp_err_t settings_set_all(const settings_t *in)
     }
     if (err == ESP_OK) {
         err = nvs_set_u32(h, "resume_s", c.resume_timeout_s);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u16(h, "touch_thr", c.touch_threshold);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u16(h, "touch_hold", c.touch_hold_ms);
     }
     if (err == ESP_OK) {
         err = write_ip(h, &c.ip);

@@ -44,3 +44,4 @@ void test_mpd_proto(void);
 void test_media(const char *fixtures);
 void test_dsp(void);
 void test_config_json(void);
+void test_touch(void);

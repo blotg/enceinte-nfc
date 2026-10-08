@@ -22,6 +22,9 @@ static config_t sample(void)
     s->normalize = 2;
     s->compress = 1;
     s->max_volume = 70;
+    s->vol_touch = true;
+    s->touch_threshold = 25;
+    s->touch_hold_ms = 1000;
     s->ip = (ip_config_t){.static_ip = true, .address = 0xC0A80132, .netmask = 0xFFFFFF00, .gateway = 0xC0A80101};
     c.admin_hash = true;
     for (int i = 0; i < SETTINGS_PW_HASH_LEN; i++) {
@@ -64,6 +67,7 @@ static void test_roundtrip(void)
     CHECK(b.s.normalize == 2 && b.s.compress == 1 && b.s.max_volume == 70);
     CHECK(b.s.resume_timeout_s == 600 && b.s.resume_after_other && !b.s.shuffle && b.s.https_enabled);
     CHECK(b.s.ota_interval_h == 24);
+    CHECK(b.s.vol_touch && b.s.touch_threshold == 25 && b.s.touch_hold_ms == 1000);
     CHECK(b.admin_hash && memcmp(b.admin, a.admin, SETTINGS_PW_HASH_LEN) == 0);
     CHECK(b.mpd_hash == 0);
 
@@ -92,6 +96,8 @@ static void test_partial_and_invalid(void)
     CHECK(parse("{\"normalize\": 3}", &c, err));
     CHECK(c.s.normalize == 3 && c.s.compress == 1 && c.s.max_volume == 70);
     CHECK_STR(c.s.hostname, "salon");
+    CHECK(parse("{\"controls\": {\"type\": \"buttons\", \"touch_threshold_pct\": 4.5}}", &c, err));
+    CHECK(!c.s.vol_touch && c.s.touch_threshold == 45 && c.s.touch_hold_ms == 1000);
     CHECK(parse("{\"ip\": {\"mode\": \"dhcp\"}, \"hostname\": \"Cuisine\"}", &c, err));
     CHECK(!c.s.ip.static_ip);
     CHECK_STR(c.s.hostname, "cuisine");
@@ -114,6 +120,10 @@ static void test_partial_and_invalid(void)
         "{\"ip\": {\"mode\": \"auto\"}}",
         "{\"admin_password_hash\": \"abc\"}",
         "{\"normalize\": 2, \"compress\": 9}",
+        "{\"controls\": {\"type\": \"capacitif\"}}",
+        "{\"controls\": {\"touch_threshold_pct\": 0.1}}",
+        "{\"controls\": {\"touch_threshold_pct\": 31}}",
+        "{\"controls\": {\"touch_hold_ms\": 5000}}",
         "[]",
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {

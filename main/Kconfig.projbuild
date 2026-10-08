@@ -112,6 +112,24 @@ menu "Enceinte"
             range 0 3
             default 2
 
+        config ENC_DEFAULT_VOL_TOUCH
+            bool "Volume par touches tactiles par défaut (sinon boutons poussoirs)"
+            default y
+            help
+                Touches tactiles : une électrode (pièce de monnaie, disque de cuivre) collée
+                sous le bois, reliée à la broche. Les broches doivent être des canaux tactiles
+                (GPIO 1 à 14). Modifiable dans l'interface web.
+
+        config ENC_DEFAULT_TOUCH_THRESHOLD
+            int "Seuil des touches tactiles par défaut (millièmes de la valeur de repos)"
+            range 3 300
+            default 20
+
+        config ENC_DEFAULT_TOUCH_HOLD_MS
+            int "Maintien avant le premier cran, touches tactiles (ms)"
+            range 0 3000
+            default 800
+
         config ENC_WIFI_TX_POWER_DBM
             int "Puissance d'émission Wi-Fi maximale (dBm)"
             range 2 20
