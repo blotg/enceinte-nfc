@@ -13,6 +13,7 @@
 #include "cards.h"
 #include "changes.h"
 #include "controller.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_https_server.h"
@@ -336,30 +337,77 @@ static bool require_auth(httpd_req_t *req)
 
 /* ================= Fichiers statiques ================= */
 
-static esp_err_t send_static(httpd_req_t *req, const char *start, const char *end, const char *type)
+/*
+ * Après une mise à jour, le navigateur ne doit pas garder l'ancienne interface :
+ *  - chaque firmware a un identifiant (début de l'empreinte SHA-256 de son ELF) ;
+ *  - index.html appelle app.js et style.css avec ?v=<identifiant> et le porte dans une
+ *    balise meta : la page compare son identifiant à celui de l'enceinte et se recharge
+ *    si l'enceinte a changé de firmware pendant qu'elle était ouverte ;
+ *  - les trois fichiers sont revalidés à chaque chargement (no-cache) grâce à leur ETag :
+ *    réponse 304 sans contenu tant que le firmware est le même.
+ */
+static char s_build[13];
+static char s_etag[16];
+static char *s_index; /* index.html, identifiant inséré */
+static size_t s_index_len;
+
+static void prepare_static(void)
+{
+    esp_app_get_elf_sha256(s_build, sizeof(s_build));
+    snprintf(s_etag, sizeof(s_etag), "\"%s\"", s_build);
+    static const char mark[] = "{{build}}";
+    const char *src = index_html_start;
+    size_t len = index_html_end - index_html_start - 1; /* EMBED_TXTFILES ajoute un octet nul final */
+    s_index = malloc(len + 8 * strlen(s_build) + 1);
+    if (!s_index) {
+        return;
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < len;) {
+        if (i + sizeof(mark) - 1 <= len && memcmp(src + i, mark, sizeof(mark) - 1) == 0) {
+            memcpy(s_index + o, s_build, strlen(s_build));
+            o += strlen(s_build);
+            i += sizeof(mark) - 1;
+        } else {
+            s_index[o++] = src[i++];
+        }
+    }
+    s_index[o] = '\0';
+    s_index_len = o;
+}
+
+static esp_err_t send_static(httpd_req_t *req, const char *data, size_t len, const char *type)
 {
     if (must_use_https(req)) {
         return redirect_https(req);
     }
-    httpd_resp_set_type(req, type);
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    /* EMBED_TXTFILES ajoute un octet nul final */
-    return httpd_resp_send(req, start, end - start - 1);
+    httpd_resp_set_hdr(req, "ETag", s_etag);
+    char inm[24];
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", inm, sizeof(inm)) == ESP_OK && strcmp(inm, s_etag) == 0) {
+        httpd_resp_set_status(req, "304 Not Modified");
+        return httpd_resp_send(req, NULL, 0);
+    }
+    httpd_resp_set_type(req, type);
+    return httpd_resp_send(req, data, len);
 }
 
 static esp_err_t h_index(httpd_req_t *req)
 {
-    return send_static(req, index_html_start, index_html_end, "text/html; charset=utf-8");
+    if (!s_index) {
+        return send_static(req, index_html_start, index_html_end - index_html_start - 1, "text/html; charset=utf-8");
+    }
+    return send_static(req, s_index, s_index_len, "text/html; charset=utf-8");
 }
 
 static esp_err_t h_app_js(httpd_req_t *req)
 {
-    return send_static(req, app_js_start, app_js_end, "application/javascript; charset=utf-8");
+    return send_static(req, app_js_start, app_js_end - app_js_start - 1, "application/javascript; charset=utf-8");
 }
 
 static esp_err_t h_style(httpd_req_t *req)
 {
-    return send_static(req, style_css_start, style_css_end, "text/css; charset=utf-8");
+    return send_static(req, style_css_start, style_css_end - style_css_start - 1, "text/css; charset=utf-8");
 }
 
 /* Portail captif : toute adresse inconnue renvoie vers la page de configuration. */
@@ -390,6 +438,7 @@ static esp_err_t h_state(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "setup_required", !cfg.admin_set);
     cJSON_AddBoolToObject(root, "logged_in", cfg.admin_set && find_session(req) != NULL);
     cJSON_AddStringToObject(root, "version", os.current_version);
+    cJSON_AddStringToObject(root, "build", s_build);
     cJSON_AddStringToObject(root, "hostname", cfg.hostname);
     cJSON_AddBoolToObject(root, "on_ap", client_on_ap(req));
     return send_json(req, root);
@@ -596,6 +645,7 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(o, "progress", os.progress);
     cJSON_AddNumberToObject(o, "last_check", (double)os.last_check);
 
+    cJSON_AddStringToObject(root, "build", s_build);
     cJSON_AddNumberToObject(root, "uptime", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddNumberToObject(root, "heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     return send_json(req, root);
@@ -1040,6 +1090,7 @@ static esp_err_t h_settings_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "hostname", cfg.hostname);
     cJSON_AddStringToObject(root, "wifi_ssid", cfg.wifi_ssid);
     cJSON_AddStringToObject(root, "ota_url", cfg.ota_url);
+    cJSON_AddStringToObject(root, "ota_default_url", CONFIG_ENC_OTA_DEFAULT_URL);
     cJSON_AddNumberToObject(root, "ota_interval_h", cfg.ota_interval_h);
     cJSON_AddNumberToObject(root, "max_volume", cfg.max_volume);
     cJSON_AddNumberToObject(root, "normalize", cfg.normalize);
@@ -1542,6 +1593,7 @@ static esp_err_t h_https(httpd_req_t *req)
 
 esp_err_t web_server_start(void)
 {
+    prepare_static();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     base_config(&cfg);
     cfg.stack_size = 10240;

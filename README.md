@@ -166,8 +166,9 @@ absente à ce moment rapporterait ses réglages à son retour.
 
 ### Son : normalisation et compression
 
-*Réglages → Son*, et carte par carte (*Cartes → ☰*, « Réglage général » par défaut). Le
-traitement se fait avant le volume ; un limiteur empêche toute saturation.
+*Réglages → Son*, et carte par carte (*Cartes → ☰*, « Réglage général » par défaut). Valeur
+d'usine : **moyenne** pour les deux (menuconfig : `ENC_DEFAULT_NORMALIZE`, `ENC_DEFAULT_COMPRESS`).
+Le traitement se fait avant le volume ; un limiteur empêche toute saturation.
 
 | Réglage | Effet | Légère | Moyenne | Forte |
 |---|---|---|---|---|
@@ -279,7 +280,9 @@ correspond à `version.txt` et publie la release avec :
 Un tag avec suffixe (`v1.2.0-rc1`) est publié en **pré-version** : les enceintes l'ignorent.
 On peut l'installer à la main sur une enceinte de test (*Réglages → Installer un fichier .bin*).
 
-L'enceinte vérifie 1 minute après le démarrage, puis toutes les 24 h (réglable). Elle lit la
+L'enceinte vérifie 1 minute après le démarrage, puis toutes les 24 h (réglable).
+Source d'usine : `https://github.com/blotg/enceinte-nfc` (bouton « Valeur d'usine » dans
+*Réglages → Mises à jour*). Elle lit la
 version dans l'en-tête du binaire de la dernière release stable, sans le télécharger en
 entier. Si elle est plus récente, elle attend la fin de la lecture, l'installe et redémarre.
 Si le nouveau firmware plante avant 30 s de fonctionnement, l'enceinte revient seule à
@@ -304,6 +307,11 @@ n'importe qui sur le réseau pourrait alors substituer un firmware.
 
 On peut aussi installer un `.bin` à la main depuis la même page. Le fichier est vérifié :
 il doit s'agir d'un firmware de ce projet.
+
+Après une mise à jour, une page de l'interface restée ouverte se recharge d'elle-même pour
+afficher la nouvelle interface : chaque firmware a un identifiant (empreinte de son binaire),
+inscrit dans la page et dans les adresses de `app.js` et `style.css`. Le navigateur revalide
+ces fichiers à chaque chargement (réponse 304 sans contenu tant que le firmware est le même).
 
 ## Organisation du code (`main/`)
 

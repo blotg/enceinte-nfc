@@ -102,6 +102,16 @@ menu "Enceinte"
             range 1 20
             default 5
 
+        config ENC_DEFAULT_NORMALIZE
+            int "Normalisation par défaut (0 désactivée, 1 légère, 2 moyenne, 3 forte)"
+            range 0 3
+            default 2
+
+        config ENC_DEFAULT_COMPRESS
+            int "Compression par défaut (0 désactivée, 1 légère, 2 moyenne, 3 forte)"
+            range 0 3
+            default 2
+
         config ENC_WIFI_TX_POWER_DBM
             int "Puissance d'émission Wi-Fi maximale (dBm)"
             range 2 20
