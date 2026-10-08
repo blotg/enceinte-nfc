@@ -13,6 +13,7 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Fonction demandée | État | Remarques |
 |---|---|---|
 | Carte NFC → lecture d'un dossier | ✅ | MP3, AAC, M4A, FLAC, WAV, OGG/Opus. Sous-dossiers inclus, ordre « naturel » (2 avant 10) ou aléatoire (réglage général ou carte par carte). |
+| Lecteur NFC PN532 ou PN5180 | ✅ | Détecté automatiquement au démarrage. Le PN5180 porte plus loin et lit aussi les étiquettes ISO 15693 (ICODE SLIX). |
 | Pause au retrait, reprise sous 10 min | ✅ | Durée de conservation de la progression réglable (0 = sans limite), progression conservée ou non après une autre carte, en réglage général ou carte par carte. Une carte inconnue compte comme « une autre carte ». |
 | Association dossier ↔ carte par l'interface web | ✅ | Mode association : la carte posée est capturée sans lancer la musique. Dossiers nommés librement (accents, espaces). |
 | Dépôt de fichiers par l'interface web | ✅ | Fichiers ou dossiers entiers, glisser-déposer. Débit limité par la carte SD en SPI. |
@@ -53,6 +54,7 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Élément | Broches ESP32-S3 (modifiables dans `idf.py menuconfig` → *Enceinte*) | Alimentation |
 |---|---|---|
 | PN532 en mode **HSU** (interrupteurs sur 0/0) | TX ESP **GPIO20** → RX PN532, RX ESP **GPIO19** ← TX PN532 | **3V3** (logique compatible ESP32 garantie) + 10 à 100 µF |
+| *ou* PN5180 (SPI) | SCK 18, MOSI 17, MISO 8, NSS 10, BUSY 11, RST 13 | **5V** et **3V3** (cf. plus bas) + 100 µF |
 | Carte SD (SPI) | CS 5, MOSI 16, MISO 15, SCK 12 | 3V3 ; **5V** si le module a un régulateur (AMS1117) |
 | MAX98357A (I2S) | BCLK 3, LRC 1, DIN 9 | **5V** (puissance, ménage le régulateur 3,3 V) + 220 à 470 µF |
 | Réinitialisation usine | bouton BOOT (GPIO0) | |
@@ -60,6 +62,32 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 
 Les GPIO de l'ESP32-S3 ne tolèrent pas le 5 V. Les entrées I2S du MAX98357A acceptent le
 3,3 V même s'il est alimenté en 5 V.
+
+### Lecteur NFC : PN532 ou PN5180
+
+Au démarrage, l'enceinte cherche un **PN5180**, puis un **PN532** : un seul des deux suffit et
+le même firmware convient aux deux. Le lecteur détecté s'affiche au survol de la puce « NFC »,
+en haut de l'interface web.
+
+Le PN5180 émet plus fort et tolère mieux une carte mal placée. Il lit les cartes ISO 14443A
+(MIFARE, NTAG) comme le PN532 : les cartes déjà associées gardent le même numéro (UID). Il lit
+aussi les étiquettes **ISO 15693** (NXP ICODE SLIX, SLIX2), dont la portée est nettement plus
+grande, y compris à travers le bois.
+
+| Module PN5180 | ESP32-S3 |
+|---|---|
+| 5V | 5V (alimente l'émetteur : c'est lui qui donne la portée) |
+| 3V3 | 3V3 (logique, compatible avec l'ESP32) |
+| GND | GND |
+| SCK, MOSI, MISO | GPIO18, GPIO17, GPIO8 |
+| NSS, BUSY, RST | GPIO10, GPIO11, GPIO13 |
+| IRQ, GPIO, AUX, REQ | non reliées |
+
+Fils courts (moins de 15 cm), condensateur de 100 µF entre 5V et GND près du module. Antenne à
+plat contre le bois, à distance des pièces métalliques et de l'aimant du haut-parleur. Les
+broches se changent dans menuconfig (SCK à -1 : pas de PN5180). Le pilote a été validé avec un
+PN5180 simulé (tests sur PC), pas encore avec un vrai module : en cas de souci, les journaux
+série (`idf.py monitor`, étiquettes `nfc` et `pn5180`) indiquent ce qui coince.
 
 ### Volume sur l'enceinte : touches tactiles sous le bois
 
@@ -344,7 +372,7 @@ ces fichiers à chaque chargement (réponse 304 sans contenu tant que le firmwar
 | Module | Rôle |
 |---|---|
 | `main.c` | Démarrage, bouton de réinitialisation, validation du firmware après 30 s |
-| `pn532*.c`, `nfc.c` | Pilote PN532 (trames vérifiées, nombre d'essais borné, réinitialisation automatique), détection pose/retrait avec anti-rebond |
+| `pn532*.c`, `pn5180*.c`, `nfc.c` | Pilotes PN532 (trames vérifiées, nombre d'essais borné) et PN5180 (ISO 14443A et 15693), détection automatique du lecteur, détection pose/retrait avec anti-rebond, réinitialisation automatique |
 | `player.c` | File d'attente, lecture SD anticipée (réservoir de 2 à 16 s), décodage, I2S, volume |
 | `dsp.c` | Normalisation, compression, limiteur |
 | `buttons.c`, `touch_keys.c` | Volume sur l'enceinte : touches tactiles ou boutons poussoirs |
@@ -365,7 +393,7 @@ test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 
 
 1. Tests unitaires des modules purs, avec de vrais fichiers audio générés par ffmpeg/lame :
    ID3v2.3/2.4/v1, pochette intégrée, FLAC, WAV, fichiers corrompus. Couvre aussi les trames
-   PN532, la règle de reprise, le DNS captif, les chemins (traversée de répertoire), les
+   PN532, le PN5180 simulé (anticollision, UID de 4, 7 et 10 octets, ISO 15693), la règle de reprise, le DNS captif, les chemins (traversée de répertoire), les
    filtres MPD, la normalisation et la compression (signaux de synthèse), les touches
    tactiles (effleurement, maintien, main à plat, dérive due à l'humidité, objet posé), les
    adresses IP et les réglages en JSON (valeurs invalides refusées).
