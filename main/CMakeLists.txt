@@ -6,6 +6,8 @@ idf_component_register(
         "cards.c"
         "pn532.c"
         "pn532_frame.c"
+        "pn5180.c"
+        "pn5180_proto.c"
         "nfc.c"
         "player.c"
         "media_info.c"

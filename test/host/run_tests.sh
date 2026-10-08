@@ -64,7 +64,7 @@ if [ -f /usr/include/cjson/cJSON.h ]; then
 fi
 gcc "${CFLAGS[@]}" -DDNS_HOST_TEST -I"$MAIN" -I"$HERE" -I"$HERE/stubs" \
     "$HERE"/test_*.c "$MAIN/util.c" "$MAIN/pn532_frame.c" "$MAIN/session.c" "$MAIN/dns_server.c" \
-    "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/dsp.c" "$MAIN/touch_keys.c" "${JSON[@]}" -lm -o "$WORK/tests"
+    "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/dsp.c" "$MAIN/touch_keys.c" "$MAIN/pn5180_proto.c" "${JSON[@]}" -lm -o "$WORK/tests"
 if [ $HAVE_MEDIA = 1 ]; then "$WORK/tests" "$FIX"; else "$WORK/tests"; fi
 
 echo "== 2. Contrôleur de cartes (vrai lecteur)"

@@ -78,7 +78,7 @@ def status():
                    "duration": 150.0, "seekable": True, "song": 1, "queue_len": 3, "volume": STATE["volume"],
                    "max_volume": STATE["max_volume"], "repeat": False, "random": False, "error": "",
                    "normalize": STATE["normalize"], "compress": STATE["compress"]},
-        "card": {"reader_ok": True, "present": "04A1B2C3D4E5F6", "session": "04A1B2C3D4E5F6",
+        "card": {"reader_ok": True, "reader": "PN5180, firmware 4.0", "present": "04A1B2C3D4E5F6", "session": "04A1B2C3D4E5F6",
                  "folder": "Comptines", "resume_remaining": 0, "last_unknown": ""},
         "wifi": {"connected": not ap, "ssid": "Maison", "ip": "" if ap else "192.168.1.42", "rssi": -58, "ap": ap,
                  "ap_ssid": "Enceinte-3F2A", "hostname": "enceinte", "sta_available": ap, "on_ap": ap,

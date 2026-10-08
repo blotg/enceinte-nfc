@@ -612,6 +612,9 @@ static esp_err_t h_status(httpd_req_t *req)
 
     cJSON *c = cJSON_AddObjectToObject(root, "card");
     cJSON_AddBoolToObject(c, "reader_ok", nfc_reader_ok());
+    char reader[48];
+    nfc_reader_desc(reader, sizeof(reader));
+    cJSON_AddStringToObject(c, "reader", reader);
     cJSON_AddStringToObject(c, "present", cs.present_uid);
     cJSON_AddStringToObject(c, "session", cs.session_uid);
     cJSON_AddStringToObject(c, "folder", cs.session_folder);

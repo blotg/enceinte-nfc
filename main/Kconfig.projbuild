@@ -14,6 +14,39 @@ menu "Enceinte"
             int "GPIO RX de l'ESP32 (vers TX/SCL du PN532)"
             default 19
 
+        config ENC_PN5180_SCK_GPIO
+            int "PN5180 : SCK (-1 : pas de PN5180)"
+            range -1 48
+            default 18
+            help
+                Lecteur PN5180 sur un bus SPI dédié. Au démarrage, l'enceinte cherche un PN5180
+                puis un PN532 : le même firmware convient aux deux lecteurs.
+
+        config ENC_PN5180_MOSI_GPIO
+            int "PN5180 : MOSI"
+            range -1 48
+            default 17
+
+        config ENC_PN5180_MISO_GPIO
+            int "PN5180 : MISO"
+            range -1 48
+            default 8
+
+        config ENC_PN5180_NSS_GPIO
+            int "PN5180 : NSS"
+            range -1 48
+            default 10
+
+        config ENC_PN5180_BUSY_GPIO
+            int "PN5180 : BUSY"
+            range -1 48
+            default 11
+
+        config ENC_PN5180_RST_GPIO
+            int "PN5180 : RST (-1 : non reliée)"
+            range -1 48
+            default 13
+
         config ENC_SD_CS_GPIO
             int "Carte SD : CS"
             default 5

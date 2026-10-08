@@ -237,7 +237,7 @@ function showSwitching(w) {
 function setChips(st) {
   const chips = $('#chips');
   if (!st) {
-    setKids(chips, h('span', { class: 'chip bad' }, 'Hors ligne'));
+    setChipList(chips, [h('span', { class: 'chip bad' }, 'Hors ligne')]);
     return;
   }
   const w = st.wifi;
@@ -246,9 +246,20 @@ function setChips(st) {
   else if (w.ap) list.push(h('span', { class: 'chip warn' }, 'Point d\'accès'));
   else list.push(h('span', { class: 'chip bad' }, 'Wi-Fi'));
   list.push(h('span', { class: 'chip ' + (st.sd.mounted ? 'ok' : 'bad') }, 'SD'));
-  list.push(h('span', { class: 'chip ' + (st.card.reader_ok ? 'ok' : 'bad') }, 'NFC'));
-  setKids(chips, ...list);
+  const reader = st.card.reader_ok
+    ? 'Lecteur NFC : ' + (st.card.reader || 'détecté')
+    : 'Aucun lecteur NFC détecté (PN5180 ou PN532)';
+  list.push(h('span', { class: 'chip ' + (st.card.reader_ok ? 'ok' : 'bad'), title: reader }, 'NFC'));
+  setChipList(chips, list);
   $('#dev-name').textContent = w.hostname || 'Enceinte';
+}
+
+/* Les puces ne sont remplacées que si elles changent : une info-bulle survolée reste affichée. */
+function setChipList(chips, list) {
+  const sig = list.map((c) => c.outerHTML).join('');
+  if (chips.dataset.sig === sig) return;
+  chips.dataset.sig = sig;
+  setKids(chips, ...list);
 }
 
 /* ================= Démarrage ================= */
