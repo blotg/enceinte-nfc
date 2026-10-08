@@ -425,6 +425,7 @@ function showApp() {
 const TABS = ['play', 'cards', 'music', 'settings'];
 
 function switchTab(tab) {
+  clearInterval(app.touchTimer);
   if (!TABS.includes(tab)) tab = 'play';
   app.tab = tab;
   if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab);
@@ -1069,6 +1070,7 @@ async function renderSettings() {
 
   /* Adresse IP */
   const ipCard = networkCard(s, w);
+  const ctlCard = controlsCard(s);
 
   /* Sauvegarde */
   const withSecrets = h('input', { type: 'checkbox', checked: true });
@@ -1199,6 +1201,7 @@ async function renderSettings() {
       h('label', null, 'Volume maximum'), h('div', { class: 'vol' }, maxVol, maxLbl),
       h('p', { class: 'small muted' }, 'Le curseur de l\'onglet Lecture, les boutons de l\'enceinte et les applications MPD ne peuvent pas dépasser ce volume.'),
       h('div', { class: 'row end actions' }, saveDev)),
+    ctlCard,
     h('div', { class: 'card' },
       h('h2', null, 'Lecture des cartes'),
       h('p', { class: 'small muted' }, 'Réglages généraux, modifiables carte par carte (bouton ☰ de l\'onglet Cartes).'),
@@ -1263,6 +1266,71 @@ async function renderSettings() {
       h('p', { class: 'small muted' }, `Allumée depuis ${fmtTime(st.uptime)} · mémoire libre ${fmtSize(st.heap)}`),
       h('div', { class: 'row' }, reboot, logout, reset)));
   app.view = { update: updateOta };
+}
+
+/*
+ * Commandes de volume de l'enceinte : boutons poussoirs ou touches tactiles (pièces sous le
+ * bois). Pour les touches, jauges en direct : l'écart mesuré quand on pose le doigt doit
+ * dépasser nettement le seuil, et rester proche de zéro sans le doigt.
+ */
+function controlsCard(s) {
+  clearInterval(app.touchTimer);
+  const touch = h('input', { type: 'radio', name: 'volctl', checked: !!s.vol_touch });
+  const buttons = h('input', { type: 'radio', name: 'volctl', checked: !s.vol_touch });
+  const thr = h('input', { type: 'range', min: 0.3, max: 10, step: 0.1, value: s.touch_threshold_pct, 'aria-label': 'Seuil' });
+  const thrLbl = h('span', { class: 'small muted' });
+  const showThr = () => { thrLbl.textContent = Number(thr.value).toFixed(1).replace('.', ',') + ' %'; };
+  showThr();
+  const HOLDS = [300, 500, 800, 1000, 1500, 2000];
+  const holds = HOLDS.includes(s.touch_hold_ms) ? HOLDS : [...HOLDS, s.touch_hold_ms].sort((a, b) => a - b);
+  const hold = h('select', null, ...holds.map((ms) => h('option', { value: String(ms), selected: ms === s.touch_hold_ms },
+    (ms / 1000).toString().replace('.', ',') + ' s' + (ms === 800 ? ' (conseillé)' : ''))));
+  const meters = [0, 1].map((i) => {
+    const fill = h('span');
+    const val = h('span', { class: 'small mono' }, '–');
+    return { fill, val, el: h('div', { class: 'touch-key' },
+      h('b', null, i === 0 ? 'Touche +' : 'Touche −'),
+      h('div', { class: 'meter' }, fill, h('i')), val) };
+  });
+  const live = h('p', { class: 'small muted' });
+  const touchBox = h('div', { hidden: !s.vol_touch },
+    h('label', null, 'Seuil de déclenchement'), h('div', { class: 'vol' }, thr, thrLbl),
+    h('p', { class: 'small muted' }, 'Posez le doigt sur chaque pièce : la jauge doit dépasser franchement le trait (seuil). Sans le doigt, elle doit rester près de zéro. Plus le bois est épais, plus le seuil doit être bas.'),
+    ...meters.map((m) => m.el), live,
+    h('label', null, 'Maintenir le doigt avant que le volume change'), hold,
+    h('p', { class: 'small muted' }, 'Un effleurement ne fait rien : utile contre les gestes involontaires des enfants. Les deux touches à la fois (main posée à plat) sont ignorées.'));
+  const refresh = async () => {
+    if (touchBox.hidden || !document.body.contains(touchBox)) return;
+    let d;
+    try { d = await api('/api/touch'); } catch (e) { return; }
+    const t = Number(thr.value);
+    if (!d.ok) { live.textContent = d.touch ? 'Capteur tactile indisponible (broches non tactiles ?).' : 'Enregistrez pour activer les touches tactiles.'; }
+    else live.textContent = '';
+    d.keys.forEach((k, i) => {
+      const m = meters[i];
+      /* jauge de 0 à deux fois le seuil : le trait du seuil est au milieu */
+      m.fill.style.width = Math.max(0, Math.min(100, (k.delta_pct / (2 * t)) * 100)) + '%';
+      m.fill.classList.toggle('on', k.delta_pct > t);
+      m.val.textContent = d.ok ? `${k.delta_pct.toFixed(1).replace('.', ',')} %${k.touched ? ' · touchée' : ''}` : '–';
+    });
+  };
+  thr.addEventListener('input', () => { showThr(); refresh(); });
+  const toggle = () => { touchBox.hidden = !touch.checked; refresh(); };
+  touch.addEventListener('change', toggle);
+  buttons.addEventListener('change', toggle);
+  app.touchTimer = setInterval(refresh, 400);
+  refresh();
+  const save = h('button', { class: 'primary' }, 'Enregistrer');
+  save.addEventListener('click', () => busy(save, async () => {
+    await post('/api/settings', { vol_touch: touch.checked, touch_threshold_pct: Number(thr.value), touch_hold_ms: Number(hold.value) });
+    toast('Commandes de volume enregistrées');
+  }));
+  return h('div', { class: 'card' },
+    h('h2', null, 'Commandes de volume sur l\'enceinte'),
+    h('label', { class: 'check' }, touch, ' Touches tactiles (pièces ou disques de métal sous le bois)'),
+    h('label', { class: 'check' }, buttons, ' Boutons poussoirs'),
+    touchBox,
+    h('div', { class: 'row end actions' }, save));
 }
 
 /* Adresse IP : DHCP ou fixe. Une nouvelle adresse est essayée 5 minutes avant d'être gardée. */

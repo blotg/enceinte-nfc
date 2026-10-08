@@ -224,7 +224,8 @@ static bool settings_same(const settings_t *a, const settings_t *b)
            a->ota_interval_h == b->ota_interval_h && a->resume_timeout_s == b->resume_timeout_s &&
            a->resume_after_other == b->resume_after_other && a->shuffle == b->shuffle &&
            a->https_enabled == b->https_enabled && a->normalize == b->normalize && a->compress == b->compress &&
-           a->max_volume == b->max_volume && ip_equal(&a->ip, &b->ip);
+           a->max_volume == b->max_volume && ip_equal(&a->ip, &b->ip) && a->vol_touch == b->vol_touch &&
+           a->touch_threshold == b->touch_threshold && a->touch_hold_ms == b->touch_hold_ms;
 }
 
 /*

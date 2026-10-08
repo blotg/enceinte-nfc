@@ -19,7 +19,7 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Mises à jour automatiques | ✅ | Depuis les releases GitHub (ou votre serveur), au démarrage (+1 min) et toutes les N heures. Installation seulement quand l'enceinte est inactive. Retour automatique à l'ancienne version si la nouvelle ne démarre pas. |
 | Protocole MPD | ✅ partiel | Large sous-ensemble (cf. plus bas). MPD ne connaît qu'un **mot de passe**, pas d'identifiant. |
 | Point d'accès + portail captif | ✅ | Sortie d'usine ou Wi-Fi injoignable : réseau `Enceinte-XXXX`, la page de configuration s'ouvre seule. L'enceinte continue de chercher le Wi-Fi de la maison et y revient dès que possible (cf. plus bas). |
-| Boutons de volume sur l'enceinte | ✅ | Deux boutons poussoirs (+ et −), appui long = répétition. Volume entre 0 et le volume maximum, conservé après un redémarrage. |
+| Volume sur l'enceinte | ✅ | Deux touches tactiles cachées sous le bois (pièces de monnaie), ou deux boutons poussoirs. Maintien avant réaction contre les gestes involontaires des enfants. Volume entre 0 et le volume maximum, conservé après un redémarrage. |
 | Normalisation et compression | ✅ | Trois intensités chacune, en réglage général et carte par carte. Niveau égalisé entre playlists et morceaux, écarts réduits dans un morceau. |
 | Adresse IP fixe | ✅ | Adresse, masque, passerelle, DNS. Sans connexion administrateur à la nouvelle adresse sous 5 min, retour à l'ancienne configuration. |
 | Réglages et cartes sur la carte SD | ✅ | Une carte SD clonée se comporte dans une autre enceinte exactement comme dans la première. Export et import des réglages en JSON. |
@@ -56,16 +56,42 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Carte SD (SPI) | CS 5, MOSI 16, MISO 15, SCK 12 | 3V3 ; **5V** si le module a un régulateur (AMS1117) |
 | MAX98357A (I2S) | BCLK 3, LRC 1, DIN 9 | **5V** (puissance, ménage le régulateur 3,3 V) + 220 à 470 µF |
 | Réinitialisation usine | bouton BOOT (GPIO0) | |
-| Boutons de volume | **GPIO7** (+) et **GPIO6** (−), chacun relié à **GND** | aucune (tirage interne) |
+| Volume + et − | **GPIO7** (+) et **GPIO6** (−) : touches tactiles, ou boutons poussoirs vers **GND** | aucune |
 
 Les GPIO de l'ESP32-S3 ne tolèrent pas le 5 V. Les entrées I2S du MAX98357A acceptent le
 3,3 V même s'il est alimenté en 5 V.
 
-Boutons de volume : de simples boutons poussoirs (contact à la fermeture) entre la broche et
-GND, sans résistance (celle de l'ESP32 suffit). Avec des fils longs, un condensateur de 100 nF
-en parallèle sur chaque bouton évite les faux appuis. Broches et cran (5 par défaut) se
-règlent dans menuconfig ; -1 désactive un bouton. Éviter les broches de démarrage (0, 3, 45,
-46), de la PSRAM octale (33 à 37) et de l'USB (19, 20).
+### Volume sur l'enceinte : touches tactiles sous le bois
+
+Par défaut, GPIO7 (+) et GPIO6 (−) sont des **touches tactiles** (canaux tactiles 7 et 6 de
+l'ESP32-S3) : rien ne dépasse du panneau.
+
+- **Électrodes** : une pièce de 50 centimes (Ø 24,25 mm) ou un disque de cuivre ou de laiton
+  de 20 à 25 mm, soit à peu près la taille d'un bout de doigt.
+- **Logement** : par l'arrière du panneau, un lamage à fond plat qui laisse **1,5 à 2,5 mm** de
+  bois devant la pièce. Une mèche Forstner de 25 mm avec butée de profondeur (perceuse à
+  colonne) donne un fond plus régulier qu'un ciseau ; finir au ciseau si besoin. Plus le bois
+  restant est fin, plus la touche est sensible ; sous 1,5 mm il risque de marquer ou de fendre.
+- **Collage** : la pièce doit être plaquée contre le bois, sans lame d'air (colle époxy ou
+  néoprène sur toute la surface).
+- **Fil** : souder le fil sur la pièce (poncer la soudure, flux) ou le serrer sous un adhésif
+  cuivre. Fil court (moins de 20 cm), éloigné des fils du haut-parleur et des mains : le fil
+  lui-même est sensible. Une résistance de 470 Ω à 1 kΩ en série, près de l'ESP32, protège
+  l'entrée des décharges électrostatiques.
+- **Écartement** : au moins 4 cm entre les deux pièces. Un repère discret (point gravé,
+  pyrogravure, petite incrustation) aide les adultes à les trouver.
+
+*Réglages → Commandes de volume sur l'enceinte* : jauges en direct de chaque touche, seuil de
+déclenchement (2 % par défaut) et temps de maintien (0,8 s par défaut). Doigt posé, la jauge
+doit dépasser franchement le trait du seuil ; sans doigt, rester près de zéro. Contre les
+gestes involontaires des enfants : un effleurement ne fait rien, il faut maintenir le doigt ;
+les deux touches à la fois (main à plat) sont ignorées ; un appui de plus de 20 s (objet posé)
+aussi. La mesure de repos suit lentement l'humidité du bois.
+
+On peut aussi y choisir des **boutons poussoirs** (contact à la fermeture, entre la broche et
+GND, sans résistance). Broches, cran (5 par défaut) et valeurs par défaut se règlent dans
+menuconfig ; -1 désactive une commande. En mode tactile, seules les GPIO 1 à 14 conviennent ;
+éviter les broches de démarrage (0, 3, 45, 46), de la PSRAM octale (33 à 37) et de l'USB (19, 20).
 
 ### Quel port USB-C ?
 
@@ -144,11 +170,11 @@ absente à ce moment rapporterait ses réglages à son retour.
   (et le nombre de cartes de chaque sous-dossier).
 - **Bips** : deux bips = carte inconnue ; trois bips graves = dossier vide ou carte SD absente.
   Ils sont joués au volume réglé (volume 0 : aucun bip), à un niveau proche de celui de la musique.
-- **Volume** : curseur de l'onglet *Lecture*, boutons de l'enceinte ou application MPD. Il va
+- **Volume** : curseur de l'onglet *Lecture*, touches ou boutons de l'enceinte, ou application MPD. Il va
   de 0 au **volume maximum** (*Réglages → Enceinte*), affiché au bout du curseur, que rien ne
   peut dépasser ; baisser le maximum baisse aussi le volume s'il était au-dessus. Le volume
   est enregistré en flash une seconde après le dernier changement et retrouvé au démarrage.
-  Hors lecture, chaque appui sur un bouton fait un bip court au nouveau volume.
+  Hors lecture, chaque cran donné sur l'enceinte fait un bip court au nouveau volume.
 - **Musique** (onglet *Musique*) : envoyer des fichiers ou des dossiers entiers, créer,
   renommer, supprimer, écouter un dossier sans carte, et **déplacer** des fichiers ou des
   dossiers (bouton ↦, ou cases à cocher pour en déplacer ou supprimer plusieurs à la fois).
@@ -321,7 +347,7 @@ ces fichiers à chaque chargement (réponse 304 sans contenu tant que le firmwar
 | `pn532*.c`, `nfc.c` | Pilote PN532 (trames vérifiées, nombre d'essais borné, réinitialisation automatique), détection pose/retrait avec anti-rebond |
 | `player.c` | File d'attente, lecture SD anticipée (réservoir de 2 à 16 s), décodage, I2S, volume |
 | `dsp.c` | Normalisation, compression, limiteur |
-| `buttons.c` | Boutons de volume |
+| `buttons.c`, `touch_keys.c` | Volume sur l'enceinte : touches tactiles ou boutons poussoirs |
 | `controller.c`, `session.c` | Règles carte ↔ lecture (reprise, délai de 10 min) |
 | `cards.c`, `settings.c` | Associations et réglages en NVS (résistants aux coupures de courant) |
 | `backup.c`, `config_json.c` | Copie des réglages et associations sur la carte SD, export et import JSON |
@@ -340,8 +366,9 @@ test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 
 1. Tests unitaires des modules purs, avec de vrais fichiers audio générés par ffmpeg/lame :
    ID3v2.3/2.4/v1, pochette intégrée, FLAC, WAV, fichiers corrompus. Couvre aussi les trames
    PN532, la règle de reprise, le DNS captif, les chemins (traversée de répertoire), les
-   filtres MPD, la normalisation et la compression (signaux de synthèse), les adresses IP et
-   les réglages en JSON (valeurs invalides refusées).
+   filtres MPD, la normalisation et la compression (signaux de synthèse), les touches
+   tactiles (effleurement, maintien, main à plat, dérive due à l'humidité, objet posé), les
+   adresses IP et les réglages en JSON (valeurs invalides refusées).
 2. Le contrôleur de cartes avec le **vrai** lecteur ; FreeRTOS, l'I2S et le décodeur sont
    simulés. Scénarios : reprise, autre carte, carte inconnue, délai dépassé, playlist
    terminée, mode association, ordre aléatoire retrouvé à la reprise.

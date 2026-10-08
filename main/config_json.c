@@ -81,6 +81,10 @@ cJSON *config_to_json(const config_t *c, bool secrets)
     cJSON_AddBoolToObject(o, "shuffle", s->shuffle);
     cJSON_AddNumberToObject(o, "normalize", s->normalize);
     cJSON_AddNumberToObject(o, "compress", s->compress);
+    cJSON *ctl = cJSON_AddObjectToObject(o, "controls");
+    cJSON_AddStringToObject(ctl, "type", s->vol_touch ? "touch" : "buttons");
+    cJSON_AddNumberToObject(ctl, "touch_threshold_pct", s->touch_threshold / 10.0);
+    cJSON_AddNumberToObject(ctl, "touch_hold_ms", s->touch_hold_ms);
     cJSON_AddBoolToObject(o, "https", s->https_enabled);
     cJSON_AddStringToObject(o, "ota_url", s->ota_url);
     cJSON_AddNumberToObject(o, "ota_interval_h", s->ota_interval_h);
@@ -238,6 +242,30 @@ bool config_from_json(const cJSON *o, config_t *out, char *err, size_t errlen)
         FAIL("compression invalide (0 à %d)", SOUND_LEVEL_MAX);
     }
     s->compress = (uint8_t)v;
+    const cJSON *ctl = cJSON_GetObjectItem(o, "controls");
+    if (ctl) {
+        const cJSON *type = cJSON_GetObjectItem(ctl, "type");
+        const cJSON *thr = cJSON_GetObjectItem(ctl, "touch_threshold_pct");
+        if (!cJSON_IsObject(ctl) || (type && (!cJSON_IsString(type) || (strcmp(type->valuestring, "touch") != 0 &&
+                                                                         strcmp(type->valuestring, "buttons") != 0)))) {
+            FAIL("commandes de volume invalides (touch ou buttons)");
+        }
+        if (type) {
+            s->vol_touch = strcmp(type->valuestring, "touch") == 0;
+        }
+        if (thr) {
+            double p = cJSON_IsNumber(thr) ? thr->valuedouble * 10.0 : -1;
+            if (p < TOUCH_THRESHOLD_MIN - 0.01 || p > TOUCH_THRESHOLD_MAX + 0.01) {
+                FAIL("seuil des touches tactiles invalide (0,3 à 30 %%)");
+            }
+            s->touch_threshold = (uint16_t)(p + 0.5);
+        }
+        v = s->touch_hold_ms;
+        if (!get_int(ctl, "touch_hold_ms", 0, TOUCH_HOLD_MAX_MS, &v, &present)) {
+            FAIL("maintien des touches tactiles invalide (0 à 3000 ms)");
+        }
+        s->touch_hold_ms = (uint16_t)v;
+    }
     if (!get_str(o, "ota_url", s->ota_url, sizeof(s->ota_url), &present) ||
         (s->ota_url[0] && strncmp(s->ota_url, "http://", 7) != 0 && strncmp(s->ota_url, "https://", 8) != 0)) {
         FAIL("source des mises à jour invalide (http:// ou https://)");

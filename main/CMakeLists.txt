@@ -23,6 +23,7 @@ idf_component_register(
         "util.c"
         "dsp.c"
         "buttons.c"
+        "touch_keys.c"
         "config_json.c"
         "backup.c"
     INCLUDE_DIRS "."
@@ -34,5 +35,5 @@ idf_component_register(
         nvs_flash esp_wifi esp_netif esp_event esp_http_server esp_http_client
         esp_https_ota app_update fatfs sdmmc esp_driver_sdspi esp_driver_spi
         esp_driver_i2s esp_driver_uart esp_driver_gpio esp_timer json mbedtls
-        esp_partition lwip esp_https_server
+        esp_partition lwip esp_https_server esp_driver_touch_sens
 )

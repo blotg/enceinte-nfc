@@ -21,7 +21,8 @@ BUILD = "simulation"  # identifiant du firmware : le changer pendant que la page
 STATE = {"setup": False, "logged": True, "volume": 35, "playing": "play", "learning": False, "learn_at": 0,
          "resume_s": 600, "resume_after_other": False, "shuffle": False, "normalize": 2, "compress": 2,
          "max_volume": 80, "ap": False, "ip": {"mode": "dhcp", "address": "", "netmask": "", "gateway": "", "dns": ""},
-         "ip_test_until": 0, "ip_test_address": ""}
+         "ip_test_until": 0, "ip_test_address": "", "vol_touch": True, "touch_threshold_pct": 2.0,
+         "touch_hold_ms": 800}
 
 FILES = {
     "": [("Comptines", True, 0), ("Histoires du soir", True, 0), ("Musique classique", True, 0)],
@@ -151,6 +152,14 @@ class Handler(BaseHTTPRequestHandler):
             path = q.get("path", [""])[0]
             entries = [{"name": n, "dir": d, "size": s, "audio": n.endswith(".mp3")} for n, d, s in FILES.get(path, [])]
             return self.send_json({"path": path, "entries": entries, "total": 15_931_539_456, "free": 12_002_000_000})
+        if u.path == "/api/touch":  # doigt simulé sur « + » une seconde sur trois
+            plus = 4.6 if int(time.time()) % 3 == 0 else 0.2
+            thr = STATE["touch_threshold_pct"]
+            keys = [{"name": "+", "delta_pct": plus, "value": int(30000 * (1 + plus / 100)), "baseline": 30000,
+                     "touched": plus > thr},
+                    {"name": "-", "delta_pct": 0.1, "value": 29800, "baseline": 29770, "touched": False}]
+            return self.send_json({"touch": STATE["vol_touch"], "ok": STATE["vol_touch"], "threshold_pct": thr,
+                                   "keys": keys})
         if u.path == "/api/config/export":
             doc = {"format": "enceinte-reglages", "version": 1, "device": "A0B1C2D3E4F5",
                    "settings": {"hostname": "enceinte", "wifi": {"ssid": "Maison"}, "ip": STATE["ip"],
@@ -178,7 +187,9 @@ class Handler(BaseHTTPRequestHandler):
                                    "normalize": STATE["normalize"], "compress": STATE["compress"], "ip": STATE["ip"],
                                    "ip_current": {"address": "192.168.1.42", "netmask": "255.255.255.0",
                                                   "gateway": "192.168.1.1", "dns": "192.168.1.1"},
-                                   "ip_test_s": 300,
+                                   "ip_test_s": 300, "vol_touch": STATE["vol_touch"],
+                                   "touch_threshold_pct": STATE["touch_threshold_pct"],
+                                   "touch_hold_ms": STATE["touch_hold_ms"],
                                    "resume_s": STATE["resume_s"], "resume_after_other": STATE["resume_after_other"],
                                    "shuffle": STATE["shuffle"],
                                    "https_enabled": STATE.get("https", False), "https_active": STATE.get("https", False),
@@ -225,7 +236,8 @@ class Handler(BaseHTTPRequestHandler):
             FILES[b["path"]] = []
             return self.send_json({"ok": True})
         if u.path == "/api/settings":
-            for k in ("resume_s", "resume_after_other", "shuffle", "normalize", "compress", "max_volume"):
+            for k in ("resume_s", "resume_after_other", "shuffle", "normalize", "compress", "max_volume", "vol_touch",
+                      "touch_threshold_pct", "touch_hold_ms"):
                 if k in b:
                     STATE[k] = b[k]
             STATE["volume"] = min(STATE["volume"], STATE["max_volume"])

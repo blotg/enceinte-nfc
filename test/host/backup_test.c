@@ -25,7 +25,12 @@ int g_checks;
 
 /* ---------- Substituts : réglages, carte SD, réseau ---------- */
 
-static settings_t g_cfg = {.hostname = "enceinte", .ota_interval_h = 24, .max_volume = 100, .resume_timeout_s = 600};
+static settings_t g_cfg = {.hostname = "enceinte",
+                           .ota_interval_h = 24,
+                           .max_volume = 100,
+                           .resume_timeout_s = 600,
+                           .touch_threshold = 20,
+                           .touch_hold_ms = 800};
 static uint8_t g_admin[SETTINGS_PW_HASH_LEN], g_mpd[SETTINGS_PW_HASH_LEN];
 static void (*g_observer)(void);
 static bool g_mounted = true;

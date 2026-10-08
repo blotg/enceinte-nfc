@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "backup.h"
+#include "buttons.h"
 #include "cJSON.h"
 #include "cards.h"
 #include "changes.h"
@@ -1095,6 +1096,9 @@ static esp_err_t h_settings_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "max_volume", cfg.max_volume);
     cJSON_AddNumberToObject(root, "normalize", cfg.normalize);
     cJSON_AddNumberToObject(root, "compress", cfg.compress);
+    cJSON_AddBoolToObject(root, "vol_touch", cfg.vol_touch);
+    cJSON_AddNumberToObject(root, "touch_threshold_pct", cfg.touch_threshold / 10.0);
+    cJSON_AddNumberToObject(root, "touch_hold_ms", cfg.touch_hold_ms);
     char a[16];
     cJSON *ip = cJSON_AddObjectToObject(root, "ip");
     cJSON_AddStringToObject(ip, "mode", cfg.ip.static_ip ? "static" : "dhcp");
@@ -1182,6 +1186,19 @@ static esp_err_t h_settings_set(httpd_req_t *req)
             settings_set_sound((uint8_t)n, (uint8_t)c) != ESP_OK) {
             cJSON_Delete(body);
             return send_error(req, "400 Bad Request", "réglage du son invalide");
+        }
+    }
+    const cJSON *vt = cJSON_GetObjectItem(body, "vol_touch");
+    const cJSON *tt = cJSON_GetObjectItem(body, "touch_threshold_pct");
+    const cJSON *th = cJSON_GetObjectItem(body, "touch_hold_ms");
+    if (cJSON_IsBool(vt) || cJSON_IsNumber(tt) || cJSON_IsNumber(th)) {
+        bool touch = cJSON_IsBool(vt) ? cJSON_IsTrue(vt) : cfg.vol_touch;
+        double thr = cJSON_IsNumber(tt) ? tt->valuedouble * 10.0 + 0.5 : cfg.touch_threshold;
+        double hold = cJSON_IsNumber(th) ? th->valuedouble : cfg.touch_hold_ms;
+        if (thr < TOUCH_THRESHOLD_MIN || thr > TOUCH_THRESHOLD_MAX + 0.5 || hold < 0 || hold > TOUCH_HOLD_MAX_MS ||
+            settings_set_controls(touch, (uint16_t)thr, (uint16_t)hold) != ESP_OK) {
+            cJSON_Delete(body);
+            return send_error(req, "400 Bad Request", "réglage des touches invalide (seuil 0,3 à 30 %, maintien 0 à 3 s)");
         }
     }
     const cJSON *maxv = cJSON_GetObjectItem(body, "max_volume");
@@ -1280,6 +1297,31 @@ static esp_err_t h_wifi_set(httpd_req_t *req)
     }
     wifi_mgr_reconnect_later(1500);
     return send_ok(req);
+}
+
+/* Mesures des touches tactiles en direct, pour régler le seuil à travers le bois. */
+static esp_err_t h_touch(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    buttons_diag_t d;
+    buttons_get_diag(&d);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "touch", d.touch);
+    cJSON_AddBoolToObject(root, "ok", d.touch_ok);
+    cJSON_AddNumberToObject(root, "threshold_pct", d.threshold / 10.0);
+    cJSON *arr = cJSON_AddArrayToObject(root, "keys");
+    for (int i = 0; i < 2; i++) {
+        cJSON *k = cJSON_CreateObject();
+        cJSON_AddStringToObject(k, "name", i == 0 ? "+" : "-");
+        cJSON_AddNumberToObject(k, "delta_pct", d.key[i].delta_permille / 10.0);
+        cJSON_AddNumberToObject(k, "value", d.key[i].value);
+        cJSON_AddNumberToObject(k, "baseline", d.key[i].baseline);
+        cJSON_AddBoolToObject(k, "touched", d.key[i].touched);
+        cJSON_AddItemToArray(arr, k);
+    }
+    return send_json(req, root);
 }
 
 static esp_err_t h_wifi_switch(httpd_req_t *req)
@@ -1502,6 +1544,7 @@ static const httpd_uri_t s_uris[] = {
     {"/api/wifi/scan", HTTP_GET, h_wifi_scan, NULL},
     {"/api/wifi", HTTP_POST, h_wifi_set, NULL},
     {"/api/wifi/switch", HTTP_POST, h_wifi_switch, NULL},
+    {"/api/touch", HTTP_GET, h_touch, NULL},
     {"/api/network", HTTP_POST, h_network, NULL},
     {"/api/config/export", HTTP_GET, h_config_export, NULL},
     {"/api/config/import", HTTP_POST, h_config_import, NULL},
