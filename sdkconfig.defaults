@@ -62,7 +62,11 @@ CONFIG_AUDIO_DECODER_AMRNB_SUPPORT=n
 CONFIG_AUDIO_DECODER_AMRWB_SUPPORT=n
 CONFIG_AUDIO_DECODER_G711_SUPPORT=n
 
-# Mémoire : tampons TLS alloués à la demande (mises à jour HTTPS)
+# Mémoire : tampons TLS alloués à la demande (mises à jour HTTPS), par malloc : les gros
+# (16 Ko en réception) vont en PSRAM (seuil SPIRAM_MALLOC_ALWAYSINTERNAL), en RAM interne
+# s'il n'y a pas de PSRAM. Forcés en RAM interne (réglage par défaut d'ESP-IDF), ils
+# manquaient quand elle était morcelée : HTTPS de l'interface + mise à jour.
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y

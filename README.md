@@ -339,6 +339,8 @@ Source d'usine : `https://github.com/blotg/enceinte-nfc` (bouton « Valeur d'usi
 *Réglages → Mises à jour*). Elle lit la
 version dans l'en-tête du binaire de la dernière release stable, sans le télécharger en
 entier. Si elle est plus récente, elle attend la fin de la lecture, l'installe et redémarre.
+Si la vérification ou le téléchargement échoue (réseau, GitHub, mémoire), elle réessaie
+15 min plus tard, puis 30 min, 1 h… sans dépasser l'intervalle réglé.
 Si le nouveau firmware plante avant 30 s de fonctionnement, l'enceinte revient seule à
 l'ancienne version. Une tâche bloquée plus de 10 s fait aussi redémarrer l'enceinte (chien de
 garde).

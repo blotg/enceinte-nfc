@@ -32,6 +32,8 @@ static const char *TAG = "ota";
 #define BIT_CHECK BIT0
 #define FIRST_CHECK_DELAY_MS (60 * 1000)
 #define IDLE_POLL_MS (30 * 1000)
+#define OFFLINE_RETRY_MS (10 * 60 * 1000)
+#define RETRY_FIRST_MS (15 * 60 * 1000) /* après un échec : 15 min, puis 30 min, 1 h... */
 #define MANIFEST_MAX 2048
 
 static EventGroupHandle_t s_ev;
@@ -229,7 +231,39 @@ static bool device_idle(void)
            (ps.state == PLAYER_STOPPED || (ps.state == PLAYER_PAUSED && ps.paused_s >= 2 * 3600));
 }
 
-static void install(const char *bin_url, const char *expected_version)
+/*
+ * pdMS_TO_TICKS calcule sur 32 bits : à 1000 Hz il déborde au-delà de 71 min (24 h
+ * donnaient ~8 min entre deux vérifications).
+ */
+static TickType_t ms_to_ticks(uint64_t ms)
+{
+    uint64_t t = ms * configTICK_RATE_HZ / 1000;
+    return t < portMAX_DELAY ? (TickType_t)t : portMAX_DELAY - 1;
+}
+
+/* Après un échec (réseau, mémoire...) : nouvel essai de plus en plus espacé, sans dépasser
+ * l'intervalle normal. Le message d'erreur l'indique. */
+static TickType_t retry_wait(int *failures, TickType_t normal)
+{
+    int shift = *failures < 6 ? *failures : 6;
+    (*failures)++;
+    uint64_t ms = (uint64_t)RETRY_FIRST_MS << shift;
+    TickType_t t = ms_to_ticks(ms);
+    if (t >= normal) {
+        return normal;
+    }
+    char msg[sizeof(s_st.message)];
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    str_copy(msg, s_st.message, sizeof(msg));
+    xSemaphoreGive(s_lock);
+    unsigned minutes = (unsigned)(ms / 60000);
+    ESP_LOGW(TAG, "%s : nouvel essai dans %u min", msg, minutes);
+    set_state(OTA_ERROR, 0, "%.80s ; nouvel essai dans %u min", msg, minutes);
+    return t;
+}
+
+/* Retourne false en cas d'échec (à réessayer). */
+static bool install(const char *bin_url, const char *expected_version)
 {
     set_state(OTA_DOWNLOADING, 0, "téléchargement de la version %s", expected_version);
     esp_http_client_config_t http;
@@ -239,20 +273,20 @@ static void install(const char *bin_url, const char *expected_version)
     esp_err_t err = esp_https_ota_begin(&cfg, &h);
     if (err != ESP_OK) {
         set_state(OTA_ERROR, 0, "téléchargement impossible (%s)", esp_err_to_name(err));
-        return;
+        return false;
     }
     esp_app_desc_t desc;
     err = esp_https_ota_get_img_desc(h, &desc);
     if (err == ESP_OK && strcmp(desc.project_name, esp_app_get_description()->project_name) != 0) {
         set_state(OTA_ERROR, 0, "firmware d'un autre projet (%s)", desc.project_name);
         esp_https_ota_abort(h);
-        return;
+        return false;
     }
     if (err == ESP_OK && semver_cmp(desc.version, s_st.current_version) <= 0) {
         /* la release a pu changer depuis la vérification */
         set_state(OTA_IDLE, 0, "à jour (dernière version : %s)", desc.version);
         esp_https_ota_abort(h);
-        return;
+        return true;
     }
     while ((err = esp_https_ota_perform(h)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
         int total = esp_https_ota_get_image_size(h);
@@ -266,27 +300,30 @@ static void install(const char *bin_url, const char *expected_version)
     if (err != ESP_OK || !esp_https_ota_is_complete_data_received(h)) {
         esp_https_ota_abort(h);
         set_state(OTA_ERROR, 0, "téléchargement interrompu (%s)", esp_err_to_name(err));
-        return;
+        return false;
     }
     err = esp_https_ota_finish(h);
     if (err != ESP_OK) {
         set_state(OTA_ERROR, 0, "image invalide (%s)", esp_err_to_name(err));
-        return;
+        return false;
     }
     ESP_LOGI(TAG, "mise à jour %s installée, redémarrage", expected_version);
     set_state(OTA_REBOOTING, 100, "version %s installée, redémarrage", expected_version);
     ota_schedule_restart(2000);
+    return true;
 }
 
 static void ota_task(void *arg)
 {
-    TickType_t wait = pdMS_TO_TICKS(FIRST_CHECK_DELAY_MS);
+    TickType_t wait = ms_to_ticks(FIRST_CHECK_DELAY_MS);
     char version[32], bin_url[320];
+    int failures = 0;
     for (;;) {
         xEventGroupWaitBits(s_ev, BIT_CHECK, pdTRUE, pdFALSE, wait);
         settings_t cfg;
         settings_get(&cfg);
-        wait = pdMS_TO_TICKS((uint64_t)cfg.ota_interval_h * 3600 * 1000);
+        const TickType_t normal = ms_to_ticks((uint64_t)cfg.ota_interval_h * 3600 * 1000);
+        wait = normal;
         wifi_status_t ws;
         wifi_mgr_get_status(&ws);
         if (!cfg.ota_url[0]) {
@@ -295,7 +332,7 @@ static void ota_task(void *arg)
         }
         if (!ws.sta_connected) {
             set_state(OTA_IDLE, 0, "pas de connexion réseau");
-            wait = pdMS_TO_TICKS(10 * 60 * 1000); /* réessai dans 10 min */
+            wait = ms_to_ticks(OFFLINE_RETRY_MS);
             continue;
         }
         set_state(OTA_CHECKING, 0, "vérification...");
@@ -309,9 +346,11 @@ static void ota_task(void *arg)
         s_st.last_check = time(NULL);
         xSemaphoreGive(s_lock);
         if (!ok) {
+            wait = retry_wait(&failures, normal);
             continue;
         }
         if (semver_cmp(version, s_st.current_version) <= 0) {
+            failures = 0;
             set_state(OTA_IDLE, 0, "à jour (dernière version : %s)", version);
             xSemaphoreTake(s_lock, portMAX_DELAY);
             s_st.available_version[0] = '\0';
@@ -334,7 +373,9 @@ static void ota_task(void *arg)
             wait = 0;
             continue;
         }
-        install(bin_url, version);
+        if (!install(bin_url, version)) {
+            wait = retry_wait(&failures, normal);
+        }
     }
 }
 
