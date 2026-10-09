@@ -13,6 +13,7 @@
 #include "cJSON.h"
 #include "cards.h"
 #include "changes.h"
+#include "config_json.h"
 #include "controller.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -606,6 +607,9 @@ static esp_err_t h_status(httpd_req_t *req)
     player_get_sound(&normalize, &compress);
     cJSON_AddNumberToObject(p, "normalize", normalize);
     cJSON_AddNumberToObject(p, "compress", compress);
+    cJSON_AddNumberToObject(p, "sleep_tracks", ps.sleep_tracks);
+    cJSON_AddNumberToObject(p, "sleep_s", ps.sleep_s);
+    cJSON_AddBoolToObject(p, "sleep_done", ps.sleep_done);
     cJSON_AddBoolToObject(p, "repeat", ps.repeat);
     cJSON_AddBoolToObject(p, "random", ps.random);
     cJSON_AddStringToObject(p, "error", ps.error);
@@ -735,36 +739,11 @@ static esp_err_t h_cards_get(httpd_req_t *req)
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "cards");
     for (int i = 0; i < n; i++) {
-        cJSON *e = cJSON_CreateObject();
-        cJSON_AddStringToObject(e, "uid", list[i].uid);
-        cJSON_AddStringToObject(e, "folder", list[i].folder);
-        cJSON_AddBoolToObject(e, "exists", storage_is_dir(list[i].folder));
-        if (list[i].resume_s >= 0) {
-            cJSON_AddNumberToObject(e, "resume_s", list[i].resume_s);
-        } else {
-            cJSON_AddNullToObject(e, "resume_s");
+        cJSON *e = card_to_json(&list[i], true);
+        if (e) {
+            cJSON_AddBoolToObject(e, "exists", storage_is_dir(list[i].folder));
+            cJSON_AddItemToArray(arr, e);
         }
-        if (list[i].resume_other >= 0) {
-            cJSON_AddBoolToObject(e, "resume_other", list[i].resume_other == 1);
-        } else {
-            cJSON_AddNullToObject(e, "resume_other");
-        }
-        if (list[i].shuffle >= 0) {
-            cJSON_AddBoolToObject(e, "shuffle", list[i].shuffle == 1);
-        } else {
-            cJSON_AddNullToObject(e, "shuffle");
-        }
-        if (list[i].normalize >= 0) {
-            cJSON_AddNumberToObject(e, "normalize", list[i].normalize);
-        } else {
-            cJSON_AddNullToObject(e, "normalize");
-        }
-        if (list[i].compress >= 0) {
-            cJSON_AddNumberToObject(e, "compress", list[i].compress);
-        } else {
-            cJSON_AddNullToObject(e, "compress");
-        }
-        cJSON_AddItemToArray(arr, e);
     }
     free(list);
     cJSON_AddBoolToObject(root, "learning", cs.learning);
@@ -776,64 +755,25 @@ static esp_err_t h_cards_get(httpd_req_t *req)
     return send_json(req, root);
 }
 
-static bool uid_valid(const char *uid)
-{
-    size_t n = strlen(uid);
-    if (n < 8 || n >= UID_STR_MAX || n % 2) {
-        return false;
-    }
-    for (size_t i = 0; i < n; i++) {
-        if (!((uid[i] >= '0' && uid[i] <= '9') || (uid[i] >= 'A' && uid[i] <= 'F'))) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static esp_err_t h_cards_set(httpd_req_t *req)
 {
     if (!require_auth(req)) {
         return ESP_OK;
     }
     cJSON *body = read_json(req);
-    const char *uid = json_str(body, "uid");
-    const char *folder = json_str(body, "folder");
-    /* Réglages propres à la carte : absent ou null = réglage général. */
-    const cJSON *rs = cJSON_GetObjectItem(body, "resume_s");
-    const cJSON *ro = cJSON_GetObjectItem(body, "resume_other");
-    const cJSON *sh = cJSON_GetObjectItem(body, "shuffle");
-    const cJSON *no = cJSON_GetObjectItem(body, "normalize");
-    const cJSON *co = cJSON_GetObjectItem(body, "compress");
-    card_entry_t e = {.resume_s = CARD_DEFAULT,
-                      .resume_other = CARD_DEFAULT,
-                      .shuffle = CARD_DEFAULT,
-                      .normalize = CARD_DEFAULT,
-                      .compress = CARD_DEFAULT};
-    if (cJSON_IsNumber(rs) && rs->valuedouble >= 0 && rs->valuedouble <= 30 * 24 * 3600) {
-        e.resume_s = (int32_t)rs->valuedouble;
-    }
-    if (cJSON_IsBool(ro)) {
-        e.resume_other = cJSON_IsTrue(ro) ? 1 : 0;
-    }
-    if (cJSON_IsBool(sh)) {
-        e.shuffle = cJSON_IsTrue(sh) ? 1 : 0;
-    }
-    if (cJSON_IsNumber(no) && no->valueint >= 0 && no->valueint <= SOUND_LEVEL_MAX) {
-        e.normalize = (int8_t)no->valueint;
-    }
-    if (cJSON_IsNumber(co) && co->valueint >= 0 && co->valueint <= SOUND_LEVEL_MAX) {
-        e.compress = (int8_t)co->valueint;
-    }
+    /* Réglages propres à la carte : absent ou null = réglage général (mode sommeil : désactivé). */
+    card_entry_t e;
+    char msg[96];
     esp_err_t err = ESP_ERR_INVALID_ARG;
-    const char *msg = "carte ou dossier invalide";
-    if (uid && folder && uid_valid(uid) && path_sanitize(folder, e.folder, sizeof(e.folder)) && e.folder[0]) {
-        if (!storage_is_dir(e.folder)) {
-            msg = "dossier introuvable";
-        } else {
-            str_copy(e.uid, uid, sizeof(e.uid));
-            err = cards_set(&e);
-            msg = "enregistrement impossible";
+    if (!body || !card_from_json(body, &e, true, msg, sizeof(msg))) {
+        if (!body) {
+            str_copy(msg, "requête invalide", sizeof(msg));
         }
+    } else if (!storage_is_dir(e.folder)) {
+        str_copy(msg, "dossier introuvable", sizeof(msg));
+    } else {
+        err = cards_set(&e);
+        str_copy(msg, "enregistrement impossible", sizeof(msg));
     }
     cJSON_Delete(body);
     return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", msg);

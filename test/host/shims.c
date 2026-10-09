@@ -277,6 +277,7 @@ void vTaskDelete(TaskHandle_t t)
 
 static uint64_t s_frames;
 static uint32_t s_rate = 44100;
+static int s_level; /* plus grand échantillon (valeur absolue) de la dernière écriture */
 
 static int speedup(void)
 {
@@ -317,6 +318,12 @@ esp_err_t i2s_channel_write(i2s_chan_handle_t h, const void *src, size_t size, s
 {
     uint64_t frames = size / 4;
     __atomic_add_fetch(&s_frames, frames, __ATOMIC_RELAXED);
+    int level = 0;
+    for (size_t i = 0; i < size / 2; i++) {
+        int v = abs(((const int16_t *)src)[i]);
+        level = v > level ? v : level;
+    }
+    __atomic_store_n(&s_level, level, __ATOMIC_RELAXED);
     usleep((useconds_t)(frames * 1000000ULL / s_rate / speedup()));
     *written = size;
     return ESP_OK;
@@ -325,6 +332,11 @@ esp_err_t i2s_channel_write(i2s_chan_handle_t h, const void *src, size_t size, s
 uint64_t shim_i2s_frames_written(void)
 {
     return __atomic_load_n(&s_frames, __ATOMIC_RELAXED);
+}
+
+int shim_i2s_level(void)
+{
+    return __atomic_load_n(&s_level, __ATOMIC_RELAXED);
 }
 
 uint32_t shim_i2s_rate(void)

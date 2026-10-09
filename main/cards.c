@@ -20,6 +20,8 @@ typedef struct {
     int8_t shuffle;
     int8_t normalize;
     int8_t compress;
+    uint16_t sleep_tracks;
+    uint16_t sleep_minutes;
 } entry_t;
 
 static entry_t *s_entries;
@@ -76,16 +78,30 @@ static void entry_to_card(const entry_t *s, card_entry_t *d)
     d->shuffle = s->shuffle;
     d->normalize = s->normalize;
     d->compress = s->compress;
+    d->sleep_tracks = s->sleep_tracks;
+    d->sleep_minutes = s->sleep_minutes;
 }
 
-/* Format du blob : lignes "UID\tdossier\tdélai\tautre_carte\taléatoire\tnormalisation\tcompression\n".
- * Champs facultatifs après le dossier : absents des associations créées par les versions 1.0
- * à 1.3 (et ignorés par elles). */
+/* Réglages propres à la carte (dossier et UID exceptés). */
+static void set_options(entry_t *d, const card_entry_t *e)
+{
+    d->resume_s = e->resume_s;
+    d->resume_other = e->resume_other;
+    d->shuffle = e->shuffle;
+    d->normalize = e->normalize;
+    d->compress = e->compress;
+    d->sleep_tracks = e->sleep_tracks;
+    d->sleep_minutes = e->sleep_minutes;
+}
+
+/* Format du blob : lignes "UID\tdossier\tdélai\tautre_carte\taléatoire\tnormalisation\tcompression
+ * \tsommeil_morceaux\tsommeil_minutes\n". Champs facultatifs après le dossier : absents des
+ * associations créées par les versions précédentes (et ignorés par elles). */
 static esp_err_t save_locked(void)
 {
     size_t size = 1;
     for (int i = 0; i < s_count; i++) {
-        size += strlen(s_entries[i].uid) + strlen(s_entries[i].folder) + 40;
+        size += strlen(s_entries[i].uid) + strlen(s_entries[i].folder) + 52;
     }
     char *blob = malloc(size);
     if (!blob) {
@@ -94,8 +110,9 @@ static esp_err_t save_locked(void)
     size_t o = 0;
     for (int i = 0; i < s_count; i++) {
         const entry_t *e = &s_entries[i];
-        o += sprintf(blob + o, "%s\t%s\t%ld\t%d\t%d\t%d\t%d\n", e->uid, e->folder, (long)e->resume_s, e->resume_other,
-                     e->shuffle, e->normalize, e->compress);
+        o += sprintf(blob + o, "%s\t%s\t%ld\t%d\t%d\t%d\t%d\t%u\t%u\n", e->uid, e->folder, (long)e->resume_s,
+                     e->resume_other, e->shuffle, e->normalize, e->compress, (unsigned)e->sleep_tracks,
+                     (unsigned)e->sleep_minutes);
     }
     nvs_handle_t h;
     esp_err_t err = nvs_open_from_partition(CFG_PARTITION, "cards", NVS_READWRITE, &h);
@@ -140,11 +157,7 @@ static bool add_locked(const card_entry_t *e)
     entry_t *d = &s_entries[s_count];
     str_copy(d->uid, e->uid, UID_STR_MAX);
     d->folder = f;
-    d->resume_s = e->resume_s;
-    d->resume_other = e->resume_other;
-    d->shuffle = e->shuffle;
-    d->normalize = e->normalize;
-    d->compress = e->compress;
+    set_options(d, e);
     s_count++;
     return true;
 }
@@ -163,6 +176,12 @@ static int8_t parse_opt(const char *field, int max)
     }
     long v = strtol(field, NULL, 10);
     return v < 0 || v > max ? CARD_DEFAULT : (int8_t)v;
+}
+
+static uint16_t parse_count(const char *field, int max)
+{
+    long v = field ? strtol(field, NULL, 10) : 0;
+    return v < 0 || v > max ? 0 : (uint16_t)v;
 }
 
 esp_err_t cards_init(void)
@@ -189,8 +208,8 @@ esp_err_t cards_init(void)
     }
     char *save = NULL;
     for (char *line = strtok_r(blob, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        char *fields[7] = {line};
-        for (int i = 1; i < 7; i++) {
+        char *fields[9] = {line};
+        for (int i = 1; i < 9; i++) {
             char *tab = fields[i - 1] ? strchr(fields[i - 1], '\t') : NULL;
             if (tab) {
                 *tab = '\0';
@@ -206,6 +225,8 @@ esp_err_t cards_init(void)
             .shuffle = parse_opt(fields[4], 1),
             .normalize = parse_opt(fields[5], SOUND_LEVEL_MAX),
             .compress = parse_opt(fields[6], SOUND_LEVEL_MAX),
+            .sleep_tracks = parse_count(fields[7], SLEEP_TRACKS_MAX),
+            .sleep_minutes = parse_count(fields[8], SLEEP_MINUTES_MAX),
         };
         if (e.resume_s < 0) {
             e.resume_s = CARD_DEFAULT;
@@ -246,11 +267,7 @@ esp_err_t cards_set(const card_entry_t *e)
             changed_add(&changed, s_entries[i].folder);
             free(s_entries[i].folder);
             s_entries[i].folder = f;
-            s_entries[i].resume_s = e->resume_s;
-            s_entries[i].resume_other = e->resume_other;
-            s_entries[i].shuffle = e->shuffle;
-            s_entries[i].normalize = e->normalize;
-            s_entries[i].compress = e->compress;
+            set_options(&s_entries[i], e);
         } else {
             err = ESP_ERR_NO_MEM;
         }

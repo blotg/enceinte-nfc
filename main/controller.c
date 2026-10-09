@@ -68,6 +68,9 @@ static int64_t s_last_pos_us[MAX_POINTS];  /* dernière position (seule ou dans 
 static uint32_t s_saved_pos[MAX_POINTS];
 static uint32_t s_saved_hash[MAX_POINTS];
 static bool s_dirty[MAX_POINTS];
+/* mode sommeil transmis au lecteur pour la carte qui joue */
+static char s_sleep_uid[UID_STR_MAX];
+static uint16_t s_sleep_tracks, s_sleep_minutes;
 
 #define LOCK() xSemaphoreTake(s_lock, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(s_lock)
@@ -193,6 +196,52 @@ static int alloc_point(const char *uid)
 static bool point_is_live(int i)
 {
     return i >= 0 && i == s_live && s_points[i].queue_version == player_queue_version();
+}
+
+/* Mode sommeil de la carte : le décompte part de maintenant (pose de la carte). */
+static void apply_sleep(const char *uid)
+{
+    card_entry_t e;
+    uint16_t tracks = 0, minutes = 0;
+    if (cards_get(uid, &e)) {
+        tracks = e.sleep_tracks;
+        minutes = e.sleep_minutes;
+    }
+    str_copy(s_sleep_uid, uid, sizeof(s_sleep_uid));
+    s_sleep_tracks = tracks;
+    s_sleep_minutes = minutes;
+    player_set_sleep(tracks, (uint32_t)minutes * 60);
+    if (tracks) {
+        ESP_LOGI(TAG, "carte %s : mode sommeil, pause après %u morceau(x)", uid, (unsigned)tracks);
+    } else if (minutes) {
+        ESP_LOGI(TAG, "carte %s : mode sommeil, pause après %u min", uid, (unsigned)minutes);
+    }
+}
+
+/* Le mode sommeil ne vaut que pour la file de la carte (pas pour une lecture lancée depuis
+ * l'interface web ou une application) ; un réglage modifié pendant l'écoute relance le décompte. */
+static void track_sleep(void)
+{
+    if (!point_is_live(s_live)) {
+        if (s_sleep_uid[0]) {
+            s_sleep_uid[0] = '\0';
+            if (s_sleep_tracks || s_sleep_minutes) {
+                player_set_sleep(0, 0);
+            }
+            s_sleep_tracks = s_sleep_minutes = 0;
+        }
+        return;
+    }
+    const char *uid = s_points[s_live].uid;
+    card_entry_t e;
+    uint16_t tracks = 0, minutes = 0;
+    if (cards_get(uid, &e)) {
+        tracks = e.sleep_tracks;
+        minutes = e.sleep_minutes;
+    }
+    if (strcmp(uid, s_sleep_uid) != 0 || tracks != s_sleep_tracks || minutes != s_sleep_minutes) {
+        apply_sleep(uid);
+    }
 }
 
 static uint32_t fnv1a(const char *s)
@@ -345,6 +394,7 @@ static void play_folder_from(int pi, const char *folder, const char *track, uint
                  shuffle ? " en ordre aléatoire" : "", index + 1);
         player_play(index);
     }
+    apply_sleep(p->uid);
 }
 
 static void on_card_on(const char *uid)
@@ -398,6 +448,7 @@ static void on_card_on(const char *uid)
             ESP_LOGI(TAG, "reprise de la carte %s", uid);
             apply_sound(uid);
             player_pause(0);
+            apply_sleep(uid);
         }
         break;
     case SESSION_RESUME_SEEK: {
@@ -490,6 +541,7 @@ static void track_live_position(int64_t now)
 static void tick(int64_t now)
 {
     track_live_position(now);
+    track_sleep();
     apply_sound(point_is_live(s_live) ? s_points[s_live].uid : NULL); /* réglages modifiés entre-temps */
     for (int i = 0; i < MAX_POINTS; i++) {
         resume_point_t *p = &s_points[i];

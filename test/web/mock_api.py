@@ -56,13 +56,13 @@ def move(src, dst):
 
 CARDS = [
     {"uid": "04A1B2C3D4E5F6", "folder": "Comptines", "exists": True, "resume_s": None, "resume_other": None,
-     "shuffle": None, "normalize": None, "compress": None},
+     "shuffle": None, "normalize": None, "compress": None, "sleep_tracks": 3, "sleep_minutes": 0},
     {"uid": "0411223344", "folder": "Histoires du soir", "exists": True, "resume_s": 0, "resume_other": True,
-     "shuffle": True, "normalize": 3, "compress": 2},
+     "shuffle": True, "normalize": 3, "compress": 2, "sleep_tracks": 0, "sleep_minutes": 45},
     {"uid": "04BADA55", "folder": "Comptines", "exists": True, "resume_s": 300, "resume_other": None,
-     "shuffle": False, "normalize": None, "compress": None},
+     "shuffle": False, "normalize": None, "compress": None, "sleep_tracks": 0, "sleep_minutes": 0},
     {"uid": "04DEADBEEF", "folder": "Ancien dossier", "exists": False, "resume_s": None, "resume_other": None,
-     "shuffle": None, "normalize": None, "compress": None},
+     "shuffle": None, "normalize": None, "compress": None, "sleep_tracks": 0, "sleep_minutes": 0},
 ]
 
 
@@ -77,7 +77,8 @@ def status():
                    "artist": "Chorale des enfants", "album": "Comptines", "elapsed": (time.time() % 150),
                    "duration": 150.0, "seekable": True, "song": 1, "queue_len": 3, "volume": STATE["volume"],
                    "max_volume": STATE["max_volume"], "repeat": False, "random": False, "error": "",
-                   "normalize": STATE["normalize"], "compress": STATE["compress"]},
+                   "normalize": STATE["normalize"], "compress": STATE["compress"],
+                   "sleep_tracks": 2, "sleep_s": 0, "sleep_done": False},
         "card": {"reader_ok": True, "reader": "PN5180, firmware 4.0", "present": "04A1B2C3D4E5F6", "session": "04A1B2C3D4E5F6",
                  "folder": "Comptines", "resume_remaining": 0, "last_unknown": ""},
         "wifi": {"connected": not ap, "ssid": "Maison", "ip": "" if ap else "192.168.1.42", "rssi": -58, "ap": ap,
@@ -267,7 +268,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/cards":
             card = {"uid": b.get("uid"), "folder": b.get("folder"), "exists": True, "resume_s": b.get("resume_s"),
                     "resume_other": b.get("resume_other"), "shuffle": b.get("shuffle"),
-                    "normalize": b.get("normalize"), "compress": b.get("compress")}
+                    "normalize": b.get("normalize"), "compress": b.get("compress"),
+                    "sleep_tracks": b.get("sleep_tracks") or 0, "sleep_minutes": b.get("sleep_minutes") or 0}
             CARDS[:] = [c for c in CARDS if c["uid"] != card["uid"]] + [card]
             return self.send_json({"ok": True})
         if u.path == "/api/cards/delete":
