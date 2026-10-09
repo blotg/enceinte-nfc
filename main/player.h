@@ -45,6 +45,9 @@ typedef struct {
     uint8_t single; /* 0, 1, 2 = "oneshot" */
     bool seekable;
     uint32_t paused_s; /* durée de la pause en cours */
+    uint16_t sleep_tracks; /* mode sommeil : morceaux restants, celui-ci compris (0 : sans limite) */
+    uint32_t sleep_s;      /* mode sommeil : secondes de lecture restantes (0 : sans limite) */
+    bool sleep_done;       /* en pause à cause du mode sommeil */
     char file[REL_PATH_MAX];
     char error[96];
 } player_status_t;
@@ -113,6 +116,13 @@ int player_get_max_volume(void);
 /* Normalisation et compression (0 à 3, cf. dsp.h), appliquées dès le bloc suivant. */
 void player_set_sound(uint8_t normalize, uint8_t compress);
 void player_get_sound(uint8_t *normalize, uint8_t *compress);
+/*
+ * Mode sommeil : pause à la fin du "tracks"-ième morceau (le morceau en cours compte pour un),
+ * ou après "seconds" de lecture, avec un fondu sur les 15 dernières secondes. 0 : sans limite.
+ * Le décompte repart à chaque appel ; les pauses ne comptent pas ; un arrêt ou une nouvelle
+ * file l'annulent.
+ */
+void player_set_sleep(uint16_t tracks, uint32_t seconds);
 void player_set_repeat(bool on);
 void player_set_random(bool on);
 void player_set_single(uint8_t mode);

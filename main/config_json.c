@@ -329,6 +329,8 @@ cJSON *card_to_json(const card_entry_t *e, bool with_folder)
     add_opt_bool(o, "shuffle", e->shuffle);
     add_opt_int(o, "normalize", e->normalize);
     add_opt_int(o, "compress", e->compress);
+    cJSON_AddNumberToObject(o, "sleep_tracks", e->sleep_tracks);
+    cJSON_AddNumberToObject(o, "sleep_minutes", e->sleep_minutes);
     return o;
 }
 
@@ -345,6 +347,22 @@ static bool opt_int(const cJSON *o, const char *key, long hi, int32_t *out)
         return false;
     }
     *out = (int32_t)d;
+    return true;
+}
+
+/* Compteur facultatif : absent ou null = 0. */
+static bool opt_count(const cJSON *o, const char *key, long hi, uint16_t *out)
+{
+    const cJSON *it = cJSON_GetObjectItem(o, key);
+    if (!it || cJSON_IsNull(it)) {
+        *out = 0;
+        return true;
+    }
+    double d = cJSON_IsNumber(it) ? it->valuedouble : -1;
+    if (d < 0 || d > hi || d != (double)(long)d) {
+        return false;
+    }
+    *out = (uint16_t)d;
     return true;
 }
 
@@ -389,6 +407,11 @@ bool card_from_json(const cJSON *o, card_entry_t *e, bool with_folder, char *err
         !opt_bool(o, "shuffle", &e->shuffle) || !opt_int(o, "normalize", SOUND_LEVEL_MAX, &normalize) ||
         !opt_int(o, "compress", SOUND_LEVEL_MAX, &compress)) {
         FAIL("réglages invalides pour la carte %s", e->uid);
+    }
+    if (!opt_count(o, "sleep_tracks", SLEEP_TRACKS_MAX, &e->sleep_tracks) ||
+        !opt_count(o, "sleep_minutes", SLEEP_MINUTES_MAX, &e->sleep_minutes)) {
+        FAIL("mode sommeil invalide pour la carte %s (%d morceaux, %d minutes au plus)", e->uid, SLEEP_TRACKS_MAX,
+             SLEEP_MINUTES_MAX);
     }
     e->normalize = (int8_t)normalize;
     e->compress = (int8_t)compress;

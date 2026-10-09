@@ -15,6 +15,7 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Carte NFC → lecture d'un dossier | ✅ | MP3, AAC, M4A, FLAC, WAV, OGG/Opus. Sous-dossiers inclus, ordre « naturel » (2 avant 10) ou aléatoire (réglage général ou carte par carte). |
 | Lecteur NFC PN532 ou PN5180 | ✅ | Détecté automatiquement au démarrage. Le PN5180 porte plus loin et lit aussi les étiquettes ISO 15693 (ICODE SLIX). |
 | Pause au retrait, reprise sous 10 min | ✅ | Durée de conservation de la progression réglable (0 = sans limite), progression conservée ou non après une autre carte, en réglage général ou carte par carte. Une carte inconnue compte comme « une autre carte ». |
+| Mode sommeil par carte | ✅ | Pause après N morceaux ou N minutes d'écoute (fondu sonore), compté depuis la pose de la carte. |
 | Association dossier ↔ carte par l'interface web | ✅ | Mode association : la carte posée est capturée sans lancer la musique. Dossiers nommés librement (accents, espaces). |
 | Dépôt de fichiers par l'interface web | ✅ | Fichiers ou dossiers entiers, glisser-déposer. Débit limité par la carte SD en SPI. |
 | Mises à jour automatiques | ✅ | Depuis les releases GitHub (ou votre serveur), au démarrage (+1 min) et toutes les N heures. Installation seulement quand l'enceinte est inactive. Retour automatique à l'ancienne version si la nouvelle ne démarre pas. |
@@ -194,7 +195,7 @@ absente à ce moment rapporterait ses réglages à son retour.
   son identifiant (ex. `04ab53a96f2681`), s'il existe à la racine de la carte SD.
   Pour un sous-dossier : onglet *Musique*, ouvrir le dossier, « Associer une carte ».
   Le bouton ☰ d'une carte ouvre ses réglages : dossier, ordre de lecture, conservation de
-  la progression. L'onglet *Musique* montre aussi les cartes associées au dossier ouvert
+  la progression, son, mode sommeil. L'onglet *Musique* montre aussi les cartes associées au dossier ouvert
   (et le nombre de cartes de chaque sous-dossier).
 - **Bips** : deux bips = carte inconnue ; trois bips graves = dossier vide ou carte SD absente.
   Ils sont joués au volume réglé (volume 0 : aucun bip), à un niveau proche de celui de la musique.
@@ -232,6 +233,24 @@ Le traitement se fait avant le volume ; un limiteur empêche toute saturation.
 Sur un signal alternant passages forts et calmes (30 dB d'écart), il reste environ 22, 15 et
 7 dB d'écart selon l'intensité de la compression. Pour une lecture lancée depuis l'interface
 web ou une application MPD, ce sont les réglages généraux qui s'appliquent.
+
+### Mode sommeil
+
+Carte par carte (*Cartes → ☰ → Mode sommeil*) : la lecture se met en pause après un nombre
+de morceaux (1 à 999) ou une durée d'écoute (1 à 720 minutes).
+
+- Le décompte part de la pose de la carte. Les pauses (carte retirée, bouton pause) ne
+  comptent pas.
+- **En morceaux** : le morceau en cours à la pose compte pour un ; la pause tombe juste avant
+  le morceau suivant.
+- **En durée** : le son baisse doucement pendant les 15 dernières secondes, puis la lecture
+  se met en pause.
+- Carte laissée sur l'enceinte : rien ne repart. Retirer et reposer la carte reprend là où
+  la lecture s'était arrêtée (selon les règles de reprise de la carte), avec un nouveau
+  décompte.
+- L'onglet *Lecture* affiche ce qui reste avant la pause. Modifier le réglage pendant
+  l'écoute relance le décompte. Une lecture lancée depuis l'interface web ou une application
+  MPD n'est pas concernée.
 
 ### Adresse IP fixe
 
@@ -401,7 +420,8 @@ test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 
    adresses IP et les réglages en JSON (valeurs invalides refusées).
 2. Le contrôleur de cartes avec le **vrai** lecteur ; FreeRTOS, l'I2S et le décodeur sont
    simulés. Scénarios : reprise, autre carte, carte inconnue, délai dépassé, playlist
-   terminée, mode association, ordre aléatoire retrouvé à la reprise.
+   terminée, mode association, ordre aléatoire retrouvé à la reprise, mode sommeil (en
+   morceaux, en durée avec fondu, nouveau décompte quand la carte est reposée).
 3. Le **vrai** serveur MPD et le **vrai** lecteur, pilotés par un vrai client MPD (python-mpd2).
 4. La copie sur carte SD, avec deux enceintes simulées : première copie, carte clonée dans une
    enceinte sortie d'usine, dossiers déplacés et fichiers ajoutés sur un ordinateur, fichier

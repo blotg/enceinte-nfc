@@ -31,6 +31,7 @@ static const char *TAG = "player";
 #define PCM_FRAMES 512      /* trames converties par écriture I2S */
 #define CMD_WAIT_MS 2000
 #define MAX_FAIL_STREAK 10
+#define SLEEP_FADE_US (15LL * 1000000) /* mode sommeil : fondu sur les 15 dernières secondes */
 
 /* ---------- Structures ---------- */
 
@@ -97,6 +98,10 @@ static volatile bool s_dsp_reset; /* nouvelle playlist : la normalisation repart
 static bool s_repeat, s_random, s_consume, s_seekable;
 static uint8_t s_single;
 static char s_error[96];
+/* Mode sommeil (cf. player_set_sleep) */
+static int s_sleep_tracks; /* fins de morceau avant la pause, 0 : sans limite */
+static int64_t s_sleep_us; /* durée de lecture avant la pause, 0 : sans limite */
+static bool s_sleep_done;  /* lecture mise en pause par le mode sommeil */
 static media_info_t s_probe;
 static uint32_t s_probe_gen;
 
@@ -223,6 +228,22 @@ static bool remove_range_locked(int start, int end)
     }
     queue_changed_locked();
     return removed_current;
+}
+
+static void sleep_clear_locked(void)
+{
+    s_sleep_tracks = 0;
+    s_sleep_us = 0;
+    s_sleep_done = false;
+}
+
+/* Fin du décompte du mode sommeil : pause. */
+static void sleep_reached_locked(void)
+{
+    sleep_clear_locked();
+    s_sleep_done = true;
+    s_state = PLAYER_PAUSED;
+    s_paused_at_us = esp_timer_get_time();
 }
 
 static void update_gain_locked(void)
@@ -634,6 +655,7 @@ static void advance(bool natural)
     int cur = find_pos_locked(s_cur_id);
     int next = give_up ? -1 : compute_next_locked(cur, natural);
     uint32_t next_id = next >= 0 ? s_queue[next].id : 0;
+    bool sleep_now = natural && s_sleep_tracks > 0 && --s_sleep_tracks == 0;
     if (natural && s_consume && cur >= 0) {
         remove_range_locked(cur, cur + 1);
         s_removed_pos = -1; /* géré ici même */
@@ -652,8 +674,19 @@ static void advance(bool natural)
     }
     if (next_id) {
         start_song(next_id, 0);
+        if (sleep_now) {
+            /* Pause au début du morceau suivant : reposer la carte le lance. */
+            LOCK();
+            sleep_reached_locked();
+            UNLOCK();
+            ESP_LOGI(TAG, "mode sommeil : pause avant le morceau suivant");
+            changes_notify(CHG_PLAYER);
+        }
     } else {
         do_stop();
+        LOCK();
+        sleep_clear_locked();
+        UNLOCK();
         if (natural && !give_up && s_cb) {
             s_cb(PLAYER_EVT_QUEUE_END);
         }
@@ -670,6 +703,19 @@ static inline int32_t read_sample(const uint8_t *p, int bps)
     default:
         return (int32_t)((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24) >> 16;
     }
+}
+
+/* Gain du fondu de fin du mode sommeil ("left_us" de lecture restants). */
+static int32_t sleep_gain(int32_t gain, int64_t left_us)
+{
+    if (left_us >= SLEEP_FADE_US) {
+        return gain;
+    }
+    if (left_us <= 0) {
+        return 0;
+    }
+    float x = (float)left_us / (float)SLEEP_FADE_US;
+    return (int32_t)((float)gain * x * x);
 }
 
 static void output_pcm(const uint8_t *buf, uint32_t size)
@@ -707,9 +753,14 @@ static void output_pcm(const uint8_t *buf, uint32_t size)
     bool processing = s_fpcm && dsp_active(&s_dsp);
     uint32_t frames = size / (uint32_t)(bps * ch);
     const uint8_t *p = buf;
-    int32_t gain = s_gain_q15;
+    LOCK();
+    int64_t sleep_us = s_sleep_us;
+    UNLOCK();
+    uint32_t rate = s_rate ? s_rate : 44100;
+    int64_t played_us = 0;
     while (frames) {
         uint32_t n = frames > PCM_FRAMES ? PCM_FRAMES : frames;
+        int32_t gain = sleep_us > 0 ? sleep_gain(s_gain_q15, sleep_us - played_us) : s_gain_q15;
         for (uint32_t i = 0; i < n; i++) {
             int32_t l = read_sample(p, bps);
             int32_t r = ch > 1 ? read_sample(p + bps, bps) : l;
@@ -738,10 +789,23 @@ static void output_pcm(const uint8_t *buf, uint32_t size)
         i2s_write_frames(s_pcm, n);
         frames -= n;
         s_frames += n;
+        played_us += (int64_t)n * 1000000 / rate;
     }
+    bool slept = false;
     LOCK();
-    s_elapsed_ms = s_base_ms + (uint32_t)(s_frames * 1000 / (s_rate ? s_rate : 44100));
+    s_elapsed_ms = s_base_ms + (uint32_t)(s_frames * 1000 / rate);
+    if (s_sleep_us > 0) {
+        s_sleep_us = s_sleep_us > played_us ? s_sleep_us - played_us : 0;
+        if (s_sleep_us == 0) {
+            sleep_reached_locked();
+            slept = true;
+        }
+    }
     UNLOCK();
+    if (slept) {
+        ESP_LOGI(TAG, "mode sommeil : pause");
+        changes_notify(CHG_PLAYER);
+    }
 }
 
 static void track_failed(const char *msg)
@@ -855,6 +919,11 @@ static void decode_step(void)
 
 static void handle_cmd(const cmd_t *c)
 {
+    if (c->type != CMD_BEEP && c->type != CMD_CURRENT_REMOVED) {
+        LOCK();
+        s_sleep_done = false; /* commande de l'utilisateur : la pause n'est plus celle du mode sommeil */
+        UNLOCK();
+    }
     switch (c->type) {
     case CMD_PLAY_POS: {
         uint32_t id = 0;
@@ -905,6 +974,9 @@ static void handle_cmd(const cmd_t *c)
     }
     case CMD_STOP:
         do_stop();
+        LOCK();
+        sleep_clear_locked();
+        UNLOCK();
         break;
     case CMD_NEXT:
         if (s_state != PLAYER_STOPPED) {
@@ -980,8 +1052,17 @@ static void player_task(void *arg)
             continue;
         }
         if (s_skip_pending) {
+            /* Morceau illisible : le suivant est chargé, en pause si le lecteur l'était. */
             s_skip_pending = false;
+            bool paused = s_state == PLAYER_PAUSED;
             advance(false);
+            if (paused && s_state == PLAYER_PLAYING) {
+                LOCK();
+                s_state = PLAYER_PAUSED;
+                s_paused_at_us = esp_timer_get_time();
+                UNLOCK();
+                changes_notify(CHG_PLAYER);
+            }
             continue;
         }
         if (s_state == PLAYER_PLAYING) {
@@ -1070,6 +1151,9 @@ void player_get_status(player_status_t *st)
     st->single = s_single;
     st->seekable = s_seekable;
     st->paused_s = s_state == PLAYER_PAUSED ? (uint32_t)((esp_timer_get_time() - s_paused_at_us) / 1000000) : 0;
+    st->sleep_tracks = (uint16_t)s_sleep_tracks;
+    st->sleep_s = (uint32_t)((s_sleep_us + 999999) / 1000000);
+    st->sleep_done = s_sleep_done && s_state == PLAYER_PAUSED;
     if (cur >= 0) {
         str_copy(st->file, s_queue[cur].path, sizeof(st->file));
     }
@@ -1254,6 +1338,7 @@ esp_err_t player_queue_replace(const path_list_t *list)
         s_queue[i].id = s_next_id++;
     }
     s_removed_pos = -1;
+    sleep_clear_locked();
     queue_changed_locked();
     UNLOCK();
     s_dsp_reset = true;
@@ -1420,6 +1505,16 @@ void player_get_sound(uint8_t *normalize, uint8_t *compress)
 {
     *normalize = s_normalize;
     *compress = s_compress;
+}
+
+void player_set_sleep(uint16_t tracks, uint32_t seconds)
+{
+    LOCK();
+    s_sleep_tracks = tracks;
+    s_sleep_us = (int64_t)seconds * 1000000;
+    s_sleep_done = false;
+    UNLOCK();
+    changes_notify(CHG_PLAYER);
 }
 
 #define SET_OPTION(var, value)        \

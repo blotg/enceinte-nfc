@@ -307,6 +307,7 @@ static void first_boot(void)
     cards_init();
     card_entry_t a = entry("04AAAAAA", "Comptines"), b = entry("04BBBBBB", "Histoires/Contes");
     b.normalize = 3;
+    b.sleep_minutes = 45;
     CHECK(cards_set(&a) == ESP_OK && cards_set(&b) == ESP_OK);
     strcpy(g_cfg.hostname, "salon");
     g_cfg.admin_set = true;
@@ -349,6 +350,7 @@ static void clone_boot(void)
     CHECK(card_in("04CCCCCC", "Comptines"));
     card_entry_t b;
     CHECK(cards_get("04BBBBBB", &b) && strcmp(b.folder, "Histoires/Contes") == 0 && b.normalize == 3);
+    CHECK(b.sleep_minutes == 45 && b.sleep_tracks == 0); /* mode sommeil recopié sur la carte SD */
     CHECK_STR(root_str("device"), "A0B1C2000002"); /* la carte SD est désormais celle de la n°2 */
 }
 
@@ -357,6 +359,8 @@ static void sd_edits(void)
 {
     boot("nvs2", 2);
     CHECK(card_count() == 2);
+    card_entry_t bb;
+    CHECK(cards_get("04BBBBBB", &bb) && bb.sleep_minutes == 45); /* relu depuis la NVS */
     g_mounted = false;
     char a[512], b[512];
     sd_path("Histoires", a, sizeof(a));

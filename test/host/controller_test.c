@@ -20,6 +20,7 @@ int g_checks;
 void mock_set_resume(uint32_t timeout_s, bool after_other);
 void mock_set_shuffle(bool on);
 void mock_set_sound(uint8_t normalize, uint8_t compress);
+int shim_i2s_level(void);
 
 /* Mémoire permanente simulée : passe par la vraie sérialisation */
 static uint8_t g_store[16][600];
@@ -94,8 +95,10 @@ static bool wait_stored(const char *uid, const char *track, bool removed, resume
 }
 
 /* Associations simulées ; la carte EE reprend même après une autre carte (réglage propre),
- * la carte SS aussi, lit son dossier dans un ordre aléatoire et compresse le son (niveau 2). */
+ * la carte SS aussi, lit son dossier dans un ordre aléatoire et compresse le son (niveau 2).
+ * Mode sommeil : ZZ s'arrête après un morceau, TT après g_tt_minutes d'écoute. */
 static char g_ee_folder[64] = "Livre";
+static uint16_t g_tt_minutes = 1;
 
 bool cards_get(const char *uid, card_entry_t *out)
 {
@@ -103,10 +106,15 @@ bool cards_get(const char *uid, card_entry_t *out)
                     : strcmp(uid, "BB") == 0 ? "Comptines"
                     : strcmp(uid, "EE") == 0 ? g_ee_folder
                     : strcmp(uid, "SS") == 0 ? "Melange"
+                    : strcmp(uid, "ZZ") == 0 ? "Comptines"
+                    : strcmp(uid, "TT") == 0 ? "Sommeil"
                                              : NULL;
     if (!f) {
         return false;
     }
+    memset(out, 0, sizeof(*out));
+    out->sleep_tracks = strcmp(uid, "ZZ") == 0 ? 1 : 0;
+    out->sleep_minutes = strcmp(uid, "TT") == 0 ? g_tt_minutes : 0;
     snprintf(out->uid, sizeof(out->uid), "%s", uid);
     snprintf(out->folder, sizeof(out->folder), "%s", f);
     out->resume_s = CARD_DEFAULT;
@@ -162,6 +170,32 @@ static void make_file(const char *path, size_t size)
     fclose(f);
 }
 
+/* Fichier « audio » non silencieux : le décodeur simulé en fait des échantillons de 8192. */
+static void make_loud_file(const char *path, size_t size)
+{
+    FILE *f = fopen(path, "wb");
+    char *buf = malloc(size);
+    for (size_t i = 0; i < size; i += 2) {
+        buf[i] = 0x00;
+        buf[i + 1] = 0x20;
+    }
+    fwrite(buf, 1, size, f);
+    free(buf);
+    fclose(f);
+}
+
+static bool wait_sleep_done(int ms)
+{
+    for (int i = 0; i < ms / 10; i++) {
+        player_status_t s = status();
+        if (s.state == PLAYER_PAUSED && s.sleep_done) {
+            return true;
+        }
+        usleep(10000);
+    }
+    return false;
+}
+
 static void card(bool on, const char *uid)
 {
     controller_on_nfc(on, uid);
@@ -191,6 +225,10 @@ int main(int argc, char **argv)
         snprintf(p, sizeof(p), "%s/Melange/%d.mp3", sd, i);
         make_file(p, 3 << 20); /* ~18 s simulées, ~0,9 s réelles */
     }
+    snprintf(p, sizeof(p), "%s/Sommeil", sd);
+    mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/Sommeil/berceuse.mp3", sd);
+    make_loud_file(p, 36 << 20); /* ~210 s simulées, ~10,5 s réelles */
 
     /* Livre audio de deux fichiers WAV réels (repositionnables), si disponibles */
     bool have_wav = argc > 1;
@@ -525,6 +563,64 @@ int main(int argc, char **argv)
     player_set_volume(-5);
     CHECK(player_get_volume() == 0);
     player_set_max_volume(100);
+
+    /* 17. Mode sommeil, en nombre de morceaux : pause au début du morceau suivant */
+    player_set_volume(50);
+    card(true, "ZZ");
+    CHECK(wait_state(PLAYER_PLAYING, 1000));
+    CHECK_STR(status().file, "Comptines/a.mp3");
+    CHECK(status().sleep_tracks == 1);
+    CHECK(wait_sleep_done(2500));
+    player_status_t zs = status();
+    CHECK_STR(zs.file, "Comptines/b.mp3");
+    CHECK(zs.elapsed_ms < 500 && zs.sleep_tracks == 0);
+    usleep(1200000);
+    CHECK(status().state == PLAYER_PAUSED); /* carte toujours posée : rien ne repart */
+    /* reposée : reprise au morceau suivant avec un nouveau décompte, puis fin de la playlist */
+    card(false, "ZZ");
+    card(true, "ZZ");
+    CHECK(wait_state(PLAYER_PLAYING, 1000));
+    CHECK_STR(status().file, "Comptines/b.mp3");
+    CHECK(status().sleep_tracks == 1 && !status().sleep_done);
+    CHECK(wait_state(PLAYER_STOPPED, 2500));
+    CHECK(status().sleep_tracks == 0 && !status().sleep_done);
+    card(false, "ZZ");
+
+    /* 18. Mode sommeil, en durée d'écoute (1 min simulée) : fondu, puis pause */
+    card(true, "TT");
+    CHECK(wait_state(PLAYER_PLAYING, 1000));
+    CHECK(status().sleep_s >= 58 && status().sleep_s <= 60);
+    usleep(600000);
+    int loud = shim_i2s_level();
+    CHECK(loud > 1500); /* 8192 au volume 50 (gain 0,25) */
+    bool faded = false;
+    for (int i = 0; i < 1000 && !faded; i++) { /* ~2,4 s réelles avant la fin du décompte */
+        player_status_t s = status();
+        faded = s.state == PLAYER_PLAYING && s.sleep_s > 0 && s.sleep_s <= 5;
+        usleep(5000);
+    }
+    CHECK(faded);
+    CHECK(shim_i2s_level() < loud / 3);
+    CHECK(wait_sleep_done(1500));
+    uint32_t slept_at = status().elapsed_ms;
+    CHECK(slept_at >= 59000 && slept_at <= 62000);
+    /* les pauses ne comptent pas ; reposée, la carte repart au même endroit pour 1 min */
+    card(false, "TT");
+    card(true, "TT");
+    CHECK(wait_state(PLAYER_PLAYING, 1000));
+    CHECK(status().elapsed_ms >= slept_at && status().sleep_s >= 58);
+    usleep(300000);
+    CHECK(shim_i2s_level() > 1500); /* volume normal après le fondu */
+    /* réglage modifié pendant l'écoute : nouveau décompte (tic d'1 s) */
+    g_tt_minutes = 2;
+    usleep(1300000);
+    CHECK(status().sleep_s >= 80); /* sans ce changement : moins de 30 s */
+    /* file modifiée depuis une application : le mode sommeil de la carte ne s'applique plus */
+    player_queue_add("Comptines/a.mp3", -1, NULL);
+    usleep(1300000);
+    CHECK(status().state == PLAYER_PLAYING && status().sleep_s == 0 && status().sleep_tracks == 0);
+    card(false, "TT");
+    player_stop();
 
     printf("contrôleur : %d vérifications, %d échec(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

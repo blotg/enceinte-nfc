@@ -116,8 +116,18 @@ function cardRules(c) {
   else if (other) rules.push('progression conservée ' + other);
   if (isSet(c.normalize)) rules.push('normalisation ' + SOUND_LEVELS[c.normalize]);
   if (isSet(c.compress)) rules.push('compression ' + SOUND_LEVELS[c.compress]);
+  if (c.sleep_tracks) rules.push(`mode sommeil : ${plural(c.sleep_tracks, 'morceau', 'morceaux')}`);
+  else if (c.sleep_minutes) rules.push(`mode sommeil : ${fmtMinutes(c.sleep_minutes)}`);
   return rules;
 }
+
+function plural(n, one, many) { return `${n} ${n > 1 ? many : one}`; }
+function fmtMinutes(m) {
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h` + (m % 60 ? ' ' + String(m % 60).padStart(2, '0') : '');
+}
+
+const SLEEP_MAX = { tracks: 999, minutes: 720 };
+const SLEEP_DEFAULT = { tracks: 3, minutes: 30 };
 
 function joinPath(a, b) { return a ? a + '/' + b : b; }
 function baseName(p) { return p.split('/').pop(); }
@@ -471,6 +481,7 @@ function renderPlay() {
   v.volLabel = h('span', { class: 'vol-val' });
   v.volMax = h('span', { title: 'Volume maximum, réglable dans Réglages → Enceinte' });
   v.sound = h('p', { class: 'small muted', hidden: true });
+  v.sleep = h('p', { class: 'small muted', hidden: true });
   let volTimer = null;
   v.vol.addEventListener('input', () => {
     v.volDragging = true;
@@ -509,6 +520,13 @@ function renderPlay() {
       p.compress ? 'compression ' + SOUND_LEVELS[p.compress] : ''].filter(Boolean);
     v.sound.hidden = !sound.length;
     v.sound.textContent = 'Son : ' + sound.join(', ');
+    let sleep = '';
+    if (p.sleep_done) sleep = 'Mode sommeil : lecture en pause. Retirez et reposez la carte pour continuer.';
+    else if (p.sleep_tracks === 1) sleep = 'Mode sommeil : pause à la fin de ce morceau.';
+    else if (p.sleep_tracks > 1) sleep = `Mode sommeil : pause dans ${p.sleep_tracks} morceaux, celui-ci compris.`;
+    else if (p.sleep_s > 0) sleep = `Mode sommeil : pause dans ${fmtTime(p.sleep_s)} d'écoute.`;
+    v.sleep.hidden = !sleep;
+    v.sleep.textContent = sleep;
     v.err.hidden = !p.error;
     v.err.textContent = p.error;
     const c = st.card;
@@ -540,7 +558,7 @@ function renderPlay() {
       h('div', { class: 'vol' }, h('span', { 'aria-hidden': 'true' }, '🔈'),
         h('div', { class: 'vol-track' }, v.vol, h('div', { class: 'vol-scale' }, h('span', null, '0'), v.volMax)),
         v.volLabel),
-      v.sound),
+      v.sound, v.sleep),
     v.card, v.err);
   app.view = v;
   if (app.status) v.update(app.status);
@@ -642,9 +660,36 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
         name[0].toUpperCase() + name.slice(1))));
     const normSel = levelSel(card ? card.normalize : null, defaults.normalize);
     const compSel = levelSel(card ? card.compress : null, defaults.compress);
+    const cur = { tracks: (card && card.sleep_tracks) || 0, minutes: (card && card.sleep_minutes) || 0 };
+    const sleepSel = h('select', null,
+      h('option', { value: '', selected: !cur.tracks && !cur.minutes }, 'Désactivé'),
+      h('option', { value: 'tracks', selected: cur.tracks > 0 }, 'Pause après un nombre de morceaux'),
+      h('option', { value: 'minutes', selected: !cur.tracks && cur.minutes > 0 }, 'Pause après une durée d\'écoute'));
+    const sleepNum = h('input', { type: 'number', class: 'short', min: 1, step: 1, inputmode: 'numeric',
+      'aria-label': 'Mode sommeil', value: cur.tracks || cur.minutes || '' });
+    const sleepUnit = h('span');
+    const sleepRow = h('div', { class: 'row' }, sleepNum, sleepUnit);
+    const syncSleep = () => {
+      const m = sleepSel.value;
+      sleepRow.hidden = !m;
+      if (!m) return;
+      sleepNum.max = SLEEP_MAX[m];
+      sleepUnit.textContent = m === 'tracks' ? 'morceau(x)' : 'minutes d\'écoute';
+    };
+    sleepSel.addEventListener('change', () => {
+      if (sleepSel.value) sleepNum.value = cur[sleepSel.value] || SLEEP_DEFAULT[sleepSel.value];
+      syncSleep();
+    });
+    syncSleep();
     const save = h('button', { class: 'primary' }, card ? 'Enregistrer' : 'Associer');
     save.addEventListener('click', () => busy(save, async () => {
       if (!sel.value) { toast('Choisissez un dossier', true); return; }
+      const sleepMode = sleepSel.value;
+      const sleepN = sleepMode ? Number(sleepNum.value) : 0;
+      if (sleepMode && !(Number.isInteger(sleepN) && sleepN >= 1 && sleepN <= SLEEP_MAX[sleepMode])) {
+        toast(`Mode sommeil : nombre entre 1 et ${SLEEP_MAX[sleepMode]}`, true);
+        return;
+      }
       await post('/api/cards', {
         uid, folder: sel.value,
         resume_s: delaySel.value === '' ? null : Number(delaySel.value),
@@ -652,6 +697,8 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
         shuffle: shuffleSel.value === '' ? null : shuffleSel.value === '1',
         normalize: normSel.value === '' ? null : Number(normSel.value),
         compress: compSel.value === '' ? null : Number(compSel.value),
+        sleep_tracks: sleepMode === 'tracks' ? sleepN : 0,
+        sleep_minutes: sleepMode === 'minutes' ? sleepN : 0,
       });
       toast(card ? 'Carte modifiée' : 'Carte associée');
       onDone();
@@ -666,6 +713,11 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
       h('label', null, 'Si une autre carte est posée entre-temps'), otherSel,
       h('label', null, 'Normalisation ', h('span', { class: 'muted' }, '(volume égalisé entre les morceaux)')), normSel,
       h('label', null, 'Compression ', h('span', { class: 'muted' }, '(écarts de volume réduits dans un morceau)')), compSel,
+      h('label', null, 'Mode sommeil ', h('span', { class: 'muted' }, '(compté depuis la pose de la carte)')), sleepSel,
+      sleepRow,
+      h('p', { class: 'muted small' }, 'En nombre de morceaux, la pause tombe entre deux morceaux ; en durée, le son baisse '
+        + 'doucement pendant les 15 dernières secondes. Retirer et reposer la carte reprend là où la lecture s\'était '
+        + 'arrêtée, avec un nouveau décompte.'),
       h('div', { class: 'row end actions' }, cancel, save));
   };
 

@@ -152,7 +152,12 @@ static void test_document(void)
 
 static void test_cards(void)
 {
-    card_entry_t e = {.resume_s = 0, .resume_other = 1, .shuffle = CARD_DEFAULT, .normalize = 3, .compress = CARD_DEFAULT};
+    card_entry_t e = {.resume_s = 0,
+                      .resume_other = 1,
+                      .shuffle = CARD_DEFAULT,
+                      .normalize = 3,
+                      .compress = CARD_DEFAULT,
+                      .sleep_tracks = 4};
     strcpy(e.uid, "04AB53A96F2681");
     strcpy(e.folder, "Histoires/Été");
     cJSON *o = card_to_json(&e, true);
@@ -167,7 +172,7 @@ static void test_cards(void)
     CHECK_STR(f.uid, e.uid);
     CHECK_STR(f.folder, e.folder);
     CHECK(f.resume_s == 0 && f.resume_other == 1 && f.shuffle == CARD_DEFAULT && f.normalize == 3 &&
-          f.compress == CARD_DEFAULT);
+          f.compress == CARD_DEFAULT && f.sleep_tracks == 4 && f.sleep_minutes == 0);
     CHECK(cards_entry_valid(&f));
     /* Fichier d'un dossier : sans chemin, clés absentes = réglage général, minuscules acceptées */
     o = cJSON_Parse("{\"uid\": \"04ab53a9\"}");
@@ -175,13 +180,23 @@ static void test_cards(void)
     cJSON_Delete(o);
     CHECK_STR(f.uid, "04AB53A9");
     CHECK(f.resume_s == CARD_DEFAULT && f.shuffle == CARD_DEFAULT && f.compress == CARD_DEFAULT);
+    CHECK(f.sleep_tracks == 0 && f.sleep_minutes == 0); /* fichiers des versions précédentes */
+    o = cJSON_Parse("{\"uid\": \"04ab53a9\", \"sleep_minutes\": 720, \"sleep_tracks\": null}");
+    CHECK(card_from_json(o, &f, false, err, sizeof(err)));
+    cJSON_Delete(o);
+    CHECK(f.sleep_minutes == 720 && f.sleep_tracks == 0);
     const char *bad[] = {
         "{\"uid\": \"04AB\"}",
         "{\"uid\": \"04AB53A96\"}",
         "{\"uid\": \"04AB53ZZ\"}",
-        "{\"uid\": \"04AB53A9\", \"compress\": 4}",
-        "{\"uid\": \"04AB53A9\", \"shuffle\": 1}",
-        "{\"uid\": \"04AB53A9\", \"resume_s\": -5}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"compress\": 4}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"shuffle\": 1}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"resume_s\": -5}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"sleep_tracks\": 1000}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"sleep_minutes\": 721}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"sleep_minutes\": 2.5}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"sleep_tracks\": -1}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"sleep_tracks\": \"3\"}",
         "{\"uid\": \"04AB53A9\", \"folder\": \"../etc\"}",
         "{\"uid\": \"04AB53A9\"}", /* dossier exigé à l'export */
     };
@@ -190,6 +205,10 @@ static void test_cards(void)
         CHECK(!card_from_json(o, &f, true, err, sizeof(err)));
         cJSON_Delete(o);
     }
+    /* Les cas refusés le sont pour leur réglage, pas pour le dossier */
+    o = cJSON_Parse("{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"sleep_tracks\": 999}");
+    CHECK(card_from_json(o, &f, true, err, sizeof(err)));
+    cJSON_Delete(o);
 }
 
 void test_config_json(void)
