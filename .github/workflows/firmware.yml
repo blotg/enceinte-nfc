@@ -28,10 +28,14 @@ jobs:
           PYTHON: ${{ runner.temp }}/venv/bin/python
         run: test/host/run_tests.sh "$RUNNER_TEMP/tests"
 
+  # ESP-IDF est installé directement (et mis en cache) plutôt que par l'image Docker
+  # espressif/idf : Docker Hub limite les téléchargements anonymes et la refusait
+  # régulièrement aux machines de GitHub (« toomanyrequests »).
   build:
     name: Compilation ESP-IDF
     runs-on: ubuntu-24.04
-    container: espressif/idf:v5.5.5
+    env:
+      IDF_VERSION: v5.5.5
     steps:
       - uses: actions/checkout@v7
       - name: Cohérence du tag et de version.txt
@@ -44,11 +48,27 @@ jobs:
             echo "::error::le tag $GITHUB_REF_NAME ne correspond pas à version.txt ($version)"
             exit 1
           fi
+      - name: Version de Python (clé du cache)
+        id: py
+        run: echo "version=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" >> "$GITHUB_OUTPUT"
+      - name: Cache d'ESP-IDF
+        id: idf-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/esp-idf
+            ~/.espressif
+          key: esp-idf-${{ env.IDF_VERSION }}-esp32s3-py${{ steps.py.outputs.version }}-${{ runner.os }}
+      - name: Installation d'ESP-IDF
+        if: steps.idf-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$IDF_VERSION" --recursive --shallow-submodules \
+            https://github.com/espressif/esp-idf.git ~/esp-idf
+          ~/esp-idf/install.sh esp32s3
       - name: Compilation
         shell: bash
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          . "$IDF_PATH/export.sh"
+          . ~/esp-idf/export.sh
           idf.py set-target esp32s3
           idf.py build
           idf.py merge-bin -o enceinte-complet.bin
