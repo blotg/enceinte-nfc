@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "log_buffer.h"
 #include "lwip/sockets.h"
 #include "media_info.h"
 #include "mpd_proto.h"
@@ -63,6 +64,7 @@ typedef struct {
 
 static volatile int s_clients;
 static int64_t s_start_us;
+static uint32_t s_stack_low = UINT32_MAX; /* d'un client à l'autre (même taille de pile) */
 
 /* ======================= Sortie ======================= */
 
@@ -302,17 +304,23 @@ static void out_meta(client_t *c, const song_meta_t *m)
     }
 }
 
+/* Webradio : le titre diffusé par la radio, pour le morceau en cours. À part (noinline) : le
+ * statut du lecteur est gros et ne doit pas peser sur la pile de chaque morceau listé. */
+static void __attribute__((noinline)) out_stream_title(client_t *c, const char *rel)
+{
+    player_status_t st;
+    player_get_status(&st);
+    if (st.stream && st.stream_title[0] && strcmp(st.file, rel) == 0) {
+        out_pair(c, "Title", st.stream_title);
+    }
+}
+
 static void out_song(client_t *c, const char *rel, int pos, uint32_t id)
 {
     out_pair(c, "file", rel);
     song_meta_t m;
     if (radio_is_url(rel)) {
-        /* webradio : le titre diffusé par la radio, pour le morceau en cours */
-        player_status_t st;
-        player_get_status(&st);
-        if (st.stream && st.stream_title[0] && strcmp(st.file, rel) == 0) {
-            out_pair(c, "Title", st.stream_title);
-        }
+        out_stream_title(c, rel);
     } else if (load_meta(rel, &m)) {
         out_meta(c, &m);
         meta_free(&m);
@@ -1576,14 +1584,17 @@ static const cmd_def_t s_cmds[] = {
 
 #define NUM_CMDS (sizeof(s_cmds) / sizeof(s_cmds[0]))
 
-static bool permitted(const client_t *c, const cmd_def_t *d)
+/* À part (noinline) : les réglages sont gros et ne doivent pas peser sur la pile de chaque commande. */
+static bool __attribute__((noinline)) password_set(void)
 {
-    if (d->open || c->authed) {
-        return true;
-    }
     settings_t cfg;
     settings_get(&cfg);
-    return !cfg.mpd_pass_set;
+    return cfg.mpd_pass_set;
+}
+
+static bool permitted(const client_t *c, const cmd_def_t *d)
+{
+    return d->open || c->authed || !password_set();
 }
 
 static int c_commands(client_t *c, int argc, char **argv)
@@ -1646,7 +1657,9 @@ static bool execute(client_t *c, char *line, int list_index)
         outf(c, "ACK [%d@%d] {%s} wrong number of arguments for \"%s\"\n", ACK_ERROR_ARG, list_index, name, name);
         return false;
     }
-    if (d->fn(c, argc, argv) != 0) {
+    int r = d->fn(c, argc, argv);
+    log_buffer_stack_check("mpd_client", d->name, &s_stack_low);
+    if (r != 0) {
         outf(c, "ACK [%d@%d] {%s} %s\n", c->err_code ? c->err_code : ACK_ERROR_SYSTEM, list_index, name,
              c->err_msg[0] ? c->err_msg : "error");
         return false;
@@ -1872,7 +1885,7 @@ static void listen_task(void *arg)
         }
         c->fd = fd;
         __atomic_add_fetch(&s_clients, 1, __ATOMIC_SEQ_CST);
-        if (xTaskCreate(client_task, "mpd_client", 5120, c, 5, NULL) != pdPASS) {
+        if (xTaskCreate(client_task, "mpd_client", 7168, c, 5, NULL) != pdPASS) {
             __atomic_sub_fetch(&s_clients, 1, __ATOMIC_SEQ_CST);
             close(fd);
             free(c);
