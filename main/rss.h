@@ -6,7 +6,7 @@
  *  - dates RFC 822 (« Wed, 08 Oct 2026 06:00:00 +0200 ») ;
  *  - nom de fichier d'un épisode (« 2026-10-08 06h00 - Titre.mp3 ») : l'ordre alphabétique
  *    de la carte SD est l'ordre chronologique ;
- *  - choix des épisodes à garder.
+ *  - choix des épisodes à garder (tous, ou les N plus récents).
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -24,6 +24,8 @@ typedef struct {
     int64_t pub;  /* date de publication (UTC), 0 si inconnue */
     char day[11]; /* "AAAA-MM-JJ", tel qu'écrit dans le flux */
     char hm[6];   /* "HHhMM" */
+    uint32_t seq; /* rang dans le flux : départage les épisodes de même date */
+    uint64_t id;  /* rss_guid_id(guid) */
 } rss_item_t;
 
 typedef struct rss_parser rss_parser_t;
@@ -49,3 +51,26 @@ void rss_episode_name(const rss_item_t *it, char *out, size_t len);
  * Un épisode sans date compte comme le plus ancien.
  */
 void rss_keep_newest(rss_item_t *top, int keep, int *count, const rss_item_t *it);
+
+/* Identifiant compact d'un épisode (empreinte 64 bits de son guid). */
+uint64_t rss_guid_id(const char *guid);
+
+/*
+ * Épisodes retenus pendant la lecture d'un flux : tous (keep = 0) ou les keep plus récents,
+ * au plus RSS_LIST_MAX (~1 Ko chacun, en PSRAM sur l'enceinte). Après rss_list_finish,
+ * items est trié du plus récent au plus ancien.
+ */
+#define RSS_LIST_MAX 2000
+
+typedef struct {
+    rss_item_t *items;
+    int count, cap, limit;
+    uint32_t seq;
+    bool sorted;
+} rss_list_t;
+
+void rss_list_init(rss_list_t *l, int keep);
+/* false : mémoire insuffisante (la liste est alors incomplète). */
+bool rss_list_add(rss_list_t *l, const rss_item_t *it);
+void rss_list_finish(rss_list_t *l);
+void rss_list_free(rss_list_t *l);

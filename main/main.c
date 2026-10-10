@@ -10,11 +10,13 @@
 
 #include "backup.h"
 #include "buttons.h"
+#include "cJSON.h"
 #include "cards.h"
 #include "controller.h"
 #include "driver/gpio.h"
 #include "esp_app_desc.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "log_buffer.h"
@@ -76,9 +78,18 @@ static void system_task(void *arg)
     }
 }
 
+static void *json_malloc(size_t size)
+{
+    return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+}
+
 void app_main(void)
 {
     log_buffer_start(); /* journal de l'interface web : avant tout autre message */
+    /* Arbres JSON (interface web, réglages, podcasts) en PSRAM : ils comptent des centaines de
+     * petits blocs qui iraient sinon en RAM interne, celle du Wi-Fi et du TLS. */
+    cJSON_Hooks json_hooks = {.malloc_fn = json_malloc, .free_fn = free};
+    cJSON_InitHooks(&json_hooks);
     const esp_app_desc_t *app = esp_app_get_description();
     ESP_LOGI(TAG, "Enceinte NFC version %s", app->version);
     log_buffer_report_boot();
@@ -119,4 +130,5 @@ void app_main(void)
 
     xTaskCreate(system_task, "system", 6144, NULL, 2, NULL); /* réinitialisation usine : parcours de la carte SD */
     ESP_LOGI(TAG, "démarrage terminé");
+    log_buffer_memory("au démarrage");
 }

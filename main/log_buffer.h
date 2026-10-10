@@ -20,3 +20,5 @@ size_t log_buffer_size(void);
  * (par paliers de 256 octets) pour vérifier les tailles de pile en usage réel. *low vaut
  * UINT32_MAX au départ ; detail (format lu…) peut être NULL. */
 void log_buffer_stack_check(const char *task, const char *detail, uint32_t *low);
+/* RAM interne libre (totale, plus grand bloc, minimum depuis le démarrage) dans le journal. */
+void log_buffer_memory(const char *when);

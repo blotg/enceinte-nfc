@@ -24,6 +24,13 @@ static inline bool radio_is_url(const char *s)
 }
 
 /*
+ * Adresse "ref" (en-tête Location d'une redirection) rapportée à "base" : absolue,
+ * « //hôte/… », « /chemin », « ?requête » ou relative au dossier de base. La requête
+ * (« ?clé=… ») est conservée. false si ref est vide ou si out est trop petit.
+ */
+bool url_resolve(const char *base, const char *ref, char *out, size_t len);
+
+/*
  * Adresses de flux d'une liste .m3u/.m3u8 (lignes hors commentaires) ou .pls (« FileN= »),
  * dans l'ordre. Chaque adresse valide est passée à cb ; retourne le nombre d'adresses.
  * Les chemins locaux et les adresses trop longues sont ignorés.

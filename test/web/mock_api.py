@@ -41,6 +41,7 @@ FILES = {
 
 
 RADIOS = {"Webradios/France Inter": "http://icecast.radiofrance.fr/franceinter-midfi.mp3"}
+SYNC_EPISODES = 3  # épisodes « téléchargés » par une vérification simulée
 PODCASTS = {"Podcasts/Les Odyssées": {"url": "https://radiofrance-podcast.net/podcast09/rss_19721.xml",
                                       "title": "Les Odyssées", "keep": 10, "last_check": time.time() - 3600,
                                       "last_error": "", "sync_until": 0}}
@@ -225,14 +226,24 @@ class Handler(BaseHTTPRequestHandler):
             pc = PODCASTS.get(folder)
             if not pc:
                 return self.send_json({"error": "pas un podcast"}, 404)
-            syncing = time.time() < pc["sync_until"]
+            # vérification simulée : 3 épisodes, 2 s chacun, chacun apparaît dans le dossier une fois fini
+            now = time.time()
+            syncing = now < pc["sync_until"]
+            start = pc["sync_until"] - SYNC_EPISODES * 2 if pc["sync_until"] else now
+            done = min(SYNC_EPISODES, int((now - start) // 2)) if pc["sync_until"] else 0
+            while pc.get("added", 0) < done:
+                pc["added"] = pc.get("added", 0) + 1
+                FILES[folder].append((f"2026-10-1{4 + pc['added']} 06h00 - Le retour à Ithaque ({pc['added']}).mp3",
+                                      False, 22_000_000))
             if not syncing and pc["sync_until"]:
-                pc["sync_until"], pc["last_check"] = 0, time.time()
-                FILES[folder].append(("2026-10-15 06h00 - Le retour à Ithaque.mp3", False, 22_000_000))
+                pc["sync_until"], pc["last_check"], pc["added"] = 0, now, 0
             eps = len([f for f in FILES.get(folder, []) if not f[1] and f[0].endswith(".mp3")])
             return self.send_json({"folder": folder, "url": pc["url"], "title": pc["title"], "keep": pc["keep"],
                                    "episodes": eps, "last_check": pc["last_check"], "last_error": pc["last_error"],
-                                   "syncing": syncing, "progress": int((time.time() * 20) % 100) if syncing else -1})
+                                   "syncing": syncing,
+                                   "progress": int(((now - start) % 2) * 50) if syncing else -1,
+                                   "dl_index": min(SYNC_EPISODES, done + 1) if syncing else 0,
+                                   "dl_count": SYNC_EPISODES if syncing else 0})
         if u.path == "/api/cards":
             for c in CARDS:
                 c["kind"] = kind(c["folder"])
@@ -352,7 +363,7 @@ class Handler(BaseHTTPRequestHandler):
             folder = unique("Podcasts", name)
             create_folder(folder)
             PODCASTS[folder] = {"url": url, "title": b.get("name") or "", "keep": b.get("keep", 10), "last_check": 0,
-                                "last_error": "", "sync_until": time.time() + 6}
+                                "last_error": "", "sync_until": time.time() + SYNC_EPISODES * 2}
             log(f"abonnement : {url} -> {folder}")
             attach(b.get("card"), folder)
             return self.send_json({"folder": folder})
@@ -362,12 +373,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": "pas un podcast"}, 400)
             action = b.get("action")
             if action == "sync":
-                pc["sync_until"] = time.time() + 5
+                pc["sync_until"] = time.time() + SYNC_EPISODES * 2
             elif action == "unsubscribe":
                 del PODCASTS[b["folder"]]
             elif action == "update":
                 pc["url"] = b.get("url") or pc["url"]
-                pc["keep"] = b.get("keep") or pc["keep"]
+                pc["keep"] = b["keep"] if isinstance(b.get("keep"), int) and b["keep"] >= 0 else pc["keep"]
             return self.send_json({"ok": True})
         if u.path == "/api/settings":
             for k in ("repeat", "resume_s", "resume_after_other", "shuffle", "normalize", "compress", "max_volume", "vol_touch",

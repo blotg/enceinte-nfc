@@ -518,3 +518,70 @@ void rss_keep_newest(rss_item_t *top, int keep, int *count, const rss_item_t *it
         (*count)++;
     }
 }
+
+uint64_t rss_guid_id(const char *guid)
+{
+    uint64_t h = 1469598103934665603ULL; /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)guid; *p; p++) {
+        h = (h ^ *p) * 1099511628211ULL;
+    }
+    return h;
+}
+
+void rss_list_init(rss_list_t *l, int keep)
+{
+    memset(l, 0, sizeof(*l));
+    l->limit = keep > 0 && keep < RSS_LIST_MAX ? keep : RSS_LIST_MAX;
+}
+
+static int newest_first(const void *a, const void *b)
+{
+    const rss_item_t *x = a, *y = b;
+    if (x->pub != y->pub) {
+        return x->pub > y->pub ? -1 : 1;
+    }
+    return x->seq < y->seq ? -1 : x->seq > y->seq;
+}
+
+bool rss_list_add(rss_list_t *l, const rss_item_t *it)
+{
+    rss_item_t item = *it;
+    item.seq = l->seq++;
+    item.id = rss_guid_id(item.guid);
+    if (l->count < l->limit) {
+        if (l->count == l->cap) {
+            int cap = l->cap ? l->cap * 2 : 8;
+            cap = cap < l->limit ? cap : l->limit;
+            rss_item_t *n = realloc(l->items, (size_t)cap * sizeof(rss_item_t));
+            if (!n) {
+                return false;
+            }
+            l->items = n;
+            l->cap = cap;
+        }
+        l->items[l->count++] = item;
+        l->sorted = false;
+        return true;
+    }
+    /* liste pleine : triée une fois, puis on ne garde que les plus récents */
+    if (!l->sorted) {
+        qsort(l->items, (size_t)l->count, sizeof(rss_item_t), newest_first);
+        l->sorted = true;
+    }
+    rss_keep_newest(l->items, l->limit, &l->count, &item);
+    return true;
+}
+
+void rss_list_finish(rss_list_t *l)
+{
+    if (!l->sorted && l->count > 1) {
+        qsort(l->items, (size_t)l->count, sizeof(rss_item_t), newest_first);
+    }
+    l->sorted = true;
+}
+
+void rss_list_free(rss_list_t *l)
+{
+    free(l->items);
+    memset(l, 0, sizeof(*l));
+}

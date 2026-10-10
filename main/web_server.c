@@ -1647,6 +1647,8 @@ static esp_err_t h_podcast_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "last_error", pi->last_error);
     cJSON_AddBoolToObject(root, "syncing", pi->syncing);
     cJSON_AddNumberToObject(root, "progress", pi->progress);
+    cJSON_AddNumberToObject(root, "dl_index", pi->dl_index);
+    cJSON_AddNumberToObject(root, "dl_count", pi->dl_count);
     free(pi);
     return send_json(req, root);
 }
@@ -1675,7 +1677,7 @@ static esp_err_t h_podcast_set(httpd_req_t *req)
             if (url && !url_ok(url, RSS_URL_MAX)) {
                 msg = "adresse de flux invalide";
             } else {
-                err = podcast_update(rel, url, cJSON_IsNumber(keep) ? keep->valueint : 0);
+                err = podcast_update(rel, url, cJSON_IsNumber(keep) ? keep->valueint : -1);
                 msg = "enregistrement impossible";
             }
         }

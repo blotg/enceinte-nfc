@@ -1282,6 +1282,20 @@ static void player_task(void *arg)
 
 /* ---------- API publique ---------- */
 
+/*
+ * Piles en PSRAM quand elle existe : 42 Ko de RAM interne rendus au Wi-Fi, au TLS et à la
+ * carte SD. Permis parce que ces deux tâches ne touchent jamais la mémoire flash (ni NVS ni
+ * mise à jour) : leur pile n'est jamais utilisée pendant que le cache est coupé.
+ */
+static void start_task(TaskFunction_t fn, const char *name, uint32_t stack, UBaseType_t prio, TaskHandle_t *out)
+{
+    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0 ||
+        xTaskCreatePinnedToCoreWithCaps(fn, name, stack, NULL, prio, out, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) !=
+            pdPASS) {
+        xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, out, 1);
+    }
+}
+
 esp_err_t player_init(uint8_t volume, uint8_t max_volume, player_event_cb_t cb)
 {
     s_cb = cb;
@@ -1329,9 +1343,9 @@ esp_err_t player_init(uint8_t volume, uint8_t max_volume, player_event_cb_t cb)
         return err;
     }
     /* La connexion HTTPS d'une webradio (TLS) demande de la pile. */
-    xTaskCreatePinnedToCore(reader_task, "reader", 10240, NULL, 9, NULL, 1); /* TLS des webradios */
+    start_task(reader_task, "reader", 10240, 9, NULL);
     /* Les décodeurs (Opus, Vorbis, FLAC...) demandent environ 20 Ko de pile selon Espressif. */
-    xTaskCreatePinnedToCore(player_task, "player", 32768, NULL, 10, &s_player_task, 1);
+    start_task(player_task, "player", 32768, 10, &s_player_task);
     return ESP_OK;
 }
 

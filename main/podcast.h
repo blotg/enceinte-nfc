@@ -5,7 +5,8 @@
  *
  * Les nouveaux épisodes sont téléchargés chaque nuit (entre 2 h et 5 h, enceinte inactive), à
  * l'abonnement et sur demande ; si l'enceinte est éteinte la nuit, au plus tard 48 h après la
- * dernière vérification. Seuls les N plus récents sont gardés. Les fichiers sont nommés
+ * dernière vérification. Tous les épisodes du flux sont gardés, ou seulement les N plus
+ * récents (les plus anciens sont alors supprimés). Les fichiers sont nommés
  * « AAAA-MM-JJ HHhMM - Titre » : une carte associée au dossier les joue dans l'ordre
  * chronologique, avec la reprise habituelle.
  */
@@ -18,18 +19,20 @@
 
 #define PODCAST_FILE ".podcast.json"
 #define PODCAST_BASE "Podcasts"
-#define PODCAST_KEEP_DEFAULT 10
-#define PODCAST_KEEP_MAX 50
+#define PODCAST_KEEP_DEFAULT 10 /* épisodes gardés ; 0 : tous */
+#define PODCAST_KEEP_MAX 99999
 
 typedef struct {
     char url[RSS_URL_MAX];
     char title[RSS_TITLE_MAX];
-    int keep;
+    int keep;           /* 0 : tous */
     int episodes;       /* épisodes présents dans le dossier */
     int64_t last_check; /* dernière lecture réussie du flux (0 : jamais) */
     char last_error[96];
     bool syncing;       /* téléchargement en cours pour ce dossier */
     int progress;       /* % de l'épisode en cours, -1 si inconnu */
+    int dl_index;       /* épisode en cours de téléchargement (1 à dl_count), 0 : aucun */
+    int dl_count;       /* épisodes à télécharger pendant cette vérification */
 } podcast_info_t;
 
 void podcast_start(void);
@@ -39,6 +42,7 @@ void podcast_start(void);
  */
 esp_err_t podcast_subscribe(const char *url, const char *name, int keep, char *folder_out, size_t len, char *err,
                             size_t errlen);
+/* url NULL ou keep < 0 : inchangé. */
 esp_err_t podcast_update(const char *folder, const char *url, int keep);
 /* Désabonnement : les épisodes restent dans le dossier. */
 esp_err_t podcast_unsubscribe(const char *folder);

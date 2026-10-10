@@ -186,6 +186,11 @@ void log_buffer_stack_check(const char *task, const char *detail, uint32_t *low)
     (void)low;
 }
 
+void log_buffer_memory(const char *when)
+{
+    (void)when;
+}
+
 /* ---------- Mutex ---------- */
 
 struct shim_sem {

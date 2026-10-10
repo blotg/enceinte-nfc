@@ -163,3 +163,11 @@ void log_buffer_stack_check(const char *task, const char *detail, uint32_t *low)
     ESP_LOG_LEVEL(left < STACK_WARN ? ESP_LOG_WARN : ESP_LOG_INFO, TAG, "pile « %s » : %" PRIu32 " octets libres au plus bas%s%s%s",
                   task, left, detail ? " (" : "", detail ? detail : "", detail ? ")" : "");
 }
+
+void log_buffer_memory(const char *when)
+{
+    ESP_LOGI(TAG, "mémoire interne %s : %u Ko libres, plus grand bloc %u Ko, minimum %u Ko", when,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024));
+}

@@ -18,7 +18,7 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Mode sommeil par carte | ✅ | Pause après N morceaux ou N minutes d'écoute (fondu sonore), compté depuis la pose de la carte. |
 | Répétition | ✅ | La playlist recommence au lieu de s'arrêter (berceuses, bruit blanc), en réglage général ou carte par carte. |
 | Webradio | ✅ | Une carte lance une radio en direct (flux MP3, AAC ou Ogg, HTTP ou HTTPS, listes .m3u/.pls), avec le titre diffusé. Pas de flux HLS (.m3u8 en segments). |
-| Podcasts | ✅ | Une carte suit un flux RSS : les nouveaux épisodes sont téléchargés chaque nuit sur la carte SD, les N plus récents gardés, joués dans l'ordre avec la reprise habituelle. |
+| Podcasts | ✅ | Une carte suit un flux RSS : les nouveaux épisodes sont téléchargés chaque nuit sur la carte SD, tous gardés ou seulement les N plus récents, joués dans l'ordre avec la reprise habituelle. |
 | Journal consultable | ✅ | *Réglages → Système → Journal* : derniers messages, raison du dernier redémarrage, résumé d'un plantage, mémoire libre ; à télécharger. |
 | Association dossier ↔ carte par l'interface web | ✅ | Mode association : la carte posée est capturée sans lancer la musique. Dossiers nommés librement (accents, espaces). |
 | Dépôt de fichiers par l'interface web | ✅ | Fichiers ou dossiers entiers, glisser-déposer. Débit limité par la carte SD en SPI. |
@@ -283,18 +283,22 @@ carte » dans le dossier créé).
 
 *Cartes → Associer une carte*, « Un podcast » : l'adresse du flux RSS (« flux RSS » ou
 « RSS feed » sur le site du podcast), un nom facultatif (sans nom : le titre du podcast),
-et le nombre d'épisodes à garder (10 par défaut). Ou *Musique → + Podcast*.
+et le nombre d'épisodes à garder (10 par défaut, **0 pour tous**). Ou *Musique → + Podcast*.
 
-- L'enceinte crée `Podcasts/<nom>` et y télécharge les épisodes les plus récents, nommés
+- L'enceinte crée `Podcasts/<nom>` et y télécharge les épisodes, du plus récent au plus ancien, nommés
   `AAAA-MM-JJ HHhMM - Titre.mp3` : la carte les joue **du plus ancien au plus récent**, avec la
   reprise habituelle (idéal pour une série d'histoires).
 - Les nouveaux épisodes arrivent **chaque nuit** entre 2 h et 5 h, enceinte inactive ; si
   elle est éteinte la nuit, au plus tard 48 h après la dernière vérification. Le dossier du
   podcast (onglet *Musique*) montre l'état et permet de vérifier tout de suite.
-- Seuls les N plus récents restent sur la carte SD (sauf l'épisode en cours d'écoute). Un
-  épisode supprimé à la main n'est pas retéléchargé. 300 Mo restent toujours libres.
-- L'abonnement est le fichier `.podcast.json` du dossier : il suit le dossier quand on le
-  déplace et voyage avec une carte SD clonée. « Se désabonner » garde les épisodes.
+- Avec N épisodes gardés, seuls les N plus récents restent sur la carte SD (sauf l'épisode
+  en cours d'écoute) ; si N augmente, les anciens reviennent. Avec 0, tout est gardé (les
+  2000 plus récents du flux au plus). Un épisode supprimé à la main n'est jamais
+  retéléchargé. 300 Mo restent toujours libres.
+- Un téléchargement automatique s'interrompt dès que l'écoute commence ; il reprend plus tard.
+- L'abonnement est le fichier `.podcast.json` du dossier, la liste des épisodes connus
+  `.podcast-episodes.txt` : ils suivent le dossier quand on le déplace et voyagent avec une
+  carte SD clonée. « Se désabonner » garde les épisodes.
 - Une mise à jour du firmware attend la fin des téléchargements.
 
 ### Journal
@@ -486,8 +490,9 @@ test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 
    enceinte sortie d'usine, dossiers déplacés et fichiers ajoutés sur un ordinateur, fichier
    abîmé, modifications pendant l'absence de la carte, export et import, réinitialisation.
 5. Les podcasts avec un « Internet » simulé : abonnement, renommage d'après le titre du flux,
-   épisodes gardés, épisode en cours d'écoute épargné, épisode supprimé à la main, épisode ou
-   flux injoignable, désabonnement. Le flux RSS lui-même (CDATA, entités, dates) est testé
+   épisodes gardés (N ou tous, N augmenté puis réduit), épisode en cours d'écoute épargné,
+   épisode supprimé à la main, épisode ou flux injoignable, désabonnement, reprise d'un
+   abonnement de la version 1.8. Le flux RSS lui-même (CDATA, entités, dates) est testé
    découpé de toutes les façons possibles.
 
 Le tout est compilé avec AddressSanitizer et UndefinedBehaviorSanitizer.

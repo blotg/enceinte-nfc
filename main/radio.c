@@ -57,6 +57,59 @@ int radio_playlist_urls(const char *text, void (*cb)(const char *url, void *ctx)
     return count;
 }
 
+/* « schéma: » en tête (http:, https:...) ? */
+static bool has_scheme(const char *s)
+{
+    if (!isalpha((unsigned char)s[0])) {
+        return false;
+    }
+    for (const char *p = s + 1; *p; p++) {
+        if (*p == ':') {
+            return true;
+        }
+        if (!isalnum((unsigned char)*p) && *p != '+' && *p != '-' && *p != '.') {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool url_resolve(const char *base, const char *ref, char *out, size_t len)
+{
+    if (!ref[0]) {
+        return false;
+    }
+    int n;
+    if (has_scheme(ref)) {
+        n = snprintf(out, len, "%s", ref);
+        return n > 0 && (size_t)n < len;
+    }
+    const char *auth = strstr(base, "://");
+    if (!auth) {
+        return false;
+    }
+    auth += 3;
+    const char *path = auth + strcspn(auth, "/?#"); /* après l'hôte */
+    size_t path_len = strcspn(path, "?#");          /* chemin sans la requête */
+    if (ref[0] == '/' && ref[1] == '/') {
+        n = snprintf(out, len, "%.*s%s", (int)(auth - 2 - base), base, ref); /* « https: » */
+    } else if (ref[0] == '/') {
+        n = snprintf(out, len, "%.*s%s", (int)(path - base), base, ref);
+    } else if (ref[0] == '?') {
+        n = snprintf(out, len, "%.*s%s", (int)(path + path_len - base), base, ref);
+    } else {
+        const char *slash = NULL;
+        for (const char *p = path; p < path + path_len; p++) {
+            if (*p == '/') {
+                slash = p;
+            }
+        }
+        n = slash ? snprintf(out, len, "%.*s%s", (int)(slash + 1 - base), base, ref)
+                  : snprintf(out, len, "%.*s/%s", (int)(path - base), base, ref);
+    }
+    return n > 0 && (size_t)n < len;
+}
+
 bool radio_is_playlist_name(const char *name)
 {
     const char *ext = strrchr(name, '.');

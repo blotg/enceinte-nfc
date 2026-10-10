@@ -1,6 +1,7 @@
 #include "podcast.h"
 
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +33,7 @@ static const char *TAG = "podcast";
 
 #define FORMAT "enceinte-podcast"
 #define MANIFEST_MAX (128 * 1024)
-#define KNOWN_MAX 300                       /* épisodes mémorisés (téléchargés ou écartés) */
+#define KNOWN_MAX 10000 /* épisodes connus (~180 octets chacun, en PSRAM) */
 #define FEED_MAX (16 * 1024 * 1024)         /* flux RSS lu au plus */
 #define FEED_TIMEOUT_MS 15000
 #define DL_TIMEOUT_MS 20000
@@ -47,20 +48,21 @@ static const char *TAG = "podcast";
 #define NAME_MAX_LEN 160
 
 typedef struct {
-    char guid[RSS_GUID_MAX];
-    char file[NAME_MAX_LEN]; /* vide : épisode écarté ou supprimé */
+    uint64_t id; /* rss_guid_id du guid */
     int64_t pub;
+    char file[NAME_MAX_LEN]; /* vide : épisode écarté ou supprimé */
 } known_t;
 
 typedef struct {
     char url[RSS_URL_MAX];
     char title[RSS_TITLE_MAX];
-    int keep;
+    int keep; /* 0 : tous les épisodes */
     bool auto_name; /* dossier à renommer d'après le titre du flux */
     int64_t last_check;
     char last_error[96];
-    known_t *known;
-    int n_known;
+    known_t *known; /* épisodes connus (téléchargés, ou supprimés à la main), en PSRAM */
+    int n_known, cap_known;
+    bool episodes_loaded; /* sinon manifest_save ne réécrit pas la liste des épisodes */
 } manifest_t;
 
 typedef struct {
@@ -73,6 +75,7 @@ static SemaphoreHandle_t s_lock;
 static volatile bool s_running;
 static char s_busy_folder[REL_PATH_MAX]; /* s_lock */
 static volatile int64_t s_dl_done, s_dl_total;
+static volatile int s_dl_index, s_dl_count; /* « épisode 3 sur 12 » */
 
 #define LOCK() xSemaphoreTake(s_lock, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(s_lock)
@@ -94,34 +97,104 @@ static bool abs_of(const char *folder, const char *name, char *out, size_t len)
     return child_path(folder, name, rel, sizeof(rel)) && path_to_abs(rel, out, len);
 }
 
-/* ---------- Manifeste (.podcast.json) ---------- */
+/* ---------- Manifeste ---------- */
+
+/*
+ * Réglages dans .podcast.json ; épisodes connus dans .podcast-episodes.txt, une ligne par
+ * épisode (« id date fichier ») : lue et écrite au fil de l'eau, la liste peut être longue
+ * sans occuper de RAM interne (un arbre cJSON en prendrait beaucoup).
+ */
+#define EPISODES_FILE ".podcast-episodes.txt"
+
+/* Gros tampons en PSRAM : la RAM interne est réservée aux piles, au Wi-Fi et au TLS. */
+static void *big_realloc(void *p, size_t size)
+{
+    void *n = heap_caps_realloc(p, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return n ? n : realloc(p, size);
+}
 
 static void manifest_free(manifest_t *m)
 {
     free(m->known);
     m->known = NULL;
+    m->n_known = m->cap_known = 0;
 }
 
-static bool manifest_init(manifest_t *m)
+static void manifest_init(manifest_t *m)
 {
     memset(m, 0, sizeof(*m));
     m->keep = PODCAST_KEEP_DEFAULT;
-    m->known = calloc(KNOWN_MAX, sizeof(known_t)); /* ~110 Ko, en PSRAM */
-    return m->known != NULL;
 }
 
-static bool manifest_load(const char *folder, manifest_t *m)
+static known_t *known_new(manifest_t *m)
 {
-    if (!manifest_init(m)) {
+    if (m->n_known == m->cap_known) {
+        if (m->cap_known >= KNOWN_MAX) {
+            return NULL;
+        }
+        int cap = m->cap_known ? m->cap_known * 2 : 32;
+        cap = cap < KNOWN_MAX ? cap : KNOWN_MAX;
+        known_t *n = big_realloc(m->known, (size_t)cap * sizeof(known_t));
+        if (!n) {
+            return NULL;
+        }
+        m->known = n;
+        m->cap_known = cap;
+    }
+    known_t *k = &m->known[m->n_known++];
+    memset(k, 0, sizeof(*k));
+    return k;
+}
+
+static bool read_episodes(const char *folder, manifest_t *m)
+{
+    char abs[ABS_PATH_MAX];
+    if (!abs_of(folder, EPISODES_FILE, abs, sizeof(abs))) {
         return false;
     }
+    FILE *f = fopen(abs, "r");
+    if (!f) {
+        return true; /* pas encore d'épisode */
+    }
+    char line[NAME_MAX_LEN + 64];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || !strchr(line, '\n')) {
+            continue; /* commentaire, ou ligne trop longue (jamais écrite ainsi) */
+        }
+        char *p = line, *e;
+        uint64_t id = strtoull(p, &e, 16);
+        if (e == p || *e != ' ') {
+            continue;
+        }
+        p = e + 1;
+        int64_t pub = strtoll(p, &e, 10);
+        if (e == p || *e != ' ') {
+            continue;
+        }
+        p = e + 1;
+        p[strcspn(p, "\r\n")] = '\0';
+        known_t *k = known_new(m);
+        if (!k) {
+            break;
+        }
+        k->id = id;
+        k->pub = pub;
+        str_copy(k->file, p, sizeof(k->file));
+    }
+    fclose(f);
+    return true;
+}
+
+static bool manifest_load(const char *folder, manifest_t *m, bool episodes)
+{
+    manifest_init(m);
     char abs[ABS_PATH_MAX];
     FILE *f = abs_of(folder, PODCAST_FILE, abs, sizeof(abs)) ? fopen(abs, "rb") : NULL;
     if (!f) {
-        manifest_free(m);
         return false;
     }
-    char *txt = malloc(MANIFEST_MAX + 1);
+    /* jusqu'à 128 Ko : les manifestes de la version 1 contenaient aussi les épisodes */
+    char *txt = big_realloc(NULL, MANIFEST_MAX + 1);
     size_t n = txt ? fread(txt, 1, MANIFEST_MAX, f) : 0;
     fclose(f);
     cJSON *root = NULL;
@@ -134,7 +207,6 @@ static bool manifest_load(const char *folder, manifest_t *m)
     const cJSON *url = cJSON_GetObjectItem(root, "url");
     if (!cJSON_IsString(fmt) || strcmp(fmt->valuestring, FORMAT) != 0 || !cJSON_IsString(url)) {
         cJSON_Delete(root);
-        manifest_free(m);
         return false;
     }
     str_copy(m->url, url->valuestring, sizeof(m->url));
@@ -143,7 +215,7 @@ static bool manifest_load(const char *folder, manifest_t *m)
         str_copy(m->title, it->valuestring, sizeof(m->title));
     }
     it = cJSON_GetObjectItem(root, "keep");
-    if (cJSON_IsNumber(it) && it->valueint >= 1 && it->valueint <= PODCAST_KEEP_MAX) {
+    if (cJSON_IsNumber(it) && it->valuedouble >= 0 && it->valuedouble <= PODCAST_KEEP_MAX) {
         m->keep = it->valueint;
     }
     m->auto_name = cJSON_IsTrue(cJSON_GetObjectItem(root, "auto_name"));
@@ -153,29 +225,73 @@ static bool manifest_load(const char *folder, manifest_t *m)
     if (cJSON_IsString(it)) {
         str_copy(m->last_error, it->valuestring, sizeof(m->last_error));
     }
-    const cJSON *e;
-    cJSON_ArrayForEach(e, cJSON_GetObjectItem(root, "episodes"))
-    {
-        const cJSON *g = cJSON_GetObjectItem(e, "guid");
-        const cJSON *file = cJSON_GetObjectItem(e, "file");
-        const cJSON *pub = cJSON_GetObjectItem(e, "pub");
-        if (!cJSON_IsString(g) || m->n_known >= KNOWN_MAX) {
-            continue;
+    bool ok = true;
+    const cJSON *old = cJSON_GetObjectItem(root, "episodes");
+    if (cJSON_IsArray(old)) {
+        /* version 1 : épisodes dans le JSON, réécrits dans EPISODES_FILE au prochain enregistrement */
+        const cJSON *e;
+        cJSON_ArrayForEach(e, old)
+        {
+            const cJSON *g = cJSON_GetObjectItem(e, "guid");
+            const cJSON *file = cJSON_GetObjectItem(e, "file");
+            const cJSON *pub = cJSON_GetObjectItem(e, "pub");
+            known_t *k = cJSON_IsString(g) ? known_new(m) : NULL;
+            if (k) {
+                k->id = rss_guid_id(g->valuestring);
+                k->pub = cJSON_IsNumber(pub) ? (int64_t)pub->valuedouble : 0;
+                str_copy(k->file, cJSON_IsString(file) ? file->valuestring : "", sizeof(k->file));
+            }
         }
-        known_t *k = &m->known[m->n_known++];
-        str_copy(k->guid, g->valuestring, sizeof(k->guid));
-        str_copy(k->file, cJSON_IsString(file) ? file->valuestring : "", sizeof(k->file));
-        k->pub = cJSON_IsNumber(pub) ? (int64_t)pub->valuedouble : 0;
+        m->episodes_loaded = true;
+    } else if (episodes) {
+        ok = read_episodes(folder, m);
+        m->episodes_loaded = ok;
     }
     cJSON_Delete(root);
-    return true;
+    if (!ok) {
+        manifest_free(m);
+    }
+    return ok;
+}
+
+/* Écrit text (ou la liste des épisodes) dans folder/name, via un fichier provisoire. */
+static bool write_atomic(const char *folder, const char *name, const char *text, const manifest_t *eps)
+{
+    char abs[ABS_PATH_MAX], tmp[ABS_PATH_MAX + 4];
+    if (!abs_of(folder, name, abs, sizeof(abs))) {
+        return false;
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", abs);
+    FILE *f = fopen(tmp, "wb");
+    bool ok = f != NULL;
+    if (ok && text) {
+        ok = fwrite(text, 1, strlen(text), f) == strlen(text);
+    } else if (ok) {
+        ok = fputs("# épisodes connus : identifiant, date, fichier (vide : supprimé)\n", f) >= 0;
+        for (int i = 0; ok && i < eps->n_known; i++) {
+            const known_t *k = &eps->known[i];
+            ok = fprintf(f, "%016" PRIx64 " %" PRId64 " %s\n", k->id, k->pub, k->file) > 0;
+        }
+    }
+    if (f && fclose(f) != 0) {
+        ok = false;
+    }
+    if (ok) {
+        unlink(abs);
+        ok = rename(tmp, abs) == 0;
+    } else {
+        unlink(tmp);
+    }
+    return ok;
 }
 
 static bool manifest_save(const char *folder, const manifest_t *m)
 {
+    /* épisodes d'abord : un manifeste de la version 1 ne perd les siens qu'une fois copiés */
+    bool ok = !m->episodes_loaded || write_atomic(folder, EPISODES_FILE, NULL, m);
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "format", FORMAT);
-    cJSON_AddNumberToObject(root, "version", 1);
+    cJSON_AddNumberToObject(root, "version", 2);
     cJSON_AddStringToObject(root, "url", m->url);
     cJSON_AddStringToObject(root, "title", m->title);
     cJSON_AddNumberToObject(root, "keep", m->keep);
@@ -184,32 +300,9 @@ static bool manifest_save(const char *folder, const manifest_t *m)
     }
     cJSON_AddNumberToObject(root, "last_check", (double)m->last_check);
     cJSON_AddStringToObject(root, "last_error", m->last_error);
-    cJSON *arr = cJSON_AddArrayToObject(root, "episodes");
-    for (int i = 0; i < m->n_known; i++) {
-        cJSON *e = cJSON_CreateObject();
-        cJSON_AddStringToObject(e, "guid", m->known[i].guid);
-        cJSON_AddStringToObject(e, "file", m->known[i].file);
-        cJSON_AddNumberToObject(e, "pub", (double)m->known[i].pub);
-        cJSON_AddItemToArray(arr, e);
-    }
-    char *txt = cJSON_Print(root);
+    char *txt = ok ? cJSON_Print(root) : NULL;
     cJSON_Delete(root);
-    char abs[ABS_PATH_MAX], tmp[ABS_PATH_MAX + 4];
-    bool ok = txt && abs_of(folder, PODCAST_FILE, abs, sizeof(abs));
-    if (ok) {
-        snprintf(tmp, sizeof(tmp), "%s.tmp", abs);
-        FILE *f = fopen(tmp, "wb");
-        ok = f && fwrite(txt, 1, strlen(txt), f) == strlen(txt);
-        if (f && fclose(f) != 0) {
-            ok = false;
-        }
-        if (ok) {
-            unlink(abs);
-            ok = rename(tmp, abs) == 0;
-        } else {
-            unlink(tmp);
-        }
-    }
+    ok = txt && write_atomic(folder, PODCAST_FILE, txt, NULL);
     free(txt);
     if (!ok) {
         ESP_LOGW(TAG, "%s : écriture de %s impossible", folder, PODCAST_FILE);
@@ -217,10 +310,10 @@ static bool manifest_save(const char *folder, const manifest_t *m)
     return ok;
 }
 
-static int known_find(const manifest_t *m, const char *guid)
+static int known_find(const manifest_t *m, uint64_t id)
 {
     for (int i = 0; i < m->n_known; i++) {
-        if (strcmp(m->known[i].guid, guid) == 0) {
+        if (m->known[i].id == id) {
             return i;
         }
     }
@@ -229,42 +322,33 @@ static int known_find(const manifest_t *m, const char *guid)
 
 static void known_add(manifest_t *m, const rss_item_t *it, const char *file)
 {
-    if (m->n_known >= KNOWN_MAX) {
-        /* place : on oublie d'abord un épisode écarté, sinon le plus ancien */
-        int victim = 0;
-        for (int i = 0; i < m->n_known; i++) {
-            if (!m->known[i].file[0]) {
-                victim = i;
-                break;
-            }
-        }
-        memmove(&m->known[victim], &m->known[victim + 1], (size_t)(m->n_known - victim - 1) * sizeof(known_t));
-        m->n_known--;
+    known_t *k = known_new(m);
+    if (!k) {
+        /* liste pleine : on oublie le plus ancien */
+        memmove(&m->known[0], &m->known[1], (size_t)(m->n_known - 1) * sizeof(known_t));
+        k = &m->known[m->n_known - 1];
     }
-    known_t *k = &m->known[m->n_known++];
-    str_copy(k->guid, it->guid, sizeof(k->guid));
-    str_copy(k->file, file, sizeof(k->file));
+    k->id = it->id;
     k->pub = it->pub;
+    str_copy(k->file, file, sizeof(k->file));
 }
 
 /* ---------- Réseau ---------- */
 
 typedef struct {
-    rss_item_t *top;
-    int keep;
-    int count;
+    rss_list_t *list;
+    bool no_mem;
 } feed_ctx_t;
 
 static bool on_item(const rss_item_t *it, void *arg)
 {
     feed_ctx_t *f = arg;
-    rss_keep_newest(f->top, f->keep, &f->count, it);
-    return true;
+    f->no_mem = !rss_list_add(f->list, it);
+    return !f->no_mem;
 }
 
-/* Lit le flux : les "keep" épisodes les plus récents, et le titre. */
-static bool fetch_feed(const char *url, rss_item_t *top, int keep, int *count, char *title, size_t tlen, char *err,
-                       size_t errlen)
+/* Lit le flux : ses épisodes (tous ou les plus récents, cf. rss_list_init) et son titre. */
+static bool fetch_feed(const char *url, rss_list_t *list, char *title, size_t tlen, char *err, size_t errlen)
 {
     http_info_t info;
     char e[64];
@@ -273,23 +357,30 @@ static bool fetch_feed(const char *url, rss_item_t *top, int keep, int *count, c
         snprintf(err, errlen, "flux injoignable : %s", e);
         return false;
     }
-    feed_ctx_t ctx = {.top = top, .keep = keep};
+    feed_ctx_t ctx = {.list = list};
     rss_parser_t *p = rss_new(on_item, &ctx);
-    char *buf = malloc(4096);
+    char *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM); /* la RAM interne reste au TLS */
+    if (!buf) {
+        buf = malloc(4096);
+    }
     size_t total = 0;
     int n = 0;
     while (p && buf && total < FEED_MAX && (n = esp_http_client_read(h, buf, 4096)) > 0) {
         total += (size_t)n;
-        rss_feed(p, buf, (size_t)n);
+        if (!rss_feed(p, buf, (size_t)n)) {
+            break;
+        }
     }
-    bool ok = p && buf && total > 0 && n >= 0;
+    bool ok = p && buf && total > 0 && n >= 0 && !ctx.no_mem;
     if (p) {
         str_copy(title, rss_channel_title(p), tlen);
     }
-    *count = ctx.count;
-    if (!ok) {
+    rss_list_finish(list);
+    if (ctx.no_mem || !p || !buf) {
+        snprintf(err, errlen, "mémoire insuffisante pour lire le flux");
+    } else if (!ok) {
         snprintf(err, errlen, "lecture du flux interrompue");
-    } else if (!title[0] && ctx.count == 0) {
+    } else if (!title[0] && list->count == 0) {
         snprintf(err, errlen, "cette adresse n'est pas un flux de podcast (RSS)");
         ok = false;
     }
@@ -434,12 +525,19 @@ static bool playing_file(const char *folder, const char *file)
     return st.state != PLAYER_STOPPED && child_path(folder, file, rel, sizeof(rel)) && strcmp(st.file, rel) == 0;
 }
 
-static void sync_folder(const char *start_folder)
+static bool player_busy(void)
+{
+    player_status_t st;
+    player_get_status(&st);
+    return st.state == PLAYER_PLAYING;
+}
+
+static void sync_folder(const char *start_folder, bool manual)
 {
     char folder[REL_PATH_MAX];
     str_copy(folder, start_folder, sizeof(folder));
     manifest_t m;
-    if (!manifest_load(folder, &m)) {
+    if (!manifest_load(folder, &m, true)) {
         return;
     }
     LOCK();
@@ -447,11 +545,13 @@ static void sync_folder(const char *start_folder)
     UNLOCK();
     changes_notify(CHG_DATABASE);
     ESP_LOGI(TAG, "%s : vérification du flux", folder);
-    rss_item_t *top = calloc((size_t)m.keep, sizeof(rss_item_t));
+    log_buffer_memory("avant");
+    rss_list_t list;
+    rss_list_init(&list, m.keep);
     char title[RSS_TITLE_MAX] = "", err[96] = "";
-    int count = 0, downloaded = 0, pruned = 0;
-    bool ok = top && fetch_feed(m.url, top, m.keep, &count, title, sizeof(title), err, sizeof(err));
-    if (ok) {
+    int downloaded = 0, pruned = 0;
+    bool interrupted = false;
+    if (fetch_feed(m.url, &list, title, sizeof(title), err, sizeof(err))) {
         if (m.auto_name && title[0]) {
             rename_folder(folder, sizeof(folder), title);
             m.auto_name = false;
@@ -462,58 +562,76 @@ static void sync_folder(const char *start_folder)
         if (title[0]) {
             str_copy(m.title, title, sizeof(m.title));
         }
+        int todo = 0;
+        for (int i = 0; i < list.count; i++) {
+            todo += known_find(&m, list.items[i].id) < 0 ? 1 : 0;
+        }
+        s_dl_count = todo;
+        s_dl_index = 0;
         /* du plus récent au plus ancien : le dernier épisode arrive en premier */
-        for (int i = 0; i < count; i++) {
-            if (known_find(&m, top[i].guid) >= 0) {
+        for (int i = 0; i < list.count; i++) {
+            const rss_item_t *it = &list.items[i];
+            if (known_find(&m, it->id) >= 0) {
                 continue;
             }
+            if (!manual && player_busy()) {
+                interrupted = true; /* automatique : la suite attendra la fin de l'écoute */
+                break;
+            }
             char base[NAME_MAX_LEN], name[NAME_MAX_LEN];
-            rss_episode_name(&top[i], base, sizeof(base));
+            rss_episode_name(it, base, sizeof(base));
             if (!unique_name(folder, base, name, sizeof(name))) {
                 continue;
             }
-            ESP_LOGI(TAG, "%s : téléchargement de « %s »", folder, name);
-            if (!download(top[i].url, folder, name, err, sizeof(err))) {
+            s_dl_index = s_dl_index < s_dl_count ? s_dl_index + 1 : s_dl_count;
+            ESP_LOGI(TAG, "%s : téléchargement %d/%d : « %s »", folder, s_dl_index, s_dl_count, name);
+            if (!download(it->url, folder, name, err, sizeof(err))) {
                 ESP_LOGW(TAG, "%s : %s", folder, err);
                 break; /* réseau ou carte SD : on réessaiera */
             }
-            known_add(&m, &top[i], name);
+            known_add(&m, it, name);
             manifest_save(folder, &m); /* chaque épisode compte, même si la suite échoue */
             changes_notify(CHG_DATABASE);
             downloaded++;
         }
-        /* épisodes sortis des N plus récents : supprimés (sauf celui qu'on écoute) */
+        /* Épisodes sortis des N plus récents : supprimés (sauf celui qu'on écoute) et oubliés,
+         * pour revenir si N augmente. Un épisode déjà supprimé à la main reste connu : il ne
+         * revient jamais. Avec « tous » (0), rien n'est supprimé. */
+        bool prune = m.keep > 0 && m.keep <= RSS_LIST_MAX;
+        int w = 0;
         for (int k = 0; k < m.n_known; k++) {
-            if (!m.known[k].file[0]) {
-                continue;
+            known_t *e = &m.known[k];
+            bool listed = false;
+            for (int i = 0; i < list.count && !listed; i++) {
+                listed = list.items[i].id == e->id;
             }
-            bool keep = false;
-            for (int i = 0; i < count && !keep; i++) {
-                keep = strcmp(top[i].guid, m.known[k].guid) == 0;
+            if (!listed && prune && e->file[0] && !playing_file(folder, e->file)) {
+                char abs[ABS_PATH_MAX];
+                if (abs_of(folder, e->file, abs, sizeof(abs)) && unlink(abs) == 0) {
+                    e->file[0] = '\0';
+                    pruned++;
+                }
             }
-            if (keep || playing_file(folder, m.known[k].file)) {
-                continue;
+            if (listed || e->file[0]) {
+                m.known[w++] = *e;
             }
-            char abs[ABS_PATH_MAX];
-            if (abs_of(folder, m.known[k].file, abs, sizeof(abs))) {
-                unlink(abs);
-            }
-            m.known[k].file[0] = '\0';
-            pruned++;
         }
-        m.last_check = clock_valid() ? (int64_t)time(NULL) : 0;
-    } else if (!top) {
-        snprintf(err, sizeof(err), "mémoire insuffisante");
+        m.n_known = w;
+        if (!interrupted) {
+            m.last_check = clock_valid() ? (int64_t)time(NULL) : 0;
+        }
     }
+    s_dl_index = s_dl_count = 0;
     str_copy(m.last_error, err, sizeof(m.last_error));
     manifest_save(folder, &m);
     manifest_free(&m);
-    free(top);
+    rss_list_free(&list);
     if (downloaded || pruned) {
         changes_notify(CHG_DATABASE);
     }
     ESP_LOGI(TAG, "%s : %d épisode(s) téléchargé(s), %d supprimé(s)%s%s", folder, downloaded, pruned,
              err[0] ? " ; " : "", err);
+    log_buffer_memory("après");
     LOCK();
     s_busy_folder[0] = '\0';
     UNLOCK();
@@ -558,7 +676,7 @@ static void find_podcasts(const char *rel, int depth, found_t *f)
 static bool due(const char *folder)
 {
     manifest_t m;
-    if (!manifest_load(folder, &m)) {
+    if (!manifest_load(folder, &m, false)) {
         return false;
     }
     int64_t now = (int64_t)time(NULL);
@@ -569,13 +687,6 @@ static bool due(const char *folder)
     localtime_r(&t, &tm);
     bool night = tm.tm_hour >= NIGHT_FROM && tm.tm_hour < NIGHT_TO;
     return (night && age > DUE_NIGHT_S) || age > DUE_ANY_S;
-}
-
-static bool player_busy(void)
-{
-    player_status_t st;
-    player_get_status(&st);
-    return st.state == PLAYER_PLAYING;
 }
 
 static uint32_t s_stack_low = UINT32_MAX; /* d'une tâche à la suivante (même taille de pile) */
@@ -614,7 +725,7 @@ static void podcast_task(void *arg)
             if (!req->manual && (player_busy() || !due(f.folders[i]))) {
                 continue; /* automatique : jamais pendant l'écoute */
             }
-            sync_folder(f.folders[i]);
+            sync_folder(f.folders[i], req->manual);
             log_buffer_stack_check("podcast", NULL, &s_stack_low);
         }
     }
@@ -691,7 +802,7 @@ esp_err_t podcast_subscribe(const char *url, const char *name, int keep, char *f
         snprintf(err, errlen, "adresse de flux invalide (http:// ou https://)");
         return ESP_ERR_INVALID_ARG;
     }
-    if (keep < 1 || keep > PODCAST_KEEP_MAX) {
+    if (keep < 0 || keep > PODCAST_KEEP_MAX) {
         keep = PODCAST_KEEP_DEFAULT;
     }
     if (!storage_is_mounted()) {
@@ -719,10 +830,8 @@ esp_err_t podcast_subscribe(const char *url, const char *name, int keep, char *f
         return ESP_FAIL;
     }
     manifest_t m;
-    if (!manifest_init(&m)) {
-        snprintf(err, errlen, "mémoire insuffisante");
-        return ESP_ERR_NO_MEM;
-    }
+    manifest_init(&m);
+    m.episodes_loaded = true; /* liste vide, écrite avec le manifeste */
     str_copy(m.url, url, sizeof(m.url));
     str_copy(m.title, auto_name ? "" : name, sizeof(m.title));
     m.keep = keep;
@@ -745,7 +854,7 @@ esp_err_t podcast_update(const char *folder, const char *url, int keep)
         return ESP_ERR_INVALID_ARG;
     }
     manifest_t m;
-    if (!manifest_load(folder, &m)) {
+    if (!manifest_load(folder, &m, false)) {
         return ESP_ERR_NOT_FOUND;
     }
     bool changed = false;
@@ -753,7 +862,7 @@ esp_err_t podcast_update(const char *folder, const char *url, int keep)
         str_copy(m.url, url, sizeof(m.url));
         changed = true;
     }
-    if (keep >= 1 && keep <= PODCAST_KEEP_MAX && keep != m.keep) {
+    if (keep >= 0 && keep <= PODCAST_KEEP_MAX && keep != m.keep) {
         m.keep = keep;
         changed = true;
     }
@@ -771,6 +880,9 @@ esp_err_t podcast_unsubscribe(const char *folder)
     if (!abs_of(folder, PODCAST_FILE, abs, sizeof(abs)) || unlink(abs) != 0) {
         return ESP_ERR_NOT_FOUND;
     }
+    if (abs_of(folder, EPISODES_FILE, abs, sizeof(abs))) {
+        unlink(abs);
+    }
     ESP_LOGI(TAG, "désabonnement : %s (épisodes gardés)", folder);
     changes_notify(CHG_DATABASE);
     return ESP_OK;
@@ -779,7 +891,7 @@ esp_err_t podcast_unsubscribe(const char *folder)
 bool podcast_get(const char *folder, podcast_info_t *out)
 {
     manifest_t m;
-    if (!manifest_load(folder, &m)) {
+    if (!manifest_load(folder, &m, false)) {
         return false;
     }
     memset(out, 0, sizeof(*out));
@@ -788,17 +900,24 @@ bool podcast_get(const char *folder, podcast_info_t *out)
     out->keep = m.keep;
     out->last_check = m.last_check;
     str_copy(out->last_error, m.last_error, sizeof(out->last_error));
-    for (int i = 0; i < m.n_known; i++) {
-        char rel[REL_PATH_MAX];
-        if (m.known[i].file[0] && child_path(folder, m.known[i].file, rel, sizeof(rel)) && storage_exists(rel)) {
-            out->episodes++;
-        }
-    }
     manifest_free(&m);
+    /* épisodes présents : fichiers audio du dossier (une seule lecture du dossier) */
+    dir_entry_t *entries;
+    int n;
+    if (storage_list_dir(folder, &entries, &n) == ESP_OK) {
+        for (int i = 0; i < n; i++) {
+            out->episodes += !entries[i].is_dir && is_audio_file(entries[i].name) ? 1 : 0;
+        }
+        storage_free_dir(entries, n);
+    }
     LOCK();
     out->syncing = s_running && strcmp(s_busy_folder, folder) == 0;
     UNLOCK();
     int64_t total = s_dl_total, done = s_dl_done;
     out->progress = out->syncing && total > 0 ? (int)(done * 100 / total) : -1;
+    if (out->syncing) {
+        out->dl_index = s_dl_index;
+        out->dl_count = s_dl_count;
+    }
     return true;
 }

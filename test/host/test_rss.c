@@ -140,6 +140,43 @@ void test_rss(void)
     rss_keep_newest(top, 3, &count, &dated);
     CHECK(count == 2 && top[0].pub == 5 && top[1].pub == 0);
     free(top);
+
+    /* Liste des épisodes retenus : les 3 plus récents, ou tous (0) */
+    rss_list_t l;
+    rss_list_init(&l, 3);
+    for (int i = 0; i < 7; i++) {
+        rss_item_t it = {.pub = pubs[i]};
+        snprintf(it.guid, sizeof(it.guid), "g%d", i);
+        CHECK(rss_list_add(&l, &it));
+    }
+    rss_list_finish(&l);
+    CHECK(l.count == 3 && l.items[0].pub == 90 && l.items[1].pub == 90 && l.items[2].pub == 70);
+    CHECK_STR(l.items[0].guid, "g3");
+    CHECK_STR(l.items[1].guid, "g6");
+    rss_list_free(&l);
+    rss_list_init(&l, 0);
+    for (int i = 0; i < 7; i++) {
+        rss_item_t it = {.pub = pubs[i]};
+        snprintf(it.guid, sizeof(it.guid), "g%d", i);
+        CHECK(rss_list_add(&l, &it));
+    }
+    rss_list_finish(&l);
+    CHECK(l.count == 7 && l.items[0].pub == 90 && l.items[2].pub == 70 && l.items[6].pub == 0);
+    CHECK_STR(l.items[0].guid, "g3");
+    rss_list_free(&l);
+    /* flux du plus ancien au plus récent, plus long que la liste : les plus récents restent */
+    rss_list_init(&l, 0);
+    bool added = true;
+    for (int i = 1; i <= RSS_LIST_MAX + 500; i++) {
+        rss_item_t it = {.pub = i};
+        added = rss_list_add(&l, &it) && added;
+    }
+    rss_list_finish(&l);
+    CHECK(added && l.count == RSS_LIST_MAX && l.items[0].pub == RSS_LIST_MAX + 500 && l.items[RSS_LIST_MAX - 1].pub == 501);
+    rss_list_free(&l);
+    rss_list_init(&l, 100000);
+    CHECK(l.limit == RSS_LIST_MAX);
+    CHECK(rss_guid_id("ep-1") == rss_guid_id("ep-1") && rss_guid_id("ep-1") != rss_guid_id("ep-2"));
     free(a);
     free(g);
 }

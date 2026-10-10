@@ -106,7 +106,7 @@ const SOUND_LEVELS = ['désactivée', 'légère', 'moyenne', 'forte'];
 const GENERAL_DEFAULTS = { resume_s: 600, resume_after_other: false, shuffle: false, repeat: false, normalize: 2, compress: 2 };
 const KIND_ICON = { folder: '📁', radio: '📻', podcast: '🎙' };
 const KIND_LABEL = { radio: 'Webradio', podcast: 'Podcast' };
-const PODCAST_KEEP = { min: 1, max: 50, def: 10 };
+const PODCAST_KEEP = { max: 99999, def: 10 }; /* 0 : tous les épisodes */
 
 function fmtDate(epoch) {
   return new Date(epoch * 1000).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' });
@@ -634,7 +634,8 @@ async function renderCards() {
 const RADIO_HELP = 'Adresse d\'un flux MP3, AAC ou Ogg, souvent donnée sur le site de la radio (elle finit '
   + 'souvent par .mp3, .aac, .m3u ou .pls). Les flux HLS (.m3u8 découpé en segments) ne sont pas pris en charge.';
 const PODCAST_HELP = 'Adresse du flux RSS du podcast (« flux RSS » ou « RSS feed » sur son site ou son '
-  + 'application). Les nouveaux épisodes sont téléchargés chaque nuit ; seuls les plus récents sont gardés. '
+  + 'application). Les nouveaux épisodes sont téléchargés chaque nuit ; gardez-les tous (0) ou seulement '
+  + 'les plus récents. '
   + 'La carte les joue du plus ancien au plus récent, avec la reprise habituelle.';
 
 /* Champs d'une webradio : nom et adresse du flux. */
@@ -659,13 +660,14 @@ function radioFields() {
 function podcastFields() {
   const url = h('input', { type: 'url', placeholder: 'https://…/rss', autocapitalize: 'off', spellcheck: false });
   const name = h('input', { type: 'text', placeholder: 'Facultatif : titre du podcast', maxlength: 80 });
-  const keep = h('input', { type: 'number', class: 'short', min: PODCAST_KEEP.min, max: PODCAST_KEEP.max,
+  const keep = h('input', { type: 'number', class: 'short', min: 0, max: PODCAST_KEEP.max,
     step: 1, value: PODCAST_KEEP.def, inputmode: 'numeric', 'aria-label': 'Épisodes gardés' });
   const info = h('div', { class: 'small', hidden: true });
   const el = h('div', { class: 'stack' },
     h('label', null, 'Adresse du flux RSS'), url,
     h('label', null, 'Nom ', h('span', { class: 'muted' }, '(sans nom : le titre du podcast)')), name,
-    h('label', null, 'Épisodes gardés'), h('div', { class: 'row' }, keep, h('span', null, 'les plus récents')),
+    h('label', null, 'Épisodes gardés'),
+    h('div', { class: 'row' }, keep, h('span', null, 'les plus récents · 0 : tous')),
     info,
     h('p', { class: 'muted small' }, PODCAST_HELP));
   return {
@@ -674,8 +676,8 @@ function podcastFields() {
     check() {
       if (!isUrl(url.value.trim())) { toast('Adresse du flux RSS : http:// ou https://', true); return false; }
       const k = Number(keep.value);
-      if (!(Number.isInteger(k) && k >= PODCAST_KEEP.min && k <= PODCAST_KEEP.max)) {
-        toast(`Épisodes gardés : ${PODCAST_KEEP.min} à ${PODCAST_KEEP.max}`, true);
+      if (!(Number.isInteger(k) && k >= 0 && k <= PODCAST_KEEP.max)) {
+        toast('Épisodes gardés : un nombre entier, 0 pour tous', true);
         return false;
       }
       return true;
@@ -683,10 +685,21 @@ function podcastFields() {
   };
 }
 
+function keepText(keep) {
+  if (!keep) return 'tous les épisodes sont gardés';
+  return keep === 1 ? 'seul le plus récent est gardé' : `les ${keep} épisodes les plus récents sont gardés`;
+}
+
 function podcastSummary(pi) {
   const parts = [`${plural(pi.episodes, 'épisode', 'épisodes')} sur la carte SD`];
-  if (pi.syncing) parts.push('téléchargement en cours' + (pi.progress >= 0 ? ` (${pi.progress} %)` : '…'));
-  else parts.push(pi.last_check ? `vérifié le ${fmtDate(pi.last_check)}` : 'pas encore vérifié');
+  if (pi.syncing && pi.dl_index > 0) {
+    parts.push(`téléchargement de l'épisode ${pi.dl_index} sur ${pi.dl_count}`
+      + (pi.progress >= 0 ? ` (${pi.progress} %)` : '…'));
+  } else if (pi.syncing) {
+    parts.push('vérification du flux…');
+  } else {
+    parts.push(pi.last_check ? `vérifié le ${fmtDate(pi.last_check)}` : 'pas encore vérifié');
+  }
   return parts.join(' · ');
 }
 
@@ -1078,18 +1091,25 @@ function radioBox(folder) {
 function podcastBox(folder) {
   const info = h('div', { class: 'small' }, 'Chargement…');
   const sync = h('button', { class: 'small' }, '↻ Vérifier maintenant');
-  const edit = h('button', { class: 'small' }, '☰ Réglages');
+  const edit = h('button', { class: 'small', 'aria-expanded': 'false' }, '⚙ Réglages');
   const unsub = h('button', { class: 'small danger' }, 'Se désabonner');
+  const form = h('div', { class: 'stack', hidden: true });
   let last = null;
   const draw = (pi) => {
-    const was = last && last.syncing;
+    const prev = last;
     last = pi;
     setKids(info,
-      h('div', null, h('b', null, pi.title || 'Podcast'), ` · les ${pi.keep} épisodes les plus récents sont gardés`),
+      h('div', null, h('b', null, pi.title || 'Podcast'), ' · ' + keepText(pi.keep)),
       h('div', { class: pi.syncing ? '' : 'muted' }, podcastSummary(pi)),
       pi.last_error && !pi.syncing ? h('div', { class: 'error-text' }, pi.last_error) : null);
     sync.disabled = pi.syncing;
-    if (was && !pi.syncing && app.tab === 'music' && app.path === folder) renderMusic(folder); /* nouveaux épisodes */
+    /* Épisode arrivé ou supprimé, vérification finie : la liste des fichiers suit (sauf
+     * pendant les réglages, qu'on ne veut pas effacer). */
+    const changed = prev && (pi.episodes !== prev.episodes || (prev.syncing && !pi.syncing));
+    if (changed && form.hidden && app.tab === 'music' && app.path === folder) {
+      const y = window.scrollY;
+      renderMusic(folder).then(() => window.scrollTo(0, y));
+    }
   };
   const load = () => api('/api/podcast?folder=' + encodeURIComponent(folder)).then(draw).catch(reportError);
   sync.addEventListener('click', () => busy(sync, async () => {
@@ -1097,17 +1117,43 @@ function podcastBox(folder) {
     toast('Vérification lancée');
     setTimeout(load, 1500);
   }));
+  const closeForm = () => {
+    form.hidden = true;
+    edit.setAttribute('aria-expanded', 'false');
+    setKids(form);
+  };
+  const openForm = () => {
+    const keep = h('input', { type: 'number', class: 'short', min: 0, max: PODCAST_KEEP.max, step: 1,
+      value: last.keep, inputmode: 'numeric', 'aria-label': 'Épisodes gardés' });
+    const url = h('input', { type: 'url', value: last.url, autocapitalize: 'off', spellcheck: false });
+    const save = h('button', { class: 'small primary' }, 'Enregistrer');
+    const cancel = h('button', { class: 'small', onclick: closeForm }, 'Annuler');
+    save.addEventListener('click', () => busy(save, async () => {
+      const k = Number(keep.value);
+      if (!(keep.value !== '' && Number.isInteger(k) && k >= 0 && k <= PODCAST_KEEP.max)) {
+        toast('Épisodes gardés : un nombre entier, 0 pour tous', true);
+        return;
+      }
+      if (!isUrl(url.value.trim())) { toast('Adresse du flux RSS : http:// ou https://', true); return; }
+      await post('/api/podcast', { folder, action: 'update', url: url.value.trim(), keep: k });
+      toast(k && k < (last.keep || Infinity)
+        ? 'Enregistré : les épisodes les plus anciens vont être supprimés'
+        : 'Réglages du podcast enregistrés');
+      closeForm();
+      load();
+    }));
+    setKids(form,
+      h('label', null, 'Épisodes gardés'),
+      h('div', { class: 'row' }, keep, h('span', null, 'les plus récents · 0 : tous')),
+      h('label', null, 'Adresse du flux RSS'), url,
+      h('div', { class: 'row end' }, cancel, save));
+    form.hidden = false;
+    edit.setAttribute('aria-expanded', 'true');
+    keep.focus();
+  };
   edit.addEventListener('click', () => {
     if (!last) return;
-    const url = prompt('Adresse du flux RSS :', last.url);
-    if (url === null) return;
-    const keep = prompt(`Nombre d'épisodes gardés (${PODCAST_KEEP.min} à ${PODCAST_KEEP.max}) :`, String(last.keep));
-    if (keep === null) return;
-    busy(edit, async () => {
-      await post('/api/podcast', { folder, action: 'update', url: url.trim(), keep: Number(keep) });
-      toast('Réglages du podcast enregistrés');
-      load();
-    });
+    if (form.hidden) openForm(); else closeForm();
   });
   unsub.addEventListener('click', () => {
     if (!confirm('Se désabonner ? Les épisodes déjà téléchargés restent dans le dossier.')) return;
@@ -1120,7 +1166,7 @@ function podcastBox(folder) {
   load();
   const box = h('div', { class: 'content-box' },
     h('div', { class: 'small muted' }, '🎙 Podcast'), info,
-    h('div', { class: 'row' }, sync, edit, unsub));
+    h('div', { class: 'row' }, sync, edit, unsub), form);
   box.refresh = () => { if (last && last.syncing) load(); };
   return box;
 }

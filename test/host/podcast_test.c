@@ -199,7 +199,7 @@ int main(void)
 {
     mkdir(MUSIC_ROOT, 0755);
     mkdir(WEB_ROOT, 0755);
-    for (int i = 1; i <= 5; i++) {
+    for (int i = 1; i <= 7; i++) {
         char name[24];
         snprintf(name, sizeof(name), "ep%d.mp3", i);
         make_episode(name, 20 + i);
@@ -257,7 +257,7 @@ int main(void)
     CHECK(part_files(pf) == 0);
 
     /* 5. Réglages : flux injoignable, puis de nouveau joignable avec 3 épisodes gardés */
-    CHECK(podcast_update(pf, "http://ailleurs.example/feed.xml", 0) == ESP_OK);
+    CHECK(podcast_update(pf, "http://ailleurs.example/feed.xml", -1) == ESP_OK);
     CHECK(wait_idle());
     CHECK(podcast_get(pf, &pi) && strstr(pi.last_error, "flux injoignable") != NULL);
     write_feed(5, 0);
@@ -266,7 +266,16 @@ int main(void)
     CHECK(podcast_get(pf, &pi) && pi.keep == 3 && pi.last_error[0] == '\0');
     CHECK(sd_has("Podcasts/Contes du soir & co/2026-10-05 06h00 - Épisode 5.mp3"));
     CHECK(pi.episodes == 2); /* 5 et 4 ; le 3, supprimé à la main, n'est pas revenu */
-    CHECK(podcast_update(pf, "ftp://x", 0) == ESP_ERR_INVALID_ARG);
+    CHECK(podcast_update(pf, "ftp://x", -1) == ESP_ERR_INVALID_ARG);
+
+    /* 5 bis. Plus d'épisodes gardés : les anciens, supprimés quand ils sont sortis de la
+     * liste, reviennent ; celui supprimé à la main, non */
+    CHECK(podcast_update(pf, NULL, 5) == ESP_OK);
+    CHECK(wait_idle());
+    CHECK(podcast_get(pf, &pi) && pi.keep == 5 && pi.episodes == 4);
+    CHECK(sd_has("Podcasts/Contes du soir & co/2026-10-01 06h00 - Épisode 1.mp3"));
+    CHECK(sd_has("Podcasts/Contes du soir & co/2026-10-02 06h00 - Épisode 2.mp3"));
+    CHECK(!sd_has("Podcasts/Contes du soir & co/2026-10-03 06h00 - Épisode 3.mp3"));
 
     /* 6. Désabonnement : les épisodes restent */
     CHECK(podcast_unsubscribe(pf) == ESP_OK);
@@ -283,6 +292,46 @@ int main(void)
     CHECK_STR(pi.title, "Contes du soir & co"); /* titre du flux, le dossier garde son nom */
     CHECK(podcast_subscribe("javascript:alert(1)", "", 1, folder, sizeof(folder), err, sizeof(err)) != ESP_OK);
     CHECK(strstr(err, "invalide") != NULL);
+
+    /* 8. Tous les épisodes (0) : rien n'est jamais supprimé */
+    write_feed(6, 0);
+    CHECK(podcast_subscribe("http://test/feed.xml", "Intégrale", 0, folder, sizeof(folder), err, sizeof(err)) ==
+          ESP_OK);
+    CHECK(wait_idle());
+    CHECK(podcast_get(folder, &pi) && pi.keep == 0 && pi.episodes == 6 && pi.last_error[0] == '\0');
+    write_feed(7, 0);
+    podcast_sync_now(folder);
+    CHECK(wait_idle());
+    CHECK(podcast_get(folder, &pi) && pi.episodes == 7);
+    CHECK(sd_has("Podcasts/Intégrale/2026-10-01 06h00 - Épisode 1.mp3"));
+    CHECK(podcast_update(folder, NULL, 2) == ESP_OK); /* puis 2 : les plus anciens partent */
+    CHECK(wait_idle());
+    CHECK(podcast_get(folder, &pi) && pi.keep == 2 && pi.episodes == 2);
+    CHECK(sd_has("Podcasts/Intégrale/2026-10-07 06h00 - Épisode 7.mp3"));
+
+    /* 9. Manifeste de la version 1 (épisodes dans le JSON) : repris, puis réécrit */
+    CHECK(path_to_abs("Podcasts/Ancien", abs, sizeof(abs)) && mkdir(abs, 0755) == 0);
+    const char *v1 = "{\"format\":\"enceinte-podcast\",\"version\":1,\"url\":\"http://test/feed.xml\","
+                     "\"title\":\"Ancien\",\"keep\":2,\"last_check\":0,\"last_error\":\"\","
+                     "\"episodes\":[{\"guid\":\"ep-7\",\"file\":\"supprimé.mp3\",\"pub\":1}]}";
+    CHECK(path_to_abs("Podcasts/Ancien/.podcast.json", abs, sizeof(abs)));
+    write_file(abs, v1, strlen(v1));
+    podcast_sync_now("Podcasts/Ancien");
+    CHECK(wait_idle());
+    CHECK(podcast_get("Podcasts/Ancien", &pi) && pi.episodes == 1 && pi.keep == 2); /* le 6 ; le 7 est connu */
+    CHECK(sd_has("Podcasts/Ancien/2026-10-06 06h00 - Épisode 6.mp3"));
+    CHECK(sd_has("Podcasts/Ancien/.podcast-episodes.txt"));
+    FILE *mf = fopen(abs, "rb");
+    char mtxt[2048] = "";
+    if (mf) {
+        mtxt[fread(mtxt, 1, sizeof(mtxt) - 1, mf)] = '\0';
+        fclose(mf);
+    }
+    CHECK(strstr(mtxt, "episodes") == NULL && strstr(mtxt, "\"version\":\t2") != NULL);
+    podcast_sync_now("Podcasts/Ancien"); /* relu depuis le fichier des épisodes : rien de nouveau */
+    CHECK(wait_idle());
+    CHECK(podcast_get("Podcasts/Ancien", &pi) && pi.episodes == 1 && pi.last_error[0] == '\0');
+    CHECK(!sd_has("Podcasts/Ancien/2026-10-07 06h00 - Épisode 7.mp3"));
 
     printf("podcasts : %d vérifications, %d échec(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

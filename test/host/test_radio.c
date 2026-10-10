@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 
 #include "radio.h"
 #include "test.h"
@@ -37,6 +38,23 @@ void test_radio(void)
     free(longtext);
 
     CHECK(radio_is_url("HTTPS://x") && radio_is_url("http://x") && !radio_is_url("Radios/x.mp3") && !radio_is_url(NULL));
+
+    /* Redirections : la requête (clé d'accès des hébergeurs de podcasts) est conservée */
+    char r[96];
+    const char *base = "https://traffic.megaphone.fm/ABC123.mp3?updated=17";
+    CHECK(url_resolve(base, "https://dcs.megaphone.fm/ABC123.mp3?key=k1&event=e2", r, sizeof(r)) &&
+          strcmp(r, "https://dcs.megaphone.fm/ABC123.mp3?key=k1&event=e2") == 0);
+    CHECK(url_resolve(base, "http://cdn.fr/a.mp3", r, sizeof(r)) && strcmp(r, "http://cdn.fr/a.mp3") == 0);
+    CHECK(url_resolve(base, "//cdn.fr/a.mp3?x=1", r, sizeof(r)) && strcmp(r, "https://cdn.fr/a.mp3?x=1") == 0);
+    CHECK(url_resolve(base, "/v2/b.mp3?k=2", r, sizeof(r)) && strcmp(r, "https://traffic.megaphone.fm/v2/b.mp3?k=2") == 0);
+    CHECK(url_resolve(base, "?updated=18", r, sizeof(r)) && strcmp(r, "https://traffic.megaphone.fm/ABC123.mp3?updated=18") == 0);
+    CHECK(url_resolve("https://h.fr/a/b/c.mp3?q=/x/y", "d.mp3", r, sizeof(r)) && strcmp(r, "https://h.fr/a/b/d.mp3") == 0);
+    CHECK(url_resolve("https://h.fr", "d.mp3", r, sizeof(r)) && strcmp(r, "https://h.fr/d.mp3") == 0);
+    CHECK(url_resolve("https://h.fr?q=1", "/d.mp3", r, sizeof(r)) && strcmp(r, "https://h.fr/d.mp3") == 0);
+    CHECK(!url_resolve(base, "", r, sizeof(r)));
+    CHECK(!url_resolve("pas une adresse", "/d.mp3", r, sizeof(r)));
+    CHECK(!url_resolve(base, "/un/chemin/bien/trop/long/pour/le/tampon/de/sortie/qui/ne/fait/que/96/octets.mp3", r,
+                       sizeof(r)));
 
     /* Listes ou flux, format */
     CHECK(radio_is_playlist("audio/x-mpegurl", "http://x/live"));
