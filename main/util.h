@@ -38,6 +38,13 @@ bool path_to_abs(const char *rel, char *out, size_t outlen);
 /* Valide un nom de fichier ou dossier isolé (sans '/'). */
 bool name_is_valid(const char *name);
 
+/*
+ * Nom de fichier ou de dossier valide tiré d'un texte libre (titre de radio, de podcast,
+ * d'épisode) : caractères interdits par FAT remplacés, espaces réunis, au plus maxlen octets
+ * sans couper un caractère UTF-8. Texte vide : « fallback ».
+ */
+void name_from_text(const char *in, char *out, size_t maxlen, const char *fallback);
+
 const char *path_basename(const char *path);
 void path_dirname(const char *path, char *out, size_t outlen);
 

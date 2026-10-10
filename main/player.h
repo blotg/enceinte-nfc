@@ -45,6 +45,8 @@ typedef struct {
     uint8_t single; /* 0, 1, 2 = "oneshot" */
     bool seekable;
     uint32_t paused_s; /* durée de la pause en cours */
+    bool stream;       /* webradio : en direct, sans durée ni recherche */
+    char stream_title[128]; /* titre diffusé par la webradio */
     uint16_t sleep_tracks; /* mode sommeil : morceaux restants, celui-ci compris (0 : sans limite) */
     uint32_t sleep_s;      /* mode sommeil : secondes de lecture restantes (0 : sans limite) */
     bool sleep_done;       /* en pause à cause du mode sommeil */

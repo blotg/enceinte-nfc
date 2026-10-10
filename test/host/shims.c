@@ -154,6 +154,28 @@ BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t ticks)
     return pdTRUE;
 }
 
+esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *out)
+{
+    (void)args;
+    *out = NULL;
+    return ESP_OK;
+}
+
+esp_err_t esp_timer_start_periodic(esp_timer_handle_t timer, uint64_t period_us)
+{
+    (void)timer;
+    (void)period_us;
+    return ESP_OK;
+}
+
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q)
+{
+    pthread_mutex_lock(&q->m);
+    UBaseType_t n = q->count;
+    pthread_mutex_unlock(&q->m);
+    return n;
+}
+
 /* ---------- Mutex ---------- */
 
 struct shim_sem {
@@ -410,4 +432,79 @@ esp_audio_err_t esp_audio_simple_dec_get_info(esp_audio_simple_dec_handle_t h, e
 void esp_audio_simple_dec_close(esp_audio_simple_dec_handle_t h)
 {
     free(h);
+}
+
+/* ---------- Webradio simulée (cf. main/stream.h) ----------
+ * « http://test/<chemin> » lit <chemin> de la carte SD simulée en boucle, au format déduit de
+ * l'extension, et annonce le titre « Titre simulé » ; toute autre adresse est injoignable.
+ * shim_stream_cut() simule une coupure : la lecture suivante échoue (reconnexion). */
+#include "stream.h"
+#include "util.h"
+
+struct stream {
+    FILE *f;
+    bool titled;
+};
+
+static volatile int s_stream_opens, s_stream_cut;
+
+int shim_stream_opens(void)
+{
+    return s_stream_opens;
+}
+
+void shim_stream_cut(void)
+{
+    s_stream_cut = 1;
+}
+
+stream_t *stream_open(const char *url, audio_fmt_t *fmt, char *err, size_t errlen)
+{
+    const char *prefix = "http://test/";
+    char abs[ABS_PATH_MAX];
+    if (strncmp(url, prefix, strlen(prefix)) != 0 || !path_to_abs(url + strlen(prefix), abs, sizeof(abs))) {
+        snprintf(err, errlen, "radio injoignable (simulation)");
+        return NULL;
+    }
+    FILE *f = fopen(abs, "rb");
+    if (!f) {
+        snprintf(err, errlen, "radio indisponible (erreur HTTP 404)");
+        return NULL;
+    }
+    stream_t *s = calloc(1, sizeof(*s));
+    s->f = f;
+    *fmt = audio_fmt_from_name(url);
+    __atomic_add_fetch(&s_stream_opens, 1, __ATOMIC_RELAXED);
+    return s;
+}
+
+int stream_read(stream_t *s, uint8_t *buf, int len)
+{
+    if (__atomic_exchange_n(&s_stream_cut, 0, __ATOMIC_RELAXED)) {
+        return -1;
+    }
+    size_t n = fread(buf, 1, (size_t)len, s->f);
+    if (n == 0) {
+        rewind(s->f); /* en direct : le flux ne finit jamais */
+        n = fread(buf, 1, (size_t)len, s->f);
+    }
+    return (int)n;
+}
+
+bool stream_take_title(stream_t *s, char *out, size_t len)
+{
+    if (s->titled) {
+        return false;
+    }
+    s->titled = true;
+    snprintf(out, len, "Titre simulé");
+    return true;
+}
+
+void stream_close(stream_t *s)
+{
+    if (s) {
+        fclose(s->f);
+        free(s);
+    }
 }

@@ -23,8 +23,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "media_info.h"
+#include "radio.h"
 #include "sdkconfig.h"
 #include "settings.h"
+#include "stream.h"
 
 static const char *TAG = "player";
 
@@ -32,6 +34,12 @@ static const char *TAG = "player";
 #define CMD_WAIT_MS 2000
 #define MAX_FAIL_STREAK 10
 #define SLEEP_FADE_US (15LL * 1000000) /* mode sommeil : fondu sur les 15 dernières secondes */
+/* Webradio */
+#define STREAM_FILL_US (300LL * 1000)      /* un bloc part au plus tard après ce délai */
+#define STREAM_SILENCE_US (10LL * 1000000) /* aucune donnée pendant ce temps : reconnexion */
+#define STREAM_RETRIES 3
+#define STREAM_PREROLL_CHUNKS 4            /* blocs reçus avant de commencer à jouer... */
+#define STREAM_PREROLL_US (3LL * 1000000)  /* ...ou au plus tard après ce délai */
 
 /* ---------- Structures ---------- */
 
@@ -40,15 +48,18 @@ typedef struct {
     uint32_t gen;
     uint32_t start_ms; /* position réelle de départ (après une recherche) */
     int len;
+    audio_fmt_t fmt; /* webradio : format du flux */
     bool eof;
     bool first;
+    bool restart; /* webradio : reconnexion, le décodeur repart de zéro */
     bool error;
 } chunk_t;
 
 typedef struct {
-    char path[ABS_PATH_MAX]; /* vide = fermer */
+    char path[ABS_PATH_MAX]; /* fichier, ou adresse d'une webradio ; vide = fermer */
     uint32_t gen;
     uint32_t seek_ms;
+    bool stream;
 } read_req_t;
 
 typedef struct {
@@ -104,6 +115,11 @@ static int64_t s_sleep_us; /* durée de lecture avant la pause, 0 : sans limite 
 static bool s_sleep_done;  /* lecture mise en pause par le mode sommeil */
 static media_info_t s_probe;
 static uint32_t s_probe_gen;
+/* Webradio en cours (cf. reader_task) */
+static bool s_cur_stream;
+static uint32_t s_stream_gen;
+static char s_stream_title[RADIO_TITLE_MAX];
+static char s_stream_err[96];
 
 /* ---------- Propre à la tâche player ---------- */
 
@@ -126,6 +142,7 @@ static int s_dec_errors, s_stall, s_fail_streak;
 static bool s_skip_pending;
 static int s_chunk_size, s_nchunks;
 static uint8_t *s_bounce; /* tampon interne compatible DMA pour la lecture SD */
+static int64_t s_preroll_until; /* webradio : on attend quelques blocs avant de jouer */
 static player_event_cb_t s_cb;
 static dsp_t s_dsp;
 static float *s_fpcm; /* PCM_FRAMES échantillons mono pour la normalisation et la compression */
@@ -292,27 +309,138 @@ static void send_chunk_error(uint32_t gen)
     c->len = 0;
     c->eof = true;
     c->first = true;
+    c->restart = false;
     c->error = true;
     c->start_ms = 0;
     xQueueSend(s_filled_q, &c, portMAX_DELAY);
 }
 
+/* Webradio : connexion, message d'erreur mémorisé pour l'affichage. */
+static stream_t *open_stream(const char *url, uint32_t gen, audio_fmt_t *fmt)
+{
+    char err[96];
+    stream_t *st = stream_open(url, fmt, err, sizeof(err));
+    if (!st) {
+        ESP_LOGW(TAG, "webradio : %s", err);
+        LOCK();
+        if (s_stream_gen == gen) {
+            str_copy(s_stream_err, err, sizeof(s_stream_err));
+        }
+        UNLOCK();
+    }
+    return st;
+}
+
+/*
+ * Bloc d'une webradio : rempli au plus tard en STREAM_FILL_US, rendu au réservoir si rien
+ * n'est arrivé. Connexion perdue (ou silence prolongé) : reconnexion, puis erreur.
+ */
+static void stream_step(stream_t **pst, const char *url, uint32_t gen, audio_fmt_t *fmt, bool *first,
+                        bool *restart, int64_t *last_data)
+{
+    chunk_t *c;
+    if (xQueueReceive(s_free_q, &c, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return; /* réservoir plein : on revient surveiller les requêtes */
+    }
+    int filled = 0;
+    bool lost = false;
+    int64_t t0 = esp_timer_get_time();
+    while (filled < s_chunk_size && uxQueueMessagesWaiting(s_req_q) == 0) {
+        int n = stream_read(*pst, c->data + filled, s_chunk_size - filled);
+        int64_t now = esp_timer_get_time();
+        if (n < 0 || (n == 0 && now - *last_data > STREAM_SILENCE_US)) {
+            lost = true;
+            break;
+        }
+        if (n > 0) {
+            filled += n;
+            *last_data = now;
+        }
+        if (filled > 0 && now - t0 > STREAM_FILL_US) {
+            break;
+        }
+    }
+    char title[RADIO_TITLE_MAX];
+    if (stream_take_title(*pst, title, sizeof(title))) {
+        ESP_LOGI(TAG, "webradio : %s", title[0] ? title : "(pas de titre)");
+        LOCK();
+        if (s_stream_gen == gen) {
+            str_copy(s_stream_title, title, sizeof(s_stream_title));
+        }
+        UNLOCK();
+        changes_notify(CHG_PLAYER);
+    }
+    if (filled > 0) {
+        c->gen = gen;
+        c->first = *first;
+        c->restart = *restart;
+        c->fmt = *fmt;
+        c->start_ms = 0;
+        c->len = filled;
+        c->eof = false;
+        c->error = false;
+        *first = *restart = false;
+        xQueueSend(s_filled_q, &c, portMAX_DELAY);
+    } else {
+        xQueueSend(s_free_q, &c, 0);
+    }
+    if (!lost) {
+        return;
+    }
+    stream_close(*pst);
+    *pst = NULL;
+    ESP_LOGW(TAG, "webradio : connexion perdue, reconnexion");
+    for (int attempt = 1; attempt <= STREAM_RETRIES && !*pst && uxQueueMessagesWaiting(s_req_q) == 0; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(1000 * attempt));
+        if (uxQueueMessagesWaiting(s_req_q) == 0) {
+            *pst = open_stream(url, gen, fmt);
+        }
+    }
+    if (*pst) {
+        *restart = true; /* nouveau flux : le décodeur repart de zéro */
+        *last_data = esp_timer_get_time();
+    } else if (uxQueueMessagesWaiting(s_req_q) == 0) {
+        send_chunk_error(gen);
+    }
+}
+
 static void reader_task(void *arg)
 {
     int fd = -1;
+    stream_t *st = NULL;
+    char *url = malloc(ABS_PATH_MAX);
+    audio_fmt_t stream_fmt = AUDIO_FMT_NONE;
+    bool stream_restart = false;
+    int64_t last_data = 0;
     uint32_t gen = 0, pos = 0, size = 0, start_ms = 0;
     uint32_t header_left = 0, jump_to = 0; /* repositionnement : en-tête d'abord, puis saut */
     bool first = false;
     media_info_t *mi = malloc(sizeof(media_info_t));
     for (;;) {
         read_req_t req;
-        if (xQueueReceive(s_req_q, &req, fd >= 0 ? 0 : portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(s_req_q, &req, (fd >= 0 || st) ? 0 : portMAX_DELAY) == pdTRUE) {
             if (fd >= 0) {
                 close(fd);
                 fd = -1;
             }
+            if (st) {
+                stream_close(st);
+                st = NULL;
+            }
             gen = req.gen;
             if (!req.path[0]) {
+                continue;
+            }
+            if (req.stream) {
+                str_copy(url, req.path, ABS_PATH_MAX);
+                st = open_stream(url, gen, &stream_fmt);
+                if (!st) {
+                    send_chunk_error(gen);
+                    continue;
+                }
+                first = true;
+                stream_restart = false;
+                last_data = esp_timer_get_time();
                 continue;
             }
             audio_fmt_t fmt = audio_fmt_from_name(req.path);
@@ -340,8 +468,8 @@ static void reader_task(void *arg)
             s_probe_gen = gen;
             UNLOCK();
             fd = open(req.path, O_RDONLY);
-            struct stat st;
-            if (fd < 0 || fstat(fd, &st) != 0) {
+            struct stat stt;
+            if (fd < 0 || fstat(fd, &stt) != 0) {
                 if (fd >= 0) {
                     close(fd);
                     fd = -1;
@@ -349,7 +477,7 @@ static void reader_task(void *arg)
                 send_chunk_error(gen);
                 continue;
             }
-            size = (uint32_t)st.st_size;
+            size = (uint32_t)stt.st_size;
             pos = 0;
             header_left = 0;
             if (sk.offset && sk.header_end) {
@@ -366,6 +494,10 @@ static void reader_task(void *arg)
                 ESP_LOGI(TAG, "reprise à %u,%03u s", (unsigned)(start_ms / 1000), (unsigned)(start_ms % 1000));
             }
             first = true;
+            continue;
+        }
+        if (st) {
+            stream_step(&st, url, gen, &stream_fmt, &first, &stream_restart, &last_data);
             continue;
         }
         if (fd < 0) {
@@ -392,6 +524,7 @@ static void reader_task(void *arg)
         }
         c->gen = gen;
         c->first = first;
+        c->restart = false;
         c->start_ms = start_ms;
         first = false;
         if (n < 0) {
@@ -617,14 +750,26 @@ static void start_song(uint32_t id, uint32_t seek_ms)
     close_decoder();
     drop_current_chunk();
     s_gen++;
-    read_req_t req = {.gen = s_gen, .seek_ms = seek_ms};
-    if (!path_to_abs(rel, req.path, sizeof(req.path))) {
+    bool stream = radio_is_url(rel); /* webradio : le décodeur s'ouvre quand le format est connu */
+    if (stream) {
+        seek_ms = 0; /* toujours en direct */
+    }
+    read_req_t req = {.gen = s_gen, .seek_ms = seek_ms, .stream = stream};
+    if (stream) {
+        str_copy(req.path, rel, sizeof(req.path));
+    } else if (!path_to_abs(rel, req.path, sizeof(req.path))) {
         req.path[0] = '\0';
     }
+    LOCK();
+    s_cur_stream = stream;
+    s_stream_gen = s_gen;
+    s_stream_title[0] = s_stream_err[0] = '\0';
+    UNLOCK();
     xQueueOverwrite(s_req_q, &req);
+    s_preroll_until = stream ? esp_timer_get_time() + STREAM_PREROLL_US : 0;
 
     audio_fmt_t fmt = audio_fmt_from_name(rel);
-    bool ok = req.path[0] && open_decoder(fmt);
+    bool ok = req.path[0] && (stream || open_decoder(fmt));
     LOCK();
     s_cur_id = id;
     s_state = PLAYER_PLAYING;
@@ -822,8 +967,25 @@ static void track_failed(const char *msg)
     advance(false);
 }
 
+/* Webradio en pause : la connexion est fermée ; à la reprise, on repart en direct. */
+static void stream_suspend(void)
+{
+    close_decoder();
+    drop_current_chunk();
+    s_gen++;
+    read_req_t req = {.gen = s_gen};
+    xQueueOverwrite(s_req_q, &req);
+}
+
 static void decode_step(void)
 {
+    if (s_preroll_until) {
+        if (uxQueueMessagesWaiting(s_filled_q) < STREAM_PREROLL_CHUNKS && esp_timer_get_time() < s_preroll_until) {
+            vTaskDelay(pdMS_TO_TICKS(10)); /* quelques secondes d'avance contre les à-coups du réseau */
+            return;
+        }
+        s_preroll_until = 0;
+    }
     if (s_raw.len == 0) {
         if (s_chunk) {
             bool eof = s_chunk->eof;
@@ -854,8 +1016,20 @@ static void decode_step(void)
         }
         if (c->error) {
             release_chunk(c);
-            track_failed("lecture impossible");
+            char msg[sizeof(s_stream_err)];
+            LOCK();
+            str_copy(msg, s_cur_stream && s_stream_err[0] ? s_stream_err : "lecture impossible", sizeof(msg));
+            UNLOCK();
+            track_failed(msg);
             return;
+        }
+        if (s_cur_stream && (c->first || c->restart)) {
+            close_decoder();
+            if (!open_decoder(c->fmt)) {
+                release_chunk(c);
+                track_failed("format de flux non pris en charge");
+                return;
+            }
         }
         if (c->len == 0) {
             release_chunk(c);
@@ -939,7 +1113,9 @@ static void handle_cmd(const cmd_t *c)
             }
         }
         UNLOCK();
-        if (c->arg < 0 && st == PLAYER_PAUSED) {
+        if (c->arg < 0 && st == PLAYER_PAUSED && s_cur_stream) {
+            start_song(s_cur_id, 0); /* webradio : reprise en direct */
+        } else if (c->arg < 0 && st == PLAYER_PAUSED) {
             LOCK();
             s_state = PLAYER_PLAYING;
             UNLOCK();
@@ -959,14 +1135,23 @@ static void handle_cmd(const cmd_t *c)
     case CMD_PAUSE: {
         LOCK();
         player_state_t st = s_state;
+        bool stream = s_cur_stream;
+        uint32_t id = s_cur_id;
+        bool resume = st == PLAYER_PAUSED && (c->arg == 0 || c->arg == -1);
         if (st == PLAYER_PLAYING && (c->arg == 1 || c->arg == -1)) {
             s_state = PLAYER_PAUSED;
             s_paused_at_us = esp_timer_get_time();
-        } else if (st == PLAYER_PAUSED && (c->arg == 0 || c->arg == -1)) {
+        } else if (resume && !stream) {
             s_state = PLAYER_PLAYING;
         }
         bool changed = st != s_state;
         UNLOCK();
+        if (stream && st == PLAYER_PLAYING && changed) {
+            stream_suspend();
+        } else if (stream && resume) {
+            start_song(id, 0); /* webradio : reprise en direct */
+            changed = false;   /* start_song a prévenu */
+        }
         if (changed) {
             changes_notify(CHG_PLAYER);
         }
@@ -1119,7 +1304,8 @@ esp_err_t player_init(uint8_t volume, uint8_t max_volume, player_event_cb_t cb)
         ESP_LOGE(TAG, "I2S : %s", esp_err_to_name(err));
         return err;
     }
-    xTaskCreatePinnedToCore(reader_task, "reader", 4608, NULL, 9, NULL, 1);
+    /* La connexion HTTPS d'une webradio (TLS) demande de la pile. */
+    xTaskCreatePinnedToCore(reader_task, "reader", 8192, NULL, 9, NULL, 1);
     /* Les décodeurs (Opus, Vorbis, FLAC...) demandent environ 20 Ko de pile selon Espressif. */
     xTaskCreatePinnedToCore(player_task, "player", 24576, NULL, 10, &s_player_task, 1);
     return ESP_OK;
@@ -1154,6 +1340,8 @@ void player_get_status(player_status_t *st)
     st->sleep_tracks = (uint16_t)s_sleep_tracks;
     st->sleep_s = (uint32_t)((s_sleep_us + 999999) / 1000000);
     st->sleep_done = s_sleep_done && s_state == PLAYER_PAUSED;
+    st->stream = s_cur_stream && cur >= 0;
+    str_copy(st->stream_title, st->stream ? s_stream_title : "", sizeof(st->stream_title));
     if (cur >= 0) {
         str_copy(st->file, s_queue[cur].path, sizeof(st->file));
     }

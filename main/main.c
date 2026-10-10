@@ -17,6 +17,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "log_buffer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mpd_server.h"
@@ -24,6 +25,7 @@
 #include "nvs_flash.h"
 #include "ota.h"
 #include "player.h"
+#include "podcast.h"
 #include "sdkconfig.h"
 #include "settings.h"
 #include "storage.h"
@@ -76,8 +78,10 @@ static void system_task(void *arg)
 
 void app_main(void)
 {
+    log_buffer_start(); /* journal de l'interface web : avant tout autre message */
     const esp_app_desc_t *app = esp_app_get_description();
     ESP_LOGI(TAG, "Enceinte NFC version %s", app->version);
+    log_buffer_report_boot();
 
     setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); /* heure de Paris */
     tzset();
@@ -110,6 +114,7 @@ void app_main(void)
     web_server_start();
     mpd_server_start();
     ota_start();
+    podcast_start(); /* abonnements : téléchargements de la nuit */
     backup_start(); /* associations de la carte SD, cartes remises en place */
 
     xTaskCreate(system_task, "system", 6144, NULL, 2, NULL); /* réinitialisation usine : parcours de la carte SD */

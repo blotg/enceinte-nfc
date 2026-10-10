@@ -12,6 +12,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "radio.h"
 #include "resume_store.h"
 #include "sdkconfig.h"
 #include "session.h"
@@ -71,6 +72,9 @@ static bool s_dirty[MAX_POINTS];
 /* mode sommeil transmis au lecteur pour la carte qui joue */
 static char s_sleep_uid[UID_STR_MAX];
 static uint16_t s_sleep_tracks, s_sleep_minutes;
+/* répétition transmise au lecteur pour la carte qui joue (-1 : aucune) */
+static char s_repeat_uid[UID_STR_MAX];
+static int8_t s_repeat_applied = -1;
 
 #define LOCK() xSemaphoreTake(s_lock, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(s_lock)
@@ -143,6 +147,18 @@ static bool shuffle_for(const char *uid)
         return e.shuffle == 1;
     }
     return cfg.shuffle;
+}
+
+/* Répétition de la playlist : réglage de la carte, sinon réglage général. */
+static bool repeat_for(const char *uid)
+{
+    settings_t cfg;
+    settings_get(&cfg);
+    card_entry_t e;
+    if (cards_get(uid, &e) && e.repeat != CARD_DEFAULT) {
+        return e.repeat == 1;
+    }
+    return cfg.repeat;
 }
 
 /* Normalisation et compression : réglage de la carte qui joue, sinon réglage général
@@ -241,6 +257,32 @@ static void track_sleep(void)
     }
     if (strcmp(uid, s_sleep_uid) != 0 || tracks != s_sleep_tracks || minutes != s_sleep_minutes) {
         apply_sleep(uid);
+    }
+}
+
+/*
+ * Répétition : l'option « repeat » du lecteur (celle de MPD) suit la carte qui joue, à sa pose
+ * et quand son réglage change. Une application MPD peut la changer pendant l'écoute ; hors
+ * carte (lecture lancée depuis l'interface web ou MPD), elle n'est pas touchée.
+ */
+static void apply_repeat(const char *uid)
+{
+    bool on = repeat_for(uid);
+    str_copy(s_repeat_uid, uid, sizeof(s_repeat_uid));
+    s_repeat_applied = on ? 1 : 0;
+    player_set_repeat(on);
+}
+
+static void track_repeat(void)
+{
+    if (!point_is_live(s_live)) {
+        s_repeat_uid[0] = '\0';
+        s_repeat_applied = -1;
+        return;
+    }
+    const char *uid = s_points[s_live].uid;
+    if (strcmp(uid, s_repeat_uid) != 0 || s_repeat_applied != (repeat_for(uid) ? 1 : 0)) {
+        apply_repeat(uid);
     }
 }
 
@@ -360,6 +402,9 @@ static void play_folder_from(int pi, const char *folder, const char *track, uint
     }
     char first[REL_PATH_MAX];
     str_copy(first, tracks.items[index], sizeof(first));
+    if (radio_is_url(first)) {
+        position_ms = 0; /* webradio : toujours en direct */
+    }
     err = player_queue_replace(&tracks);
     int count = tracks.count;
     path_list_free(&tracks);
@@ -384,6 +429,7 @@ static void play_folder_from(int pi, const char *folder, const char *track, uint
     UNLOCK();
     persist(pi);
     apply_sound(p->uid);
+    apply_repeat(p->uid);
     if (position_ms > 0) {
         ESP_LOGI(TAG, "carte %s : reprise de \"%s\" à %u s", p->uid, first, (unsigned)(position_ms / 1000));
         if (player_seek(index, position_ms) != ESP_OK) {
@@ -447,6 +493,7 @@ static void on_card_on(const char *uid)
         if (action == SESSION_RESUME_LIVE) {
             ESP_LOGI(TAG, "reprise de la carte %s", uid);
             apply_sound(uid);
+            apply_repeat(uid);
             player_pause(0);
             apply_sleep(uid);
         }
@@ -531,6 +578,12 @@ static void track_live_position(int64_t now)
     if (s_dirty[i]) {
         return; /* un point complet est déjà en attente d'écriture */
     }
+    if (st.stream) {
+        if (track_changed) {
+            persist(i); /* webradio : la position n'a pas de sens, seul le flux compte */
+        }
+        return;
+    }
     if (track_changed) {
         persist(i); /* nouveau morceau : point complet */
     } else if (now - s_last_pos_us[i] >= SAVE_PERIOD_US && moved >= SAVE_MIN_PROGRESS_MS) {
@@ -542,6 +595,7 @@ static void tick(int64_t now)
 {
     track_live_position(now);
     track_sleep();
+    track_repeat();
     apply_sound(point_is_live(s_live) ? s_points[s_live].uid : NULL); /* réglages modifiés entre-temps */
     for (int i = 0; i < MAX_POINTS; i++) {
         resume_point_t *p = &s_points[i];

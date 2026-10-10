@@ -58,20 +58,27 @@ else
 fi
 
 echo "== 1. Tests unitaires"
-JSON=()
+# cJSON : bibliothèque du système (libcjson-dev), sinon sources fournies avec ESP-IDF
+CJSON=()
 if [ -f /usr/include/cjson/cJSON.h ]; then
-    JSON=(-DHAVE_CJSON -I/usr/include/cjson "$MAIN/config_json.c" -lcjson)
+    CJSON=(-I/usr/include/cjson -lcjson)
+elif [ -n "${IDF_PATH:-}" ] && [ -f "$IDF_PATH/components/json/cJSON/cJSON.c" ]; then
+    CJSON=(-I"$IDF_PATH/components/json/cJSON" "$IDF_PATH/components/json/cJSON/cJSON.c")
+fi
+JSON=()
+if [ ${#CJSON[@]} -gt 0 ]; then
+    JSON=(-DHAVE_CJSON "$MAIN/config_json.c" "${CJSON[@]}")
 fi
 gcc "${CFLAGS[@]}" -DDNS_HOST_TEST -I"$MAIN" -I"$HERE" -I"$HERE/stubs" \
     "$HERE"/test_*.c "$MAIN/util.c" "$MAIN/pn532_frame.c" "$MAIN/session.c" "$MAIN/dns_server.c" \
-    "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/dsp.c" "$MAIN/touch_keys.c" "$MAIN/pn5180_proto.c" "${JSON[@]}" -lm -o "$WORK/tests"
+    "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/dsp.c" "$MAIN/touch_keys.c" "$MAIN/pn5180_proto.c" "$MAIN/log_ring.c" "$MAIN/radio.c" "$MAIN/rss.c" "${JSON[@]}" -lm -o "$WORK/tests"
 if [ $HAVE_MEDIA = 1 ]; then "$WORK/tests" "$FIX"; else "$WORK/tests"; fi
 
 echo "== 2. Contrôleur de cartes (vrai lecteur)"
 rm -rf "$WORK/sd_ctrl"
 gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd_ctrl\"" -DCONFIG_ENC_RESUME_TIMEOUT_S=2 \
     -I"$HERE/stubs" -I"$MAIN" -I"$HERE" "$HERE/controller_test.c" "$HERE/shims.c" "$HERE/mocks.c" \
-    "$MAIN/controller.c" "$MAIN/session.c" "$MAIN/player.c" "$MAIN/dsp.c" "$MAIN/media_info.c" "$MAIN/util.c" \
+    "$MAIN/controller.c" "$MAIN/session.c" "$MAIN/player.c" "$MAIN/dsp.c" "$MAIN/media_info.c" "$MAIN/util.c" "$MAIN/radio.c" \
     "$MAIN/changes.c" -lm -o "$WORK/controller_test"
 if [ $HAVE_MEDIA = 1 ]; then
     ASAN_OPTIONS=detect_leaks=0 "$WORK/controller_test" "$FIX"
@@ -82,7 +89,7 @@ fi
 echo "== 3. Intégration MPD"
 if [ $HAVE_MEDIA = 1 ] && "$PY" -c "import mpd" 2> /dev/null; then
     gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd\"" -I"$HERE/stubs" -I"$MAIN" -I"$HERE" \
-        "$HERE/mpd_host_main.c" "$HERE/shims.c" "$HERE/mocks.c" "$MAIN/player.c" "$MAIN/dsp.c" "$MAIN/mpd_server.c" \
+        "$HERE/mpd_host_main.c" "$HERE/shims.c" "$HERE/mocks.c" "$MAIN/player.c" "$MAIN/dsp.c" "$MAIN/mpd_server.c" "$MAIN/radio.c" \
         "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/util.c" "$MAIN/changes.c" -lm -o "$WORK/mpd_host"
     "$PY" "$HERE/mpd_integration.py" "$WORK/mpd_host" "$WORK/sd" "$FIX"
 else
@@ -90,11 +97,21 @@ else
 fi
 echo "== 4. Réglages et associations sur la carte SD"
 if [ ${#JSON[@]} -gt 0 ]; then
-    gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd_backup\"" -I"$HERE/stubs" -I"$MAIN" -I"$HERE" -I/usr/include/cjson \
+    gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd_backup\"" -I"$HERE/stubs" -I"$MAIN" -I"$HERE" \
         "$HERE/backup_test.c" "$HERE/nvs_mem.c" "$HERE/shims.c" "$MAIN/backup.c" "$MAIN/cards.c" \
-        "$MAIN/config_json.c" "$MAIN/util.c" -lcjson -lm -o "$WORK/backup_test"
+        "$MAIN/config_json.c" "$MAIN/util.c" "$MAIN/radio.c" "${CJSON[@]}" -lm -o "$WORK/backup_test"
     ASAN_OPTIONS=detect_leaks=0 "$WORK/backup_test"
 else
-    echo "bibliothèque cJSON absente : étape ignorée (paquet libcjson-dev)"
+    echo "bibliothèque cJSON absente : étape ignorée (paquet libcjson-dev, ou IDF_PATH)"
+fi
+echo "== 5. Podcasts (Internet simulé)"
+if [ ${#CJSON[@]} -gt 0 ]; then
+    rm -rf "$WORK/sd_podcast" "$WORK/web_podcast"
+    gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd_podcast\"" -DWEB_ROOT="\"$WORK/web_podcast\"" -I"$HERE/stubs" \
+        -I"$MAIN" -I"$HERE" "$HERE/podcast_test.c" "$HERE/shims.c" "$HERE/mocks.c" "$MAIN/podcast.c" "$MAIN/rss.c" \
+        "$MAIN/radio.c" "$MAIN/util.c" "$MAIN/changes.c" "${CJSON[@]}" -lm -o "$WORK/podcast_test"
+    ASAN_OPTIONS=detect_leaks=0 "$WORK/podcast_test"
+else
+    echo "bibliothèque cJSON absente : étape ignorée (paquet libcjson-dev, ou IDF_PATH)"
 fi
 echo "== Tous les tests sont passés"

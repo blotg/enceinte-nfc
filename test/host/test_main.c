@@ -16,6 +16,9 @@ int main(int argc, char **argv)
     test_config_json();
     test_touch();
     test_pn5180();
+    test_log_ring();
+    test_radio();
+    test_rss();
     if (argc > 1) {
         test_media(argv[1]);
     } else {

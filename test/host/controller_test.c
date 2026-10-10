@@ -19,6 +19,9 @@ int g_checks;
 
 void mock_set_resume(uint32_t timeout_s, bool after_other);
 void mock_set_shuffle(bool on);
+void mock_set_repeat(bool on);
+int shim_stream_opens(void);
+void shim_stream_cut(void);
 void mock_set_sound(uint8_t normalize, uint8_t compress);
 int shim_i2s_level(void);
 
@@ -96,9 +99,11 @@ static bool wait_stored(const char *uid, const char *track, bool removed, resume
 
 /* Associations simulées ; la carte EE reprend même après une autre carte (réglage propre),
  * la carte SS aussi, lit son dossier dans un ordre aléatoire et compresse le son (niveau 2).
- * Mode sommeil : ZZ s'arrête après un morceau, TT après g_tt_minutes d'écoute. */
+ * Mode sommeil : ZZ s'arrête après un morceau, TT après g_tt_minutes d'écoute.
+ * Répétition : RR recommence sa playlist (g_rr_repeat). */
 static char g_ee_folder[64] = "Livre";
 static uint16_t g_tt_minutes = 1;
+static int8_t g_rr_repeat = 1;
 
 bool cards_get(const char *uid, card_entry_t *out)
 {
@@ -108,6 +113,9 @@ bool cards_get(const char *uid, card_entry_t *out)
                     : strcmp(uid, "SS") == 0 ? "Melange"
                     : strcmp(uid, "ZZ") == 0 ? "Comptines"
                     : strcmp(uid, "TT") == 0 ? "Sommeil"
+                    : strcmp(uid, "RR") == 0 ? "Comptines"
+                    : strcmp(uid, "WR") == 0 ? "Radio"
+                    : strcmp(uid, "WK") == 0 ? "Radio absente"
                                              : NULL;
     if (!f) {
         return false;
@@ -120,6 +128,7 @@ bool cards_get(const char *uid, card_entry_t *out)
     out->resume_s = CARD_DEFAULT;
     out->resume_other = strcmp(uid, "EE") == 0 || strcmp(uid, "SS") == 0 ? 1 : CARD_DEFAULT;
     out->shuffle = strcmp(uid, "SS") == 0 ? 1 : CARD_DEFAULT;
+    out->repeat = strcmp(uid, "RR") == 0 ? g_rr_repeat : CARD_DEFAULT;
     out->normalize = CARD_DEFAULT;
     out->compress = strcmp(uid, "SS") == 0 ? 2 : CARD_DEFAULT;
     return true;
@@ -621,6 +630,80 @@ int main(int argc, char **argv)
     CHECK(status().state == PLAYER_PLAYING && status().sleep_s == 0 && status().sleep_tracks == 0);
     card(false, "TT");
     player_stop();
+
+    /* 19. Répétition (réglage de la carte) : la playlist recommence au lieu de s'arrêter */
+    card(true, "RR");
+    CHECK(wait_state(PLAYER_PLAYING, 1000));
+    CHECK(status().repeat);
+    usleep(1800000); /* deux morceaux de ~0,6 s : la playlist a déjà recommencé */
+    CHECK(status().state == PLAYER_PLAYING && status().queue_len == 2);
+    /* réglage modifié pendant l'écoute : appliqué au tic suivant */
+    g_rr_repeat = 0;
+    usleep(1300000);
+    CHECK(!status().repeat);
+    g_rr_repeat = 1;
+    card(false, "RR");
+    /* carte sans réglage propre : réglage général (s'arrêter), puis réglage général modifié */
+    card(true, "BB");
+    usleep(1300000);
+    CHECK(!status().repeat);
+    card(false, "BB");
+    mock_set_repeat(true);
+    card(true, "BB");
+    usleep(1300000);
+    CHECK(status().repeat);
+    card(false, "BB");
+    mock_set_repeat(false);
+    player_stop();
+
+    /* 20. Webradio : une liste .m3u du dossier donne l'adresse du flux, joué en direct */
+    snprintf(p, sizeof(p), "%s/Flux", sd);
+    mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/Flux/direct.mp3", sd);
+    make_file(p, 2 << 20); /* ~12 s simulées, rejouées en boucle par le flux simulé */
+    snprintf(p, sizeof(p), "%s/Radio", sd);
+    mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/Radio/webradio.m3u", sd);
+    FILE *m3u = fopen(p, "w");
+    fputs("#EXTM3U\r\n#EXTINF:-1,Radio test\r\nhttp://test/Flux/direct.mp3\r\n", m3u);
+    fclose(m3u);
+    int opens = shim_stream_opens();
+    card(true, "WR");
+    CHECK(wait_state(PLAYER_PLAYING, 4000));
+    player_status_t ws = status();
+    CHECK(ws.stream && ws.queue_len == 1 && !ws.seekable && ws.duration_ms == 0);
+    CHECK_STR(ws.file, "http://test/Flux/direct.mp3");
+    CHECK(shim_stream_opens() == opens + 1);
+    int pos_saves = g_pos_saves;
+    usleep(2500000); /* 50 s simulées : bien plus que le fichier, le direct continue */
+    ws = status();
+    CHECK(ws.state == PLAYER_PLAYING && ws.elapsed_ms > 20000);
+    CHECK_STR(ws.stream_title, "Titre simulé");
+    CHECK(g_pos_saves == pos_saves); /* pas de position à enregistrer pour un direct */
+    /* coupure du réseau : reconnexion, la lecture continue */
+    shim_stream_cut();
+    usleep(1800000);
+    CHECK(shim_stream_opens() == opens + 2 && status().state == PLAYER_PLAYING);
+    /* retirée : pause (connexion fermée) ; reposée : reprise en direct, nouvelle connexion */
+    card(false, "WR");
+    CHECK(wait_state(PLAYER_PAUSED, 1000));
+    card(true, "WR");
+    CHECK(wait_state(PLAYER_PLAYING, 4000));
+    CHECK(shim_stream_opens() == opens + 3);
+    CHECK(status().elapsed_ms < 15000);
+    card(false, "WR");
+    /* radio injoignable : message clair, lecture arrêtée */
+    snprintf(p, sizeof(p), "%s/Radio absente", sd);
+    mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/Radio absente/radio.pls", sd);
+    m3u = fopen(p, "w");
+    fputs("[playlist]\nFile1=http://absent.example/flux\n", m3u);
+    fclose(m3u);
+    card(true, "WK");
+    CHECK(wait_state(PLAYER_STOPPED, 5000));
+    CHECK(strstr(status().error, "injoignable") != NULL);
+    card(false, "WK");
+    player_clear_error();
 
     printf("contrôleur : %d vérifications, %d échec(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

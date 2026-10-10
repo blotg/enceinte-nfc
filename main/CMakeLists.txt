@@ -28,6 +28,13 @@ idf_component_register(
         "touch_keys.c"
         "config_json.c"
         "backup.c"
+        "log_ring.c"
+        "log_buffer.c"
+        "radio.c"
+        "stream.c"
+        "net_http.c"
+        "rss.c"
+        "podcast.c"
     INCLUDE_DIRS "."
     EMBED_TXTFILES
         "web/index.html"
@@ -38,4 +45,5 @@ idf_component_register(
         esp_https_ota app_update fatfs sdmmc esp_driver_sdspi esp_driver_spi
         esp_driver_i2s esp_driver_uart esp_driver_gpio esp_timer json mbedtls
         esp_partition lwip esp_https_server esp_driver_touch_sens
+        espcoredump
 )

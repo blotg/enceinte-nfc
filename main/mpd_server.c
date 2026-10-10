@@ -18,6 +18,7 @@
 #include "media_info.h"
 #include "mpd_proto.h"
 #include "player.h"
+#include "radio.h"
 #include "sdkconfig.h"
 #include "settings.h"
 #include "storage.h"
@@ -305,7 +306,14 @@ static void out_song(client_t *c, const char *rel, int pos, uint32_t id)
 {
     out_pair(c, "file", rel);
     song_meta_t m;
-    if (load_meta(rel, &m)) {
+    if (radio_is_url(rel)) {
+        /* webradio : le titre diffusé par la radio, pour le morceau en cours */
+        player_status_t st;
+        player_get_status(&st);
+        if (st.stream && st.stream_title[0] && strcmp(st.file, rel) == 0) {
+            out_pair(c, "Title", st.stream_title);
+        }
+    } else if (load_meta(rel, &m)) {
         out_meta(c, &m);
         meta_free(&m);
     }
@@ -722,15 +730,34 @@ static int c_replay_gain_status(client_t *c, int argc, char **argv)
 
 /* ======================= Commandes : file d'attente ======================= */
 
+/* Adresse de webradio ajoutée telle quelle (comme le vrai MPD). 1 : ce n'en est pas une. */
+static int add_stream(client_t *c, const char *url, int pos, uint32_t *id_out)
+{
+    if (!radio_is_url(url)) {
+        return 1;
+    }
+    if (strlen(url) >= RADIO_URL_MAX) {
+        return fail(c, ACK_ERROR_ARG, "URI too long");
+    }
+    if (player_queue_add(url, pos, id_out) != ESP_OK) {
+        return fail(c, ACK_ERROR_ARG, "Bad song index");
+    }
+    return 0;
+}
+
 static int c_add(client_t *c, int argc, char **argv)
 {
     char rel[REL_PATH_MAX];
     int pos = -1;
-    if (!uri_arg(c, argv[1], rel) || !need_storage(c)) {
-        return -1;
-    }
     if (argc > 2 && (!mpd_parse_int(argv[2], &pos) || pos < 0 || pos > player_queue_length())) {
         return fail(c, ACK_ERROR_ARG, "Bad position");
+    }
+    int r = add_stream(c, argv[1], pos, NULL);
+    if (r <= 0) {
+        return r;
+    }
+    if (!uri_arg(c, argv[1], rel) || !need_storage(c)) {
+        return -1;
     }
     return add_path(c, rel, pos, NULL);
 }
@@ -739,16 +766,24 @@ static int c_addid(client_t *c, int argc, char **argv)
 {
     char rel[REL_PATH_MAX];
     int pos = -1;
-    if (!uri_arg(c, argv[1], rel) || !need_storage(c)) {
-        return -1;
-    }
     if (argc > 2 && (!mpd_parse_int(argv[2], &pos) || pos < 0 || pos > player_queue_length())) {
         return fail(c, ACK_ERROR_ARG, "Bad position");
+    }
+    uint32_t id = 0;
+    int r = add_stream(c, argv[1], pos, &id);
+    if (r < 0) {
+        return r;
+    }
+    if (r == 0) {
+        outf(c, "Id: %u\n", (unsigned)id);
+        return 0;
+    }
+    if (!uri_arg(c, argv[1], rel) || !need_storage(c)) {
+        return -1;
     }
     if (storage_is_dir(rel)) {
         return fail(c, ACK_ERROR_ARG, "Directory not allowed");
     }
-    uint32_t id = 0;
     if (add_path(c, rel, pos, &id)) {
         return -1;
     }

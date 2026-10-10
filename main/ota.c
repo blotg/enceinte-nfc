@@ -23,6 +23,7 @@
 #include "freertos/task.h"
 #include "player.h"
 #include "settings.h"
+#include "podcast.h"
 #include "util.h"
 #include "web_server.h"
 #include "wifi_mgr.h"
@@ -227,7 +228,7 @@ static bool device_idle(void)
     controller_status_t cs;
     controller_get_status(&cs);
     /* Une pause longue (reprise « toujours ») ne bloque pas les mises à jour indéfiniment. */
-    return !cs.present_uid[0] && !web_server_busy() &&
+    return !cs.present_uid[0] && !web_server_busy() && !podcast_busy() &&
            (ps.state == PLAYER_STOPPED || (ps.state == PLAYER_PAUSED && ps.paused_s >= 2 * 3600));
 }
 

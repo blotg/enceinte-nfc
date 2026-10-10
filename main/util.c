@@ -78,6 +78,50 @@ bool name_is_valid(const char *name)
     return true;
 }
 
+void name_from_text(const char *in, char *out, size_t maxlen, const char *fallback)
+{
+    size_t o = 0;
+    bool space = true; /* pas d'espace au début ni deux de suite */
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 1 < maxlen; p++) {
+        unsigned char ch = *p;
+        if (ch < 0x20 || ch == 0x7f || strchr("\"*:<>?\\|/", ch)) {
+            ch = strchr(":/\\|", ch) ? '-' : ' ';
+        }
+        if (ch == ' ') {
+            if (!space) {
+                out[o++] = ' ';
+            }
+            space = true;
+            continue;
+        }
+        if (ch >= 0x80 && (ch & 0xC0) != 0x80) { /* début d'un caractère UTF-8 : tient-il en entier ? */
+            size_t n = (ch >> 5) == 6 ? 2 : (ch >> 4) == 14 ? 3 : 4;
+            if (o + n >= maxlen) {
+                break;
+            }
+        }
+        out[o++] = (char)ch;
+        space = false;
+    }
+    while (o > 0 && (out[o - 1] == ' ' || out[o - 1] == '.' || out[o - 1] == '-')) {
+        o--;
+    }
+    out[o] = '\0';
+    while (o > 0 && ((unsigned char)out[o - 1] & 0xC0) == 0x80) { /* caractère coupé (texte invalide) */
+        size_t k = o;
+        while (k > 0 && ((unsigned char)out[k - 1] & 0xC0) == 0x80) {
+            k--;
+        }
+        if (k > 0 && (unsigned char)out[k - 1] >= 0xC0) {
+            break; /* séquence complète */
+        }
+        out[--o] = '\0';
+    }
+    if (!o || !name_is_valid(out)) {
+        str_copy(out, fallback, maxlen);
+    }
+}
+
 bool path_sanitize(const char *in, char *out, size_t outlen)
 {
     if (outlen == 0) {

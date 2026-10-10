@@ -222,7 +222,7 @@ static bool settings_same(const settings_t *a, const settings_t *b)
     return strcmp(a->hostname, b->hostname) == 0 && strcmp(a->wifi_ssid, b->wifi_ssid) == 0 &&
            strcmp(a->wifi_pass, b->wifi_pass) == 0 && strcmp(a->ota_url, b->ota_url) == 0 &&
            a->ota_interval_h == b->ota_interval_h && a->resume_timeout_s == b->resume_timeout_s &&
-           a->resume_after_other == b->resume_after_other && a->shuffle == b->shuffle &&
+           a->resume_after_other == b->resume_after_other && a->shuffle == b->shuffle && a->repeat == b->repeat &&
            a->https_enabled == b->https_enabled && a->normalize == b->normalize && a->compress == b->compress &&
            a->max_volume == b->max_volume && ip_equal(&a->ip, &b->ip) && a->vol_touch == b->vol_touch &&
            a->touch_threshold == b->touch_threshold && a->touch_hold_ms == b->touch_hold_ms;

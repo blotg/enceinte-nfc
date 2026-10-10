@@ -65,6 +65,20 @@ static void test_names(void)
     CHECK(!name_is_valid(""));
     CHECK(!name_is_valid(".."));
     CHECK(name_is_valid("Chansons d'été"));
+
+    /* Noms tirés d'un texte libre */
+    char nm[32];
+    name_from_text("  France Inter : le 7/9 ?  ", nm, sizeof(nm), "Radio");
+    CHECK_STR(nm, "France Inter - le 7-9");
+    name_from_text("\"Les \"histoires\" du soir...\"", nm, sizeof(nm), "Podcast");
+    CHECK_STR(nm, "Les histoires du soir");
+    name_from_text("..", nm, sizeof(nm), "Podcast");
+    CHECK_STR(nm, "Podcast");
+    name_from_text("", nm, sizeof(nm), "Sans nom");
+    CHECK_STR(nm, "Sans nom");
+    name_from_text("Été été été été été été été", nm, 12, "x"); /* coupé entre deux caractères */
+    CHECK_STR(nm, "Été été");
+    CHECK(name_is_valid(nm));
 }
 
 static void test_natural(void)

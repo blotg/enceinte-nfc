@@ -19,6 +19,7 @@
 #include "sdmmc_cmd.h"
 
 #include "changes.h"
+#include "radio.h"
 
 static const char *TAG = "storage";
 
@@ -265,6 +266,42 @@ static int path_cmp(const void *a, const void *b)
     return natural_casecmp(*(char *const *)a, *(char *const *)b);
 }
 
+static esp_err_t list_add(path_list_t *out, int *cap, const char *item)
+{
+    if (out->count >= MAX_TRACKS) {
+        return ESP_OK;
+    }
+    if (out->count == *cap) {
+        int ncap = *cap ? *cap * 2 : 32;
+        char **ni = realloc(out->items, ncap * sizeof(char *));
+        if (!ni) {
+            return ESP_ERR_NO_MEM;
+        }
+        out->items = ni;
+        *cap = ncap;
+    }
+    out->items[out->count] = strdup(item);
+    if (!out->items[out->count]) {
+        return ESP_ERR_NO_MEM;
+    }
+    out->count++;
+    return ESP_OK;
+}
+
+typedef struct {
+    path_list_t *out;
+    int *cap;
+    esp_err_t err;
+} url_ctx_t;
+
+static void add_url(const char *url, void *arg)
+{
+    url_ctx_t *u = arg;
+    if (u->err == ESP_OK) {
+        u->err = list_add(u->out, u->cap, url);
+    }
+}
+
 static esp_err_t collect_tracks(const char *rel_dir, path_list_t *out, int *cap, int depth)
 {
     dir_entry_t *entries;
@@ -285,21 +322,15 @@ static esp_err_t collect_tracks(const char *rel_dir, path_list_t *out, int *cap,
                 err = collect_tracks(child, out, cap, depth + 1);
             }
         } else if (is_audio_file(entries[i].name)) {
-            if (out->count == *cap) {
-                *cap = *cap ? *cap * 2 : 32;
-                char **ni = realloc(out->items, *cap * sizeof(char *));
-                if (!ni) {
-                    err = ESP_ERR_NO_MEM;
-                    break;
-                }
-                out->items = ni;
+            err = list_add(out, cap, child);
+        } else if (radio_is_playlist_name(entries[i].name)) {
+            /* webradio : les adresses de flux de la liste rejoignent la playlist */
+            char abs[ABS_PATH_MAX];
+            url_ctx_t u = {.out = out, .cap = cap, .err = ESP_OK};
+            if (path_to_abs(child, abs, sizeof(abs))) {
+                radio_playlist_file(abs, add_url, &u);
             }
-            out->items[out->count] = strdup(child);
-            if (!out->items[out->count]) {
-                err = ESP_ERR_NO_MEM;
-                break;
-            }
-            out->count++;
+            err = u.err;
         }
     }
     storage_free_dir(entries, n);

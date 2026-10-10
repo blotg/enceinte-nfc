@@ -272,7 +272,7 @@ static bool card_in(const char *uid, const char *folder)
 static card_entry_t entry(const char *uid, const char *folder)
 {
     card_entry_t e = {.resume_s = CARD_DEFAULT, .resume_other = CARD_DEFAULT, .shuffle = CARD_DEFAULT,
-                      .normalize = CARD_DEFAULT, .compress = CARD_DEFAULT};
+                      .repeat = CARD_DEFAULT, .normalize = CARD_DEFAULT, .compress = CARD_DEFAULT};
     snprintf(e.uid, sizeof(e.uid), "%s", uid);
     snprintf(e.folder, sizeof(e.folder), "%s", folder);
     return e;

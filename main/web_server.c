@@ -6,6 +6,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "backup.h"
@@ -25,11 +26,14 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "log_buffer.h"
 #include "lwip/sockets.h"
 #include "media_info.h"
 #include "nfc.h"
 #include "ota.h"
 #include "player.h"
+#include "podcast.h"
+#include "radio.h"
 #include "sdkconfig.h"
 #include "settings.h"
 #include "storage.h"
@@ -557,7 +561,7 @@ static void current_tags(const char *rel)
     str_copy(s_tag_path, rel, sizeof(s_tag_path));
     s_tag_title[0] = s_tag_artist[0] = s_tag_album[0] = '\0';
     char abs[ABS_PATH_MAX];
-    if (!rel[0] || !path_to_abs(rel, abs, sizeof(abs))) {
+    if (!rel[0] || radio_is_url(rel) || !path_to_abs(rel, abs, sizeof(abs))) {
         return;
     }
     FILE *f = fopen(abs, "rb");
@@ -593,7 +597,12 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON *p = cJSON_AddObjectToObject(root, "player");
     cJSON_AddStringToObject(p, "state", state_name(ps.state));
     cJSON_AddStringToObject(p, "file", ps.file);
-    cJSON_AddStringToObject(p, "title", s_tag_title[0] ? s_tag_title : path_basename(ps.file));
+    const char *title = s_tag_title[0] ? s_tag_title : path_basename(ps.file);
+    if (ps.stream) {
+        title = ps.stream_title[0] ? ps.stream_title : "En direct";
+    }
+    cJSON_AddStringToObject(p, "title", title);
+    cJSON_AddBoolToObject(p, "stream", ps.stream);
     cJSON_AddStringToObject(p, "artist", s_tag_artist);
     cJSON_AddStringToObject(p, "album", s_tag_album);
     cJSON_AddNumberToObject(p, "elapsed", ps.elapsed_ms / 1000.0);
@@ -727,6 +736,17 @@ static esp_err_t h_player(httpd_req_t *req)
 
 /* ================= Cartes ================= */
 
+/* Contenu d'un dossier : podcast (abonnement), webradio (liste créée par l'interface) ou dossier. */
+static const char *folder_kind(const char *rel)
+{
+    if (podcast_is_folder(rel)) {
+        return "podcast";
+    }
+    char m3u[REL_PATH_MAX];
+    int n = snprintf(m3u, sizeof(m3u), "%s/%s", rel, RADIO_FILE);
+    return rel[0] && n > 0 && (size_t)n < sizeof(m3u) && storage_exists(m3u) ? "radio" : "folder";
+}
+
 static esp_err_t h_cards_get(httpd_req_t *req)
 {
     if (!require_auth(req)) {
@@ -742,6 +762,7 @@ static esp_err_t h_cards_get(httpd_req_t *req)
         cJSON *e = card_to_json(&list[i], true);
         if (e) {
             cJSON_AddBoolToObject(e, "exists", storage_is_dir(list[i].folder));
+            cJSON_AddStringToObject(e, "kind", folder_kind(list[i].folder));
             cJSON_AddItemToArray(arr, e);
         }
     }
@@ -830,6 +851,7 @@ static esp_err_t h_files_list(httpd_req_t *req)
     }
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "path", rel);
+    cJSON_AddStringToObject(root, "kind", folder_kind(rel));
     cJSON *arr = cJSON_AddArrayToObject(root, "entries");
     for (int i = 0; i < n; i++) {
         cJSON *e = cJSON_CreateObject();
@@ -837,6 +859,14 @@ static esp_err_t h_files_list(httpd_req_t *req)
         cJSON_AddBoolToObject(e, "dir", entries[i].is_dir);
         cJSON_AddNumberToObject(e, "size", entries[i].size);
         cJSON_AddBoolToObject(e, "audio", !entries[i].is_dir && is_audio_file(entries[i].name));
+        if (entries[i].is_dir) {
+            char child[REL_PATH_MAX];
+            int len = rel[0] ? snprintf(child, sizeof(child), "%s/%s", rel, entries[i].name)
+                             : snprintf(child, sizeof(child), "%s", entries[i].name);
+            if (len > 0 && (size_t)len < sizeof(child)) {
+                cJSON_AddStringToObject(e, "kind", folder_kind(child));
+            }
+        }
         cJSON_AddItemToArray(arr, e);
     }
     storage_free_dir(entries, n);
@@ -1065,6 +1095,7 @@ static esp_err_t h_settings_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "resume_s", cfg.resume_timeout_s);
     cJSON_AddBoolToObject(root, "resume_after_other", cfg.resume_after_other);
     cJSON_AddBoolToObject(root, "shuffle", cfg.shuffle);
+    cJSON_AddBoolToObject(root, "repeat", cfg.repeat);
     cJSON_AddBoolToObject(root, "https_enabled", cfg.https_enabled);
     cJSON_AddBoolToObject(root, "https_active", s_https != NULL);
     cJSON_AddBoolToObject(root, "https_pending", s_https_busy);
@@ -1117,6 +1148,11 @@ static esp_err_t h_settings_set(httpd_req_t *req)
     }
     const cJSON *shuffle = cJSON_GetObjectItem(body, "shuffle");
     if (cJSON_IsBool(shuffle) && settings_set_shuffle(cJSON_IsTrue(shuffle)) != ESP_OK) {
+        cJSON_Delete(body);
+        return send_error(req, "500 Internal Server Error", "enregistrement impossible");
+    }
+    const cJSON *repeat = cJSON_GetObjectItem(body, "repeat");
+    if (cJSON_IsBool(repeat) && settings_set_repeat(cJSON_IsTrue(repeat)) != ESP_OK) {
         cJSON_Delete(body);
         return send_error(req, "500 Internal Server Error", "enregistrement impossible");
     }
@@ -1436,6 +1472,253 @@ static esp_err_t h_reboot(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ================= Webradios et podcasts ================= */
+
+/* Carte associée au dossier qui vient d'être créé (réglages de la carte facultatifs). */
+static esp_err_t attach_card(const cJSON *card, const char *folder, char *msg, size_t len)
+{
+    if (!cJSON_IsObject(card)) {
+        return ESP_OK;
+    }
+    card_entry_t e;
+    if (!card_from_json(card, &e, false, msg, len)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    str_copy(e.folder, folder, sizeof(e.folder));
+    esp_err_t err = cards_set(&e);
+    if (err != ESP_OK) {
+        str_copy(msg, "association de la carte impossible", len);
+    }
+    return err;
+}
+
+static bool url_ok(const char *url, size_t max)
+{
+    return url && radio_is_url(url) && strlen(url) < max && !strpbrk(url, " \t\r\n\"<>");
+}
+
+static esp_err_t send_folder(httpd_req_t *req, const char *folder)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "folder", folder);
+    return send_json(req, root);
+}
+
+/* Webradio : {"url", "name"} crée « Webradios/<nom> », {"url", "folder"} change l'adresse ;
+ * "card" (facultatif) : carte à associer. */
+static esp_err_t h_radio_set(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *url = json_str(body, "url");
+    const char *name = json_str(body, "name");
+    const char *folder = json_str(body, "folder");
+    char rel[REL_PATH_MAX], msg[96] = "adresse de flux invalide (http:// ou https://)";
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    if (!url_ok(url, RADIO_URL_MAX)) {
+        goto out;
+    }
+    if (!storage_is_mounted()) {
+        str_copy(msg, "carte SD absente", sizeof(msg));
+        goto out;
+    }
+    if (folder && folder[0]) {
+        if (!path_sanitize(folder, rel, sizeof(rel)) || !rel[0] || !storage_is_dir(rel)) {
+            str_copy(msg, "dossier introuvable", sizeof(msg));
+            goto out;
+        }
+    } else {
+        char base[96];
+        name_from_text(name ? name : "", base, sizeof(base), "Webradio");
+        if (!storage_is_dir(RADIO_BASE)) {
+            storage_mkdir(RADIO_BASE);
+        }
+        bool made = false;
+        for (int i = 1; i < 10 && !made; i++) {
+            if (i == 1) {
+                snprintf(rel, sizeof(rel), "%s/%s", RADIO_BASE, base);
+            } else {
+                snprintf(rel, sizeof(rel), "%s/%s (%d)", RADIO_BASE, base, i);
+            }
+            made = !storage_exists(rel) && storage_mkdir(rel) == ESP_OK;
+        }
+        if (!made) {
+            str_copy(msg, "création du dossier impossible", sizeof(msg));
+            goto out;
+        }
+    }
+    char m3u[REL_PATH_MAX], abs[ABS_PATH_MAX];
+    int n = snprintf(m3u, sizeof(m3u), "%s/%s", rel, RADIO_FILE);
+    FILE *f = n > 0 && (size_t)n < sizeof(m3u) && path_to_abs(m3u, abs, sizeof(abs)) ? fopen(abs, "w") : NULL;
+    if (!f) {
+        str_copy(msg, "écriture sur la carte SD impossible", sizeof(msg));
+        goto out;
+    }
+    fprintf(f, "#EXTM3U\r\n#EXTINF:-1,%s\r\n%s\r\n", path_basename(rel), url);
+    bool written = fclose(f) == 0;
+    if (!written) {
+        str_copy(msg, "écriture sur la carte SD impossible", sizeof(msg));
+        goto out;
+    }
+    changes_notify(CHG_DATABASE);
+    err = attach_card(cJSON_GetObjectItem(body, "card"), rel, msg, sizeof(msg));
+out:
+    cJSON_Delete(body);
+    return err == ESP_OK ? send_folder(req, rel) : send_error(req, "400 Bad Request", msg);
+}
+
+static esp_err_t h_radio_get(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    char raw[REL_PATH_MAX] = "", rel[REL_PATH_MAX], m3u[REL_PATH_MAX], abs[ABS_PATH_MAX], url[RADIO_URL_MAX] = "";
+    get_query(req, "folder", raw, sizeof(raw));
+    if (!path_sanitize(raw, rel, sizeof(rel)) || !rel[0]) {
+        return send_error(req, "400 Bad Request", "dossier invalide");
+    }
+    int n = snprintf(m3u, sizeof(m3u), "%s/%s", rel, RADIO_FILE);
+    FILE *f = n > 0 && (size_t)n < sizeof(m3u) && path_to_abs(m3u, abs, sizeof(abs)) ? fopen(abs, "rb") : NULL;
+    if (!f) {
+        return send_error(req, "404 Not Found", "pas une webradio");
+    }
+    char *txt = malloc(4097);
+    size_t len = txt ? fread(txt, 1, 4096, f) : 0;
+    fclose(f);
+    if (txt) {
+        txt[len] = '\0';
+        radio_playlist_first(txt, url, sizeof(url));
+        free(txt);
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "folder", rel);
+    cJSON_AddStringToObject(root, "name", path_basename(rel));
+    cJSON_AddStringToObject(root, "url", url);
+    return send_json(req, root);
+}
+
+/* Abonnement : {"url", "name" (facultatif), "keep", "card" (facultatif)}. */
+static esp_err_t h_podcast_subscribe(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *url = json_str(body, "url");
+    const char *name = json_str(body, "name");
+    const cJSON *keep = cJSON_GetObjectItem(body, "keep");
+    char folder[REL_PATH_MAX] = "", msg[96] = "adresse de flux invalide";
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    if (url_ok(url, RSS_URL_MAX)) {
+        err = podcast_subscribe(url, name, cJSON_IsNumber(keep) ? keep->valueint : PODCAST_KEEP_DEFAULT, folder,
+                                sizeof(folder), msg, sizeof(msg));
+    }
+    if (err == ESP_OK) {
+        err = attach_card(cJSON_GetObjectItem(body, "card"), folder, msg, sizeof(msg));
+    }
+    cJSON_Delete(body);
+    return err == ESP_OK ? send_folder(req, folder) : send_error(req, "400 Bad Request", msg);
+}
+
+static esp_err_t h_podcast_get(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    char raw[REL_PATH_MAX] = "", rel[REL_PATH_MAX];
+    get_query(req, "folder", raw, sizeof(raw));
+    podcast_info_t *pi = malloc(sizeof(podcast_info_t));
+    if (!pi) {
+        return send_error(req, "500 Internal Server Error", "mémoire insuffisante");
+    }
+    if (!path_sanitize(raw, rel, sizeof(rel)) || !rel[0] || !podcast_get(rel, pi)) {
+        free(pi);
+        return send_error(req, "404 Not Found", "pas un podcast");
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "folder", rel);
+    cJSON_AddStringToObject(root, "url", pi->url);
+    cJSON_AddStringToObject(root, "title", pi->title);
+    cJSON_AddNumberToObject(root, "keep", pi->keep);
+    cJSON_AddNumberToObject(root, "episodes", pi->episodes);
+    cJSON_AddNumberToObject(root, "last_check", (double)pi->last_check);
+    cJSON_AddStringToObject(root, "last_error", pi->last_error);
+    cJSON_AddBoolToObject(root, "syncing", pi->syncing);
+    cJSON_AddNumberToObject(root, "progress", pi->progress);
+    free(pi);
+    return send_json(req, root);
+}
+
+/* {"folder", "action": "update" (url, keep) | "sync" | "unsubscribe"} */
+static esp_err_t h_podcast_set(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json(req);
+    const char *folder = json_str(body, "folder");
+    const char *action = json_str(body, "action");
+    const char *url = json_str(body, "url");
+    const cJSON *keep = cJSON_GetObjectItem(body, "keep");
+    char rel[REL_PATH_MAX];
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    const char *msg = "requête invalide";
+    if (folder && action && path_sanitize(folder, rel, sizeof(rel)) && rel[0] && podcast_is_folder(rel)) {
+        if (strcmp(action, "sync") == 0) {
+            podcast_sync_now(rel);
+            err = ESP_OK;
+        } else if (strcmp(action, "unsubscribe") == 0) {
+            err = podcast_unsubscribe(rel);
+        } else if (strcmp(action, "update") == 0) {
+            if (url && !url_ok(url, RSS_URL_MAX)) {
+                msg = "adresse de flux invalide";
+            } else {
+                err = podcast_update(rel, url, cJSON_IsNumber(keep) ? keep->valueint : 0);
+                msg = "enregistrement impossible";
+            }
+        }
+    } else if (folder) {
+        msg = "pas un podcast";
+    }
+    cJSON_Delete(body);
+    return err == ESP_OK ? send_ok(req) : send_error(req, "400 Bad Request", msg);
+}
+
+/* Journal (depuis la position "since" déjà lue) et état de la mémoire. */
+static esp_err_t h_logs(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    char v[24];
+    uint64_t since = get_query(req, "since", v, sizeof(v)) ? strtoull(v, NULL, 10) : 0;
+    size_t cap = log_buffer_size() + 1;
+    char *text = malloc(cap); /* en PSRAM (grande allocation) */
+    if (!text) {
+        return send_error(req, "500 Internal Server Error", "mémoire insuffisante");
+    }
+    uint64_t next;
+    bool reset;
+    log_buffer_read(since, text, cap, &next, &reset);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "next", (double)next);
+    cJSON_AddBoolToObject(root, "reset", reset);
+    cJSON_AddStringToObject(root, "text", text);
+    free(text);
+    cJSON_AddNumberToObject(root, "uptime_ms", (double)(esp_timer_get_time() / 1000));
+    time_t now = time(NULL);
+    cJSON_AddNumberToObject(root, "time", now > 1700000000 ? (double)now : 0);
+    cJSON *m = cJSON_AddObjectToObject(root, "memory");
+    cJSON_AddNumberToObject(m, "internal_free", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(m, "internal_largest", heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(m, "internal_min", heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(m, "psram_free", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(m, "psram_total", heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+    return send_json(req, root);
+}
+
 static esp_err_t h_factory_reset(httpd_req_t *req)
 {
     if (!require_auth(req)) {
@@ -1495,6 +1778,12 @@ static const httpd_uri_t s_uris[] = {
     {"/api/ota/upload", HTTP_PUT, h_ota_upload, NULL},
     {"/api/reboot", HTTP_POST, h_reboot, NULL},
     {"/api/factory-reset", HTTP_POST, h_factory_reset, NULL},
+    {"/api/logs", HTTP_GET, h_logs, NULL},
+    {"/api/radio", HTTP_GET, h_radio_get, NULL},
+    {"/api/radio", HTTP_POST, h_radio_set, NULL},
+    {"/api/podcasts", HTTP_POST, h_podcast_subscribe, NULL},
+    {"/api/podcast", HTTP_GET, h_podcast_get, NULL},
+    {"/api/podcast", HTTP_POST, h_podcast_set, NULL},
 };
 
 static void register_handlers(httpd_handle_t srv, bool secure)
@@ -1508,7 +1797,7 @@ static void register_handlers(httpd_handle_t srv, bool secure)
 
 static void base_config(httpd_config_t *cfg)
 {
-    cfg->max_uri_handlers = 40;
+    cfg->max_uri_handlers = 48;
     cfg->lru_purge_enable = true;
     cfg->recv_wait_timeout = 10;
     cfg->send_wait_timeout = 10;

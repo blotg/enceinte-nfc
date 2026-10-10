@@ -18,6 +18,7 @@ typedef struct {
     int32_t resume_s;
     int8_t resume_other;
     int8_t shuffle;
+    int8_t repeat;
     int8_t normalize;
     int8_t compress;
     uint16_t sleep_tracks;
@@ -76,6 +77,7 @@ static void entry_to_card(const entry_t *s, card_entry_t *d)
     d->resume_s = s->resume_s;
     d->resume_other = s->resume_other;
     d->shuffle = s->shuffle;
+    d->repeat = s->repeat;
     d->normalize = s->normalize;
     d->compress = s->compress;
     d->sleep_tracks = s->sleep_tracks;
@@ -88,6 +90,7 @@ static void set_options(entry_t *d, const card_entry_t *e)
     d->resume_s = e->resume_s;
     d->resume_other = e->resume_other;
     d->shuffle = e->shuffle;
+    d->repeat = e->repeat;
     d->normalize = e->normalize;
     d->compress = e->compress;
     d->sleep_tracks = e->sleep_tracks;
@@ -95,13 +98,13 @@ static void set_options(entry_t *d, const card_entry_t *e)
 }
 
 /* Format du blob : lignes "UID\tdossier\tdélai\tautre_carte\taléatoire\tnormalisation\tcompression
- * \tsommeil_morceaux\tsommeil_minutes\n". Champs facultatifs après le dossier : absents des
- * associations créées par les versions précédentes (et ignorés par elles). */
+ * \tsommeil_morceaux\tsommeil_minutes\trépétition\n". Champs facultatifs après le dossier : absents
+ * des associations créées par les versions précédentes (et ignorés par elles). */
 static esp_err_t save_locked(void)
 {
     size_t size = 1;
     for (int i = 0; i < s_count; i++) {
-        size += strlen(s_entries[i].uid) + strlen(s_entries[i].folder) + 52;
+        size += strlen(s_entries[i].uid) + strlen(s_entries[i].folder) + 56;
     }
     char *blob = malloc(size);
     if (!blob) {
@@ -110,9 +113,9 @@ static esp_err_t save_locked(void)
     size_t o = 0;
     for (int i = 0; i < s_count; i++) {
         const entry_t *e = &s_entries[i];
-        o += sprintf(blob + o, "%s\t%s\t%ld\t%d\t%d\t%d\t%d\t%u\t%u\n", e->uid, e->folder, (long)e->resume_s,
+        o += sprintf(blob + o, "%s\t%s\t%ld\t%d\t%d\t%d\t%d\t%u\t%u\t%d\n", e->uid, e->folder, (long)e->resume_s,
                      e->resume_other, e->shuffle, e->normalize, e->compress, (unsigned)e->sleep_tracks,
-                     (unsigned)e->sleep_minutes);
+                     (unsigned)e->sleep_minutes, e->repeat);
     }
     nvs_handle_t h;
     esp_err_t err = nvs_open_from_partition(CFG_PARTITION, "cards", NVS_READWRITE, &h);
@@ -208,8 +211,8 @@ esp_err_t cards_init(void)
     }
     char *save = NULL;
     for (char *line = strtok_r(blob, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        char *fields[9] = {line};
-        for (int i = 1; i < 9; i++) {
+        char *fields[10] = {line};
+        for (int i = 1; i < 10; i++) {
             char *tab = fields[i - 1] ? strchr(fields[i - 1], '\t') : NULL;
             if (tab) {
                 *tab = '\0';
@@ -227,6 +230,7 @@ esp_err_t cards_init(void)
             .compress = parse_opt(fields[6], SOUND_LEVEL_MAX),
             .sleep_tracks = parse_count(fields[7], SLEEP_TRACKS_MAX),
             .sleep_minutes = parse_count(fields[8], SLEEP_MINUTES_MAX),
+            .repeat = parse_opt(fields[9], 1),
         };
         if (e.resume_s < 0) {
             e.resume_s = CARD_DEFAULT;

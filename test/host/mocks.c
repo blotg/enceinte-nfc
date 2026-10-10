@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "changes.h"
+#include "radio.h"
 #include "sdkconfig.h"
 #include "settings.h"
 #include "storage.h"
@@ -21,6 +22,7 @@ static char s_mpd_password[65];
 static uint32_t s_resume_s = CONFIG_ENC_RESUME_TIMEOUT_S;
 static bool s_resume_other;
 static bool s_shuffle;
+static bool s_repeat;
 static uint8_t s_normalize, s_compress;
 
 void mock_set_resume(uint32_t timeout_s, bool after_other)
@@ -32,6 +34,11 @@ void mock_set_resume(uint32_t timeout_s, bool after_other)
 void mock_set_shuffle(bool on)
 {
     s_shuffle = on;
+}
+
+void mock_set_repeat(bool on)
+{
+    s_repeat = on;
 }
 
 void mock_set_sound(uint8_t normalize, uint8_t compress)
@@ -55,6 +62,7 @@ void settings_get(settings_t *out)
     out->resume_timeout_s = s_resume_s;
     out->resume_after_other = s_resume_other;
     out->shuffle = s_shuffle;
+    out->repeat = s_repeat;
     out->normalize = s_normalize;
     out->compress = s_compress;
     out->mpd_pass_set = s_mpd_password[0] != '\0';
@@ -146,6 +154,13 @@ void storage_free_dir(dir_entry_t *entries, int count)
     free(entries);
 }
 
+static void add_item(const char *item, void *arg)
+{
+    path_list_t *out = arg;
+    out->items = realloc(out->items, (out->count + 1) * sizeof(char *));
+    out->items[out->count++] = strdup(item);
+}
+
 static void collect(const char *rel, path_list_t *out, int depth)
 {
     dir_entry_t *e;
@@ -159,8 +174,12 @@ static void collect(const char *rel, path_list_t *out, int depth)
         if (e[i].is_dir) {
             collect(child, out, depth + 1);
         } else if (is_audio_file(e[i].name)) {
-            out->items = realloc(out->items, (out->count + 1) * sizeof(char *));
-            out->items[out->count++] = strdup(child);
+            add_item(child, out);
+        } else if (radio_is_playlist_name(e[i].name)) {
+            char abs[ABS_PATH_MAX];
+            if (path_to_abs(child, abs, sizeof(abs))) {
+                radio_playlist_file(abs, add_item, out);
+            }
         }
     }
     storage_free_dir(e, n);
@@ -191,6 +210,31 @@ void path_list_free(path_list_t *list)
     free(list->items);
     list->items = NULL;
     list->count = 0;
+}
+
+esp_err_t storage_mkdir(const char *rel)
+{
+    char abs[ABS_PATH_MAX];
+    if (!rel[0] || !path_to_abs(rel, abs, sizeof(abs))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (mkdir(abs, 0775) != 0) {
+        return errno == EEXIST ? ESP_ERR_INVALID_STATE : ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t storage_rename(const char *from, const char *to)
+{
+    char a[ABS_PATH_MAX], b[ABS_PATH_MAX];
+    struct stat st;
+    if (!path_to_abs(from, a, sizeof(a)) || !path_to_abs(to, b, sizeof(b))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (stat(b, &st) == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return rename(a, b) == 0 ? ESP_OK : ESP_FAIL;
 }
 
 bool storage_is_dir(const char *rel)

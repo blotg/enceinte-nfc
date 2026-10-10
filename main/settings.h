@@ -37,6 +37,7 @@ typedef struct {
     uint32_t resume_timeout_s; /* délai de reprise après retrait, 0 = toujours */
     bool resume_after_other;   /* reprendre même si une autre carte a été posée entre-temps */
     bool shuffle;              /* cartes : playlist dans un ordre aléatoire */
+    bool repeat;               /* cartes : la playlist recommence quand elle est finie */
     bool https_enabled;        /* interface web aussi en HTTPS (certificat auto-signé) */
     uint8_t normalize;         /* égalisation du niveau entre morceaux et playlists, 0-3 */
     uint8_t compress;          /* réduction des écarts de volume dans un morceau, 0-3 */
@@ -59,6 +60,7 @@ esp_err_t settings_set_ota(const char *url, uint16_t interval_h);
 esp_err_t settings_set_max_volume(uint8_t max_volume);
 esp_err_t settings_set_resume(uint32_t timeout_s, bool after_other);
 esp_err_t settings_set_shuffle(bool on);
+esp_err_t settings_set_repeat(bool on);
 esp_err_t settings_set_https(bool enabled);
 esp_err_t settings_set_sound(uint8_t normalize, uint8_t compress);
 esp_err_t settings_set_ip(const ip_config_t *ip);

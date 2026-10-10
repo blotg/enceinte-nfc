@@ -144,6 +144,9 @@ esp_err_t settings_init(void)
         uint8_t shuffle = 0;
         nvs_get_u8(h, "shuffle", &shuffle);
         s_cfg.shuffle = shuffle != 0;
+        uint8_t repeat = 0;
+        nvs_get_u8(h, "repeat", &repeat);
+        s_cfg.repeat = repeat != 0;
         uint8_t https = 0;
         nvs_get_u8(h, "https", &https);
         s_cfg.https_enabled = https != 0;
@@ -360,6 +363,18 @@ esp_err_t settings_set_shuffle(bool on)
     return err;
 }
 
+esp_err_t settings_set_repeat(bool on)
+{
+    esp_err_t err = save_u8("repeat", on ? 1 : 0);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_cfg.repeat = on;
+        xSemaphoreGive(s_lock);
+        notify();
+    }
+    return err;
+}
+
 esp_err_t settings_set_https(bool enabled)
 {
     esp_err_t err = save_u8("https", enabled ? 1 : 0);
@@ -517,7 +532,7 @@ esp_err_t settings_set_all(const settings_t *in)
         uint8_t value;
     } u8s[] = {
         {"max_vol", c.max_volume},       {"resume_other", c.resume_after_other}, {"shuffle", c.shuffle},
-        {"https", c.https_enabled},      {"normalize", c.normalize},             {"compress", c.compress},
+        {"repeat", c.repeat},            {"https", c.https_enabled},      {"normalize", c.normalize},             {"compress", c.compress},
         {"vol_touch", c.vol_touch},
     };
     for (size_t i = 0; err == ESP_OK && i < sizeof(u8s) / sizeof(u8s[0]); i++) {

@@ -103,7 +103,16 @@ function fmtDelay(s) {
 
 const DELAY_CHOICES = [0, 60, 300, 600, 1800, 3600, 10800, 86400];
 const SOUND_LEVELS = ['désactivée', 'légère', 'moyenne', 'forte'];
-const GENERAL_DEFAULTS = { resume_s: 600, resume_after_other: false, shuffle: false, normalize: 2, compress: 2 };
+const GENERAL_DEFAULTS = { resume_s: 600, resume_after_other: false, shuffle: false, repeat: false, normalize: 2, compress: 2 };
+const KIND_ICON = { folder: '📁', radio: '📻', podcast: '🎙' };
+const KIND_LABEL = { radio: 'Webradio', podcast: 'Podcast' };
+const PODCAST_KEEP = { min: 1, max: 50, def: 10 };
+
+function fmtDate(epoch) {
+  return new Date(epoch * 1000).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+const isUrl = (u) => /^https?:\/\/\S+$/i.test(u);
 
 const isSet = (v) => v !== null && v !== undefined;
 
@@ -111,6 +120,7 @@ const isSet = (v) => v !== null && v !== undefined;
 function cardRules(c) {
   const rules = [];
   if (isSet(c.shuffle)) rules.push(c.shuffle ? 'ordre aléatoire' : 'dans l\'ordre');
+  if (isSet(c.repeat)) rules.push(c.repeat ? 'playlist en boucle' : 's\'arrête à la fin');
   const other = !isSet(c.resume_other) ? '' : c.resume_other ? 'même après une autre carte' : 'sauf si une autre carte est posée';
   if (isSet(c.resume_s)) rules.push(`progression conservée ${fmtDelay(c.resume_s)}` + (other ? ', ' + other : ''));
   else if (other) rules.push('progression conservée ' + other);
@@ -510,6 +520,10 @@ function renderPlay() {
       v.elapsed.textContent = fmtTime(p.elapsed);
     }
     v.duration.textContent = p.duration ? fmtTime(p.duration) : '–:––';
+    if (p.stream) {
+      v.duration.textContent = 'en direct';
+      v.sub.textContent = 'Webradio' + (st.card.folder ? ' · ' + baseName(st.card.folder) : '');
+    }
     if (!v.volDragging) {
       if (Number(v.vol.max) !== p.max_volume) v.vol.max = p.max_volume;
       v.vol.value = p.volume;
@@ -595,7 +609,7 @@ async function renderCards() {
     edit.addEventListener('click', () => learnFlow(c.folder, c.uid, folders, c, defaults));
     const rules = cardRules(c);
     list.append(h('li', null,
-      h('span', { class: 'ico' }, '▣'),
+      h('span', { class: 'ico', title: KIND_LABEL[c.kind] || 'Dossier' }, KIND_ICON[c.kind] || '▣'),
       h('div', { class: 'name' },
         c.folder, !c.exists ? h('span', { class: 'error-text small' }, '  (dossier introuvable)') : null,
         h('small', { class: 'mono' }, c.uid),
@@ -615,6 +629,65 @@ async function renderCards() {
       h('div', { class: 'row' }, h('h2', { class: 'grow' }, 'Cartes associées'), add),
       list));
   app.view = null;
+}
+
+const RADIO_HELP = 'Adresse d\'un flux MP3, AAC ou Ogg, souvent donnée sur le site de la radio (elle finit '
+  + 'souvent par .mp3, .aac, .m3u ou .pls). Les flux HLS (.m3u8 découpé en segments) ne sont pas pris en charge.';
+const PODCAST_HELP = 'Adresse du flux RSS du podcast (« flux RSS » ou « RSS feed » sur son site ou son '
+  + 'application). Les nouveaux épisodes sont téléchargés chaque nuit ; seuls les plus récents sont gardés. '
+  + 'La carte les joue du plus ancien au plus récent, avec la reprise habituelle.';
+
+/* Champs d'une webradio : nom et adresse du flux. */
+function radioFields() {
+  const name = h('input', { type: 'text', placeholder: 'Ex. : France Inter', maxlength: 80 });
+  const url = h('input', { type: 'url', placeholder: 'https://…', autocapitalize: 'off', spellcheck: false });
+  const el = h('div', { class: 'stack' },
+    h('label', null, 'Nom de la webradio'), name,
+    h('label', null, 'Adresse du flux'), url,
+    h('p', { class: 'muted small' }, RADIO_HELP));
+  return {
+    el, name, url,
+    check(needName) {
+      if (needName && !name.value.trim()) { toast('Donnez un nom à la webradio', true); return false; }
+      if (!isUrl(url.value.trim())) { toast('Adresse du flux : http:// ou https://', true); return false; }
+      return true;
+    },
+  };
+}
+
+/* Champs d'un podcast : flux RSS, nom facultatif, épisodes gardés. */
+function podcastFields() {
+  const url = h('input', { type: 'url', placeholder: 'https://…/rss', autocapitalize: 'off', spellcheck: false });
+  const name = h('input', { type: 'text', placeholder: 'Facultatif : titre du podcast', maxlength: 80 });
+  const keep = h('input', { type: 'number', class: 'short', min: PODCAST_KEEP.min, max: PODCAST_KEEP.max,
+    step: 1, value: PODCAST_KEEP.def, inputmode: 'numeric', 'aria-label': 'Épisodes gardés' });
+  const info = h('div', { class: 'small', hidden: true });
+  const el = h('div', { class: 'stack' },
+    h('label', null, 'Adresse du flux RSS'), url,
+    h('label', null, 'Nom ', h('span', { class: 'muted' }, '(sans nom : le titre du podcast)')), name,
+    h('label', null, 'Épisodes gardés'), h('div', { class: 'row' }, keep, h('span', null, 'les plus récents')),
+    info,
+    h('p', { class: 'muted small' }, PODCAST_HELP));
+  return {
+    el, url, name, keep, info,
+    keepValue: () => Number(keep.value),
+    check() {
+      if (!isUrl(url.value.trim())) { toast('Adresse du flux RSS : http:// ou https://', true); return false; }
+      const k = Number(keep.value);
+      if (!(Number.isInteger(k) && k >= PODCAST_KEEP.min && k <= PODCAST_KEEP.max)) {
+        toast(`Épisodes gardés : ${PODCAST_KEEP.min} à ${PODCAST_KEEP.max}`, true);
+        return false;
+      }
+      return true;
+    },
+  };
+}
+
+function podcastSummary(pi) {
+  const parts = [`${plural(pi.episodes, 'épisode', 'épisodes')} sur la carte SD`];
+  if (pi.syncing) parts.push('téléchargement en cours' + (pi.progress >= 0 ? ` (${pi.progress} %)` : '…'));
+  else parts.push(pi.last_check ? `vérifié le ${fmtDate(pi.last_check)}` : 'pas encore vérifié');
+  return parts.join(' · ');
 }
 
 /*
@@ -639,6 +712,46 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
     const curDelay = card && isSet(card.resume_s) ? card.resume_s : null;
     const curOther = card && isSet(card.resume_other) ? card.resume_other : null;
     const curShuffle = card && isSet(card.shuffle) ? card.shuffle : null;
+    const curRepeat = card && isSet(card.repeat) ? card.repeat : null;
+    const repeatSel = h('select', null,
+      h('option', { value: '', selected: curRepeat === null },
+        `Réglage général (${defaults.repeat ? 'recommencer' : 's\'arrêter'})`),
+      h('option', { value: '0', selected: curRepeat === false }, 'S\'arrêter'),
+      h('option', { value: '1', selected: curRepeat === true }, 'Recommencer la playlist'));
+    /* Contenu joué : dossier de la carte SD, webradio ou podcast */
+    const kind0 = (card && card.kind) || 'folder';
+    const kindSel = h('select', null,
+      h('option', { value: 'folder', selected: kind0 === 'folder' }, 'Un dossier de la carte SD'),
+      h('option', { value: 'radio', selected: kind0 === 'radio' }, 'Une webradio'),
+      h('option', { value: 'podcast', selected: kind0 === 'podcast' }, 'Un podcast'));
+    const folderBox = h('div', { class: 'stack' },
+      h('label', null, 'Dossier de la carte SD'), sel,
+      h('p', { class: 'muted small' }, 'Pour un sous-dossier, utilisez « Associer une carte » depuis l\'onglet Musique.'));
+    const radio = radioFields();
+    const podcast = podcastFields();
+    const syncKind = () => {
+      folderBox.hidden = kindSel.value !== 'folder';
+      radio.el.hidden = kindSel.value !== 'radio';
+      podcast.el.hidden = kindSel.value !== 'podcast';
+    };
+    kindSel.addEventListener('change', syncKind);
+    syncKind();
+    if (card && kind0 === 'radio') {
+      const r = await api('/api/radio?folder=' + encodeURIComponent(card.folder)).catch(() => null);
+      if (r) { radio.name.value = r.name; radio.url.value = r.url; }
+      radio.name.disabled = true; /* nom : celui du dossier (onglet Musique) */
+    }
+    if (card && kind0 === 'podcast') {
+      const pi = await api('/api/podcast?folder=' + encodeURIComponent(card.folder)).catch(() => null);
+      if (pi) {
+        podcast.url.value = pi.url;
+        podcast.name.value = pi.title;
+        podcast.keep.value = pi.keep;
+        podcast.info.hidden = false;
+        setKids(podcast.info, podcastSummary(pi), pi.last_error ? h('div', { class: 'error-text' }, pi.last_error) : null);
+      }
+      podcast.name.disabled = true;
+    }
     const shuffleSel = h('select', null,
       h('option', { value: '', selected: curShuffle === null },
         `Réglage général (${defaults.shuffle ? 'aléatoire' : 'dans l\'ordre'})`),
@@ -683,32 +796,56 @@ function learnFlow(presetFolder, knownUid, folders, card = null, defaults = null
     syncSleep();
     const save = h('button', { class: 'primary' }, card ? 'Enregistrer' : 'Associer');
     save.addEventListener('click', () => busy(save, async () => {
-      if (!sel.value) { toast('Choisissez un dossier', true); return; }
+      const kind = kindSel.value;
+      const same = card && kind === kind0; /* même webradio ou même podcast : réglages modifiés */
+      if (kind === 'folder' && !sel.value) { toast('Choisissez un dossier', true); return; }
+      if (kind === 'radio' && !radio.check(!same)) return;
+      if (kind === 'podcast' && !podcast.check()) return;
       const sleepMode = sleepSel.value;
       const sleepN = sleepMode ? Number(sleepNum.value) : 0;
       if (sleepMode && !(Number.isInteger(sleepN) && sleepN >= 1 && sleepN <= SLEEP_MAX[sleepMode])) {
         toast(`Mode sommeil : nombre entre 1 et ${SLEEP_MAX[sleepMode]}`, true);
         return;
       }
-      await post('/api/cards', {
-        uid, folder: sel.value,
+      const settings = {
+        uid,
         resume_s: delaySel.value === '' ? null : Number(delaySel.value),
         resume_other: otherSel.value === '' ? null : otherSel.value === '1',
         shuffle: shuffleSel.value === '' ? null : shuffleSel.value === '1',
         normalize: normSel.value === '' ? null : Number(normSel.value),
         compress: compSel.value === '' ? null : Number(compSel.value),
+        repeat: repeatSel.value === '' ? null : repeatSel.value === '1',
         sleep_tracks: sleepMode === 'tracks' ? sleepN : 0,
         sleep_minutes: sleepMode === 'minutes' ? sleepN : 0,
-      });
+      };
+      if (kind === 'folder') {
+        await post('/api/cards', { ...settings, folder: sel.value });
+      } else if (kind === 'radio' && same) {
+        await post('/api/radio', { folder: card.folder, url: radio.url.value.trim() });
+        await post('/api/cards', { ...settings, folder: card.folder });
+      } else if (kind === 'radio') {
+        await post('/api/radio', { name: radio.name.value.trim(), url: radio.url.value.trim(), card: settings });
+      } else if (same) {
+        await post('/api/podcast', { folder: card.folder, action: 'update', url: podcast.url.value.trim(),
+          keep: podcast.keepValue() });
+        await post('/api/cards', { ...settings, folder: card.folder });
+      } else {
+        await post('/api/podcasts', { url: podcast.url.value.trim(), name: podcast.name.value.trim(),
+          keep: podcast.keepValue(), card: settings });
+        toast('Abonnement enregistré : les épisodes se téléchargent');
+        onDone();
+        return;
+      }
       toast(card ? 'Carte modifiée' : 'Carte associée');
       onDone();
     }));
     setKids(box,
       h('h2', null, card ? 'Modifier la carte' : 'Choisir la musique'),
       h('div', { class: 'big-uid mono' }, uid),
-      h('label', null, 'Dossier de la carte SD'), sel,
-      h('p', { class: 'muted small' }, 'Pour un sous-dossier, utilisez « Associer une carte » depuis l\'onglet Musique.'),
+      h('label', null, 'Que joue cette carte ?'), kindSel,
+      folderBox, radio.el, podcast.el,
       h('label', null, 'Ordre de lecture'), shuffleSel,
+      h('label', null, 'À la fin de la playlist'), repeatSel,
       h('label', null, 'Après le retrait, conserver la progression pendant'), delaySel,
       h('label', null, 'Si une autre carte est posée entre-temps'), otherSel,
       h('label', null, 'Normalisation ', h('span', { class: 'muted' }, '(volume égalisé entre les morceaux)')), normSel,
@@ -834,7 +971,7 @@ async function renderMusic(path = app.path) {
     if (e.dir) {
       const nCards = cardsOf(full).length;
       list.append(h('li', null, check,
-        h('span', { class: 'ico' }, '📁'),
+        h('span', { class: 'ico', title: KIND_LABEL[e.kind] || 'Dossier' }, KIND_ICON[e.kind] || '📁'),
         h('div', { class: 'name' }, h('button', { class: 'linkish', onclick: () => renderMusic(full) }, e.name),
           nCards ? h('small', null, `▣ ${nCards} carte${nCards > 1 ? 's' : ''} associée${nCards > 1 ? 's' : ''}`) : null),
         h('button', { class: 'small', 'aria-label': 'Lire', title: 'Lire', onclick: () => playFolder(full) }, '▶'),
@@ -873,7 +1010,8 @@ async function renderMusic(path = app.path) {
   });
 
   const uploadsBox = h('div', { class: 'uploads' });
-  app.view = { uploadsBox, update: null };
+  const content = data.kind === 'podcast' ? podcastBox(data.path) : data.kind === 'radio' ? radioBox(data.path) : null;
+  app.view = { uploadsBox, update: content && content.refresh ? () => content.refresh() : null };
 
   const folderActions = data.path ? h('div', { class: 'row' },
     h('button', { class: 'small', onclick: () => playFolder(data.path) }, '▶ Lire ce dossier'),
@@ -899,16 +1037,113 @@ async function renderMusic(path = app.path) {
 
   setKids(root, 
     h('div', { class: 'card' },
-      crumbs, folderActions, folderCards,
+      crumbs, folderActions, content, folderCards,
       h('div', { class: 'row actions' },
         mkdir,
         h('button', { class: 'small', onclick: () => filesInput.click() }, '↑ Fichiers'),
-        h('button', { class: 'small', onclick: () => dirInput.click() }, '↑ Dossier')),
+        h('button', { class: 'small', onclick: () => dirInput.click() }, '↑ Dossier'),
+        h('button', { class: 'small', onclick: () => newContentFlow('radio') }, '+ Webradio'),
+        h('button', { class: 'small', onclick: () => newContentFlow('podcast') }, '+ Podcast')),
       filesInput, dirInput,
       h('div', { class: 'actions' }, drop),
       uploadsBox),
     h('div', { class: 'card' }, selBar, list, h('div', { class: 'actions' }, usage)));
   drawUploads();
+}
+
+/* Encadré d'un dossier de webradio : adresse du flux. */
+function radioBox(folder) {
+  const info = h('div', { class: 'small mono' }, '…');
+  const edit = h('button', { class: 'small' }, '✎ Modifier l\'adresse');
+  let url = '';
+  edit.addEventListener('click', () => {
+    const u = prompt('Adresse du flux de la webradio :', url);
+    if (!u || u.trim() === url) return;
+    if (!isUrl(u.trim())) { toast('Adresse du flux : http:// ou https://', true); return; }
+    busy(edit, async () => {
+      await post('/api/radio', { folder, url: u.trim() });
+      toast('Adresse enregistrée');
+      renderMusic(folder);
+    });
+  });
+  api('/api/radio?folder=' + encodeURIComponent(folder))
+    .then((r) => { url = r.url; info.textContent = r.url || '(aucune adresse)'; })
+    .catch(reportError);
+  return h('div', { class: 'content-box' },
+    h('div', { class: 'small muted' }, '📻 Webradio'), info,
+    h('div', { class: 'row' }, edit));
+}
+
+/* Encadré d'un dossier de podcast : état des téléchargements, réglages, désabonnement. */
+function podcastBox(folder) {
+  const info = h('div', { class: 'small' }, 'Chargement…');
+  const sync = h('button', { class: 'small' }, '↻ Vérifier maintenant');
+  const edit = h('button', { class: 'small' }, '☰ Réglages');
+  const unsub = h('button', { class: 'small danger' }, 'Se désabonner');
+  let last = null;
+  const draw = (pi) => {
+    const was = last && last.syncing;
+    last = pi;
+    setKids(info,
+      h('div', null, h('b', null, pi.title || 'Podcast'), ` · les ${pi.keep} épisodes les plus récents sont gardés`),
+      h('div', { class: pi.syncing ? '' : 'muted' }, podcastSummary(pi)),
+      pi.last_error && !pi.syncing ? h('div', { class: 'error-text' }, pi.last_error) : null);
+    sync.disabled = pi.syncing;
+    if (was && !pi.syncing && app.tab === 'music' && app.path === folder) renderMusic(folder); /* nouveaux épisodes */
+  };
+  const load = () => api('/api/podcast?folder=' + encodeURIComponent(folder)).then(draw).catch(reportError);
+  sync.addEventListener('click', () => busy(sync, async () => {
+    await post('/api/podcast', { folder, action: 'sync' });
+    toast('Vérification lancée');
+    setTimeout(load, 1500);
+  }));
+  edit.addEventListener('click', () => {
+    if (!last) return;
+    const url = prompt('Adresse du flux RSS :', last.url);
+    if (url === null) return;
+    const keep = prompt(`Nombre d'épisodes gardés (${PODCAST_KEEP.min} à ${PODCAST_KEEP.max}) :`, String(last.keep));
+    if (keep === null) return;
+    busy(edit, async () => {
+      await post('/api/podcast', { folder, action: 'update', url: url.trim(), keep: Number(keep) });
+      toast('Réglages du podcast enregistrés');
+      load();
+    });
+  });
+  unsub.addEventListener('click', () => {
+    if (!confirm('Se désabonner ? Les épisodes déjà téléchargés restent dans le dossier.')) return;
+    busy(unsub, async () => {
+      await post('/api/podcast', { folder, action: 'unsubscribe' });
+      toast('Désabonné');
+      renderMusic(folder);
+    });
+  });
+  load();
+  const box = h('div', { class: 'content-box' },
+    h('div', { class: 'small muted' }, '🎙 Podcast'), info,
+    h('div', { class: 'row' }, sync, edit, unsub));
+  box.refresh = () => { if (last && last.syncing) load(); };
+  return box;
+}
+
+/* Nouvelle webradio ou nouveau podcast (sans carte : on l'associera ensuite). */
+function newContentFlow(kind) {
+  const f = kind === 'radio' ? radioFields() : podcastFields();
+  const save = h('button', { class: 'primary' }, kind === 'radio' ? 'Créer' : 'S\'abonner');
+  const cancel = h('button', { onclick: () => renderMusic() }, 'Annuler');
+  save.addEventListener('click', () => busy(save, async () => {
+    if (kind === 'radio' ? !f.check(true) : !f.check()) return;
+    const r = kind === 'radio'
+      ? await post('/api/radio', { name: f.name.value.trim(), url: f.url.value.trim() })
+      : await post('/api/podcasts', { url: f.url.value.trim(), name: f.name.value.trim(), keep: f.keepValue() });
+    toast(kind === 'radio' ? 'Webradio créée' : 'Abonnement enregistré : les épisodes se téléchargent');
+    renderMusic(r.folder);
+  }));
+  setKids(root, h('div', { class: 'card stack' },
+    h('h2', null, kind === 'radio' ? 'Nouvelle webradio' : 'Nouveau podcast'),
+    f.el,
+    h('p', { class: 'muted small' }, 'Associez ensuite une carte depuis le dossier créé (« ▣ Associer une carte »).'),
+    h('div', { class: 'row end actions' }, cancel, save)));
+  app.view = null;
 }
 
 /*
@@ -1109,6 +1344,7 @@ async function renderSettings() {
 
   /* Lecture des cartes */
   const shuffle = h('input', { type: 'checkbox', checked: !!s.shuffle });
+  const repeat = h('input', { type: 'checkbox', checked: !!s.repeat });
   const resumeMin = h('input', { type: 'number', class: 'short', min: 0, max: 43200, step: 1, value: Math.round(s.resume_s / 60),
     'aria-label': 'Durée de conservation de la progression, en minutes' });
   const resumeOther = h('input', { type: 'checkbox', checked: !!s.resume_after_other, id: 'resume-other' });
@@ -1116,7 +1352,8 @@ async function renderSettings() {
   saveResume.addEventListener('click', () => busy(saveResume, async () => {
     const m = Number(resumeMin.value);
     if (!Number.isFinite(m) || m < 0) { toast('Durée invalide', true); return; }
-    await post('/api/settings', { shuffle: shuffle.checked, resume_s: Math.round(m * 60), resume_after_other: resumeOther.checked });
+    await post('/api/settings', { shuffle: shuffle.checked, repeat: repeat.checked, resume_s: Math.round(m * 60),
+      resume_after_other: resumeOther.checked });
     toast('Réglages de lecture enregistrés');
   }));
 
@@ -1269,6 +1506,7 @@ async function renderSettings() {
       h('h2', null, 'Lecture des cartes'),
       h('p', { class: 'small muted' }, 'Réglages généraux, modifiables carte par carte (bouton ☰ de l\'onglet Cartes).'),
       h('label', { class: 'check' }, shuffle, ' Lire les morceaux dans un ordre aléatoire'),
+      h('label', { class: 'check' }, repeat, ' Recommencer la playlist quand elle est finie'),
       h('label', null, 'Après le retrait de la carte, conserver la progression pendant'),
       h('div', { class: 'row' }, resumeMin, h('span', null, 'minutes')),
       h('p', { class: 'small muted' }, '0 : sans limite, la carte reprend toujours où elle en était.'),
@@ -1327,7 +1565,8 @@ async function renderSettings() {
     h('div', { class: 'card' },
       h('h2', null, 'Système'),
       h('p', { class: 'small muted' }, `Allumée depuis ${fmtTime(st.uptime)} · mémoire libre ${fmtSize(st.heap)}`),
-      h('div', { class: 'row' }, reboot, logout, reset)));
+      h('div', { class: 'row' }, reboot, logout, reset),
+      journalBox()));
   app.view = { update: updateOta };
 }
 
@@ -1488,6 +1727,56 @@ async function importSettings(file) {
   toast(r.message || 'Réglages importés');
   if (r.ip_test) showIpTest(st.ip.address, 300);
   else renderSettings();
+}
+
+/*
+ * Journal de l'enceinte (messages aussi envoyés sur le port série) et état de la mémoire, lus
+ * pendant que le panneau est ouvert. Les temps « depuis le démarrage » sont convertis en heures.
+ */
+function journalBox() {
+  const pre = h('pre', { class: 'log' });
+  const mem = h('p', { class: 'small muted' });
+  const follow = h('input', { type: 'checkbox', checked: true });
+  const details = h('details', null, h('summary', null, 'Journal de l\'enceinte'));
+  let next = 0, text = '', timer = null;
+  const clock = (r, ms) => {
+    if (!r.time) return fmtTime(ms / 1000);
+    return new Date(r.time * 1000 - (r.uptime_ms - ms)).toLocaleTimeString('fr-FR');
+  };
+  const load = async () => {
+    if (!details.open || app.tab !== 'settings' || !document.body.contains(pre)) {
+      clearInterval(timer);
+      timer = null;
+      return;
+    }
+    const r = await api('/api/logs?since=' + next);
+    if (r.reset) text = '';
+    text += r.text.replace(/^([EWIDV]) \((\d+)\) /gm, (m, lvl, ms) => `${lvl} ${clock(r, Number(ms))} `);
+    if (text.length > 300000) text = text.slice(text.indexOf('\n', text.length - 200000) + 1);
+    next = r.next;
+    pre.textContent = text || '(vide)';
+    if (follow.checked) pre.scrollTop = pre.scrollHeight;
+    const m = r.memory;
+    mem.textContent = `Mémoire interne : ${fmtSize(m.internal_free)} libres (plus grand bloc ${fmtSize(m.internal_largest)}, `
+      + `minimum depuis le démarrage ${fmtSize(m.internal_min)})`
+      + (m.psram_total ? ` · PSRAM : ${fmtSize(m.psram_free)} libres sur ${fmtSize(m.psram_total)}` : '');
+  };
+  details.addEventListener('toggle', () => {
+    if (details.open && !timer) {
+      load().catch(reportError);
+      timer = setInterval(() => load().catch(() => {}), 3000);
+    }
+  });
+  const save = h('button', { class: 'small' }, '↓ Télécharger');
+  save.addEventListener('click', () => {
+    const a = h('a', { href: URL.createObjectURL(new Blob([text], { type: 'text/plain' })),
+      download: `journal-enceinte-${new Date().toISOString().slice(0, 16).replace(':', 'h')}.txt` });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+  details.append(mem, pre,
+    h('div', { class: 'row' }, h('label', { class: 'check', style: 'margin-top:0' }, follow, ' Suivre'), save));
+  return details;
 }
 
 function uploadFirmware(file, bar, msg) {

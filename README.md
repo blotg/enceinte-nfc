@@ -16,6 +16,10 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Lecteur NFC PN532 ou PN5180 | ✅ | Détecté automatiquement au démarrage. Le PN5180 porte plus loin et lit aussi les étiquettes ISO 15693 (ICODE SLIX). |
 | Pause au retrait, reprise sous 10 min | ✅ | Durée de conservation de la progression réglable (0 = sans limite), progression conservée ou non après une autre carte, en réglage général ou carte par carte. Une carte inconnue compte comme « une autre carte ». |
 | Mode sommeil par carte | ✅ | Pause après N morceaux ou N minutes d'écoute (fondu sonore), compté depuis la pose de la carte. |
+| Répétition | ✅ | La playlist recommence au lieu de s'arrêter (berceuses, bruit blanc), en réglage général ou carte par carte. |
+| Webradio | ✅ | Une carte lance une radio en direct (flux MP3, AAC ou Ogg, HTTP ou HTTPS, listes .m3u/.pls), avec le titre diffusé. Pas de flux HLS (.m3u8 en segments). |
+| Podcasts | ✅ | Une carte suit un flux RSS : les nouveaux épisodes sont téléchargés chaque nuit sur la carte SD, les N plus récents gardés, joués dans l'ordre avec la reprise habituelle. |
+| Journal consultable | ✅ | *Réglages → Système → Journal* : derniers messages, raison du dernier redémarrage, résumé d'un plantage, mémoire libre ; à télécharger. |
 | Association dossier ↔ carte par l'interface web | ✅ | Mode association : la carte posée est capturée sans lancer la musique. Dossiers nommés librement (accents, espaces). |
 | Dépôt de fichiers par l'interface web | ✅ | Fichiers ou dossiers entiers, glisser-déposer. Débit limité par la carte SD en SPI. |
 | Mises à jour automatiques | ✅ | Depuis les releases GitHub (ou votre serveur), au démarrage (+1 min) et toutes les N heures. Installation seulement quand l'enceinte est inactive. Retour automatique à l'ancienne version si la nouvelle ne démarre pas. |
@@ -194,9 +198,11 @@ absente à ce moment rapporterait ses réglages à son retour.
   Compatibilité avec l'ancien firmware : une carte non associée joue le dossier nommé d'après
   son identifiant (ex. `04ab53a96f2681`), s'il existe à la racine de la carte SD.
   Pour un sous-dossier : onglet *Musique*, ouvrir le dossier, « Associer une carte ».
-  Le bouton ☰ d'une carte ouvre ses réglages : dossier, ordre de lecture, conservation de
-  la progression, son, mode sommeil. L'onglet *Musique* montre aussi les cartes associées au dossier ouvert
-  (et le nombre de cartes de chaque sous-dossier).
+  Une carte peut aussi jouer une **webradio** ou un **podcast** (« Que joue cette carte ? »).
+  Le bouton ☰ d'une carte ouvre ses réglages : contenu, ordre de lecture, fin de playlist
+  (s'arrêter ou recommencer), conservation de la progression, son, mode sommeil. L'onglet
+  *Musique* montre aussi les cartes associées au dossier ouvert (et le nombre de cartes de
+  chaque sous-dossier).
 - **Bips** : deux bips = carte inconnue ; trois bips graves = dossier vide ou carte SD absente.
   Ils sont joués au volume réglé (volume 0 : aucun bip), à un niveau proche de celui de la musique.
 - **Volume** : curseur de l'onglet *Lecture*, touches ou boutons de l'enceinte, ou application MPD. Il va
@@ -251,6 +257,54 @@ de morceaux (1 à 999) ou une durée d'écoute (1 à 720 minutes).
 - L'onglet *Lecture* affiche ce qui reste avant la pause. Modifier le réglage pendant
   l'écoute relance le décompte. Une lecture lancée depuis l'interface web ou une application
   MPD n'est pas concernée.
+
+### Webradio
+
+Une carte associée à une webradio la joue en direct : *Cartes → Associer une carte*, « Une
+webradio », un nom et l'adresse du flux (ou *Musique → + Webradio*, puis « Associer une
+carte » dans le dossier créé).
+
+- L'adresse est celle d'un flux MP3, AAC ou Ogg, souvent donnée sur le site de la radio
+  (elle finit souvent par `.mp3`, `.aac`, `.m3u` ou `.pls`). Les listes `.m3u`/`.pls` et les
+  redirections sont suivies ; HTTP et HTTPS. Les flux HLS (`.m3u8` découpés en segments),
+  qu'utilisent certaines applications, ne sont pas pris en charge : prendre l'adresse
+  « Icecast » ou « Shoutcast » de la radio.
+- Elle est rangée dans `Webradios/<nom>/webradio.m3u` sur la carte SD. N'importe quel
+  dossier contenant une liste `.m3u` ou `.pls` d'adresses `http(s)://` se joue d'ailleurs de
+  la même façon.
+- L'onglet *Lecture* et les applications MPD affichent le titre diffusé par la radio. Une
+  application MPD peut aussi ajouter directement une adresse de flux (`add http://…`).
+- Retirer la carte coupe la connexion ; la reposer reprend **en direct** (pas de retard
+  accumulé). Coupure du réseau : reconnexion automatique (3 essais), sinon message
+  « radio injoignable ». La position n'est pas enregistrée (rien à reprendre) et le mode
+  sommeil en minutes s'applique comme pour un dossier.
+
+### Podcasts
+
+*Cartes → Associer une carte*, « Un podcast » : l'adresse du flux RSS (« flux RSS » ou
+« RSS feed » sur le site du podcast), un nom facultatif (sans nom : le titre du podcast),
+et le nombre d'épisodes à garder (10 par défaut). Ou *Musique → + Podcast*.
+
+- L'enceinte crée `Podcasts/<nom>` et y télécharge les épisodes les plus récents, nommés
+  `AAAA-MM-JJ HHhMM - Titre.mp3` : la carte les joue **du plus ancien au plus récent**, avec la
+  reprise habituelle (idéal pour une série d'histoires).
+- Les nouveaux épisodes arrivent **chaque nuit** entre 2 h et 5 h, enceinte inactive ; si
+  elle est éteinte la nuit, au plus tard 48 h après la dernière vérification. Le dossier du
+  podcast (onglet *Musique*) montre l'état et permet de vérifier tout de suite.
+- Seuls les N plus récents restent sur la carte SD (sauf l'épisode en cours d'écoute). Un
+  épisode supprimé à la main n'est pas retéléchargé. 300 Mo restent toujours libres.
+- L'abonnement est le fichier `.podcast.json` du dossier : il suit le dossier quand on le
+  déplace et voyage avec une carte SD clonée. « Se désabonner » garde les épisodes.
+- Une mise à jour du firmware attend la fin des téléchargements.
+
+### Journal
+
+*Réglages → Système → Journal de l'enceinte* : les derniers messages de l'enceinte (48 Ko,
+les mêmes que sur le port série), avec l'heure, la raison du dernier redémarrage (coupure,
+chute de tension, plantage, chien de garde…) et, après un plantage, la tâche en cause et la
+pile d'appels. La mémoire libre y est affichée (mémoire interne, plus grand bloc, minimum
+depuis le démarrage, PSRAM). « Télécharger » en fait un fichier texte à joindre à un
+signalement.
 
 ### Adresse IP fixe
 
@@ -394,7 +448,10 @@ ces fichiers à chaque chargement (réponse 304 sans contenu tant que le firmwar
 |---|---|
 | `main.c` | Démarrage, bouton de réinitialisation, validation du firmware après 30 s |
 | `pn532*.c`, `pn5180*.c`, `nfc.c` | Pilotes PN532 (trames vérifiées, nombre d'essais borné) et PN5180 (ISO 14443A et 15693), détection automatique du lecteur, détection pose/retrait avec anti-rebond, réinitialisation automatique |
-| `player.c` | File d'attente, lecture SD anticipée (réservoir de 2 à 16 s), décodage, I2S, volume |
+| `player.c` | File d'attente, lecture SD ou réseau anticipée (réservoir de 2 à 16 s), décodage, I2S, volume |
+| `radio.c`, `stream.c`, `net_http.c` | Webradio : listes .m3u/.pls, titres ICY, flux HTTP(S) avec redirections |
+| `rss.c`, `podcast.c` | Podcasts : flux RSS lu au fil de l'eau, abonnements, téléchargements de la nuit |
+| `log_ring.c`, `log_buffer.c` | Journal en mémoire pour l'interface web, raison du redémarrage, résumé d'un plantage |
 | `dsp.c` | Normalisation, compression, limiteur |
 | `buttons.c`, `touch_keys.c` | Volume sur l'enceinte : touches tactiles ou boutons poussoirs |
 | `controller.c`, `session.c` | Règles carte ↔ lecture (reprise, délai de 10 min) |
@@ -409,7 +466,7 @@ ces fichiers à chaque chargement (réponse 304 sans contenu tant que le firmwar
 ## Tests (sur PC, sans le matériel)
 
 ```bash
-test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 (MPD), libcjson-dev (JSON)
+test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 (MPD), libcjson-dev ou IDF_PATH (JSON)
 ```
 
 1. Tests unitaires des modules purs, avec de vrais fichiers audio générés par ffmpeg/lame :
@@ -422,10 +479,16 @@ test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 
    simulés. Scénarios : reprise, autre carte, carte inconnue, délai dépassé, playlist
    terminée, mode association, ordre aléatoire retrouvé à la reprise, mode sommeil (en
    morceaux, en durée avec fondu, nouveau décompte quand la carte est reposée).
+   Aussi la répétition et la webradio (flux simulé : direct, titre, coupure du réseau et
+   reconnexion, reprise en direct, radio injoignable).
 3. Le **vrai** serveur MPD et le **vrai** lecteur, pilotés par un vrai client MPD (python-mpd2).
 4. La copie sur carte SD, avec deux enceintes simulées : première copie, carte clonée dans une
    enceinte sortie d'usine, dossiers déplacés et fichiers ajoutés sur un ordinateur, fichier
    abîmé, modifications pendant l'absence de la carte, export et import, réinitialisation.
+5. Les podcasts avec un « Internet » simulé : abonnement, renommage d'après le titre du flux,
+   épisodes gardés, épisode en cours d'écoute épargné, épisode supprimé à la main, épisode ou
+   flux injoignable, désabonnement. Le flux RSS lui-même (CDATA, entités, dates) est testé
+   découpé de toutes les façons possibles.
 
 Le tout est compilé avec AddressSanitizer et UndefinedBehaviorSanitizer.
 

@@ -297,6 +297,31 @@ def test_queue(c):
     c.stop()
 
 
+def test_radio(c):
+    """Webradio : adresse ajoutée par une application et jouée en direct (flux simulé)."""
+    c.clear()
+    url = "http://test/Long/long.mp3"
+    c.add(url)
+    sid = c.addid(url, 0)
+    songs = c.playlistinfo()
+    check(len(songs) == 2 and songs[0]["file"] == url and songs[0]["id"] == sid, f"radio ajoutée : {songs}")
+    c.play(0)
+    check(wait_for(lambda: c.currentsong().get("title") == "Titre simulé", 5), f"titre de la radio : {c.currentsong()}")
+    st = c.status()
+    check(st["state"] == "play" and float(st.get("duration", 0)) == 0, f"en direct : {st}")
+    try:
+        c.seekcur(10)
+        check(False, "recherche acceptée dans un direct")
+    except mpd.CommandError:
+        pass
+    c.clear()
+    try:
+        c.add("ftp://x/y")
+        check(False, "schéma d'adresse inconnu accepté")
+    except mpd.CommandError:
+        pass
+
+
 def test_protocol(c):
     c.command_list_ok_begin()
     c.status()
@@ -403,6 +428,7 @@ if __name__ == "__main__":
         test_library(cl)
         test_playback(cl, server)
         test_queue(cl)
+        test_radio(cl)
         test_protocol(cl)
         cl.close()
         test_robustness()

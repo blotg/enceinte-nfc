@@ -24,6 +24,7 @@ typedef struct {
     int32_t resume_s;    /* délai de reprise : CARD_DEFAULT, 0 = toujours, sinon secondes */
     int8_t resume_other; /* après une autre carte : CARD_DEFAULT, 0 = recommencer, 1 = reprendre */
     int8_t shuffle;      /* ordre de lecture : CARD_DEFAULT, 0 = dans l'ordre, 1 = aléatoire */
+    int8_t repeat;       /* fin de playlist : CARD_DEFAULT, 0 = s'arrêter, 1 = recommencer */
     int8_t normalize;    /* normalisation : CARD_DEFAULT ou 0 à SOUND_LEVEL_MAX */
     int8_t compress;     /* compression : CARD_DEFAULT ou 0 à SOUND_LEVEL_MAX */
     /* mode sommeil : pause après ce nombre de morceaux ou de minutes d'écoute (0 : jamais) */
@@ -35,7 +36,8 @@ typedef struct {
 static inline bool cards_entry_valid(const card_entry_t *e)
 {
     return e->resume_s >= CARD_DEFAULT && e->resume_s <= 30 * 24 * 3600 && e->resume_other >= CARD_DEFAULT &&
-           e->resume_other <= 1 && e->shuffle >= CARD_DEFAULT && e->shuffle <= 1 && e->normalize >= CARD_DEFAULT &&
+           e->resume_other <= 1 && e->shuffle >= CARD_DEFAULT && e->shuffle <= 1 && e->repeat >= CARD_DEFAULT &&
+           e->repeat <= 1 && e->normalize >= CARD_DEFAULT &&
            e->normalize <= SOUND_LEVEL_MAX && e->compress >= CARD_DEFAULT && e->compress <= SOUND_LEVEL_MAX &&
            e->sleep_tracks <= SLEEP_TRACKS_MAX && e->sleep_minutes <= SLEEP_MINUTES_MAX;
 }

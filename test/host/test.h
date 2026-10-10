@@ -46,3 +46,6 @@ void test_dsp(void);
 void test_config_json(void);
 void test_touch(void);
 void test_pn5180(void);
+void test_log_ring(void);
+void test_radio(void);
+void test_rss(void);

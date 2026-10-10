@@ -18,6 +18,7 @@ static config_t sample(void)
     s->resume_timeout_s = 600;
     s->resume_after_other = true;
     s->shuffle = false;
+    s->repeat = true;
     s->https_enabled = true;
     s->normalize = 2;
     s->compress = 1;
@@ -66,6 +67,7 @@ static void test_roundtrip(void)
           b.s.ip.gateway == 0xC0A80101 && b.s.ip.dns == 0);
     CHECK(b.s.normalize == 2 && b.s.compress == 1 && b.s.max_volume == 70);
     CHECK(b.s.resume_timeout_s == 600 && b.s.resume_after_other && !b.s.shuffle && b.s.https_enabled);
+    CHECK(b.s.repeat);
     CHECK(b.s.ota_interval_h == 24);
     CHECK(b.s.vol_touch && b.s.touch_threshold == 25 && b.s.touch_hold_ms == 1000);
     CHECK(b.admin_hash && memcmp(b.admin, a.admin, SETTINGS_PW_HASH_LEN) == 0);
@@ -155,6 +157,7 @@ static void test_cards(void)
     card_entry_t e = {.resume_s = 0,
                       .resume_other = 1,
                       .shuffle = CARD_DEFAULT,
+                      .repeat = 1,
                       .normalize = 3,
                       .compress = CARD_DEFAULT,
                       .sleep_tracks = 4};
@@ -171,6 +174,7 @@ static void test_cards(void)
     free(txt);
     CHECK_STR(f.uid, e.uid);
     CHECK_STR(f.folder, e.folder);
+    CHECK(f.repeat == 1);
     CHECK(f.resume_s == 0 && f.resume_other == 1 && f.shuffle == CARD_DEFAULT && f.normalize == 3 &&
           f.compress == CARD_DEFAULT && f.sleep_tracks == 4 && f.sleep_minutes == 0);
     CHECK(cards_entry_valid(&f));
@@ -180,6 +184,7 @@ static void test_cards(void)
     cJSON_Delete(o);
     CHECK_STR(f.uid, "04AB53A9");
     CHECK(f.resume_s == CARD_DEFAULT && f.shuffle == CARD_DEFAULT && f.compress == CARD_DEFAULT);
+    CHECK(f.repeat == CARD_DEFAULT);
     CHECK(f.sleep_tracks == 0 && f.sleep_minutes == 0); /* fichiers des versions précédentes */
     o = cJSON_Parse("{\"uid\": \"04ab53a9\", \"sleep_minutes\": 720, \"sleep_tracks\": null}");
     CHECK(card_from_json(o, &f, false, err, sizeof(err)));
@@ -191,6 +196,7 @@ static void test_cards(void)
         "{\"uid\": \"04AB53ZZ\"}",
         "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"compress\": 4}",
         "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"shuffle\": 1}",
+        "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"repeat\": \"oui\"}",
         "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"resume_s\": -5}",
         "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"sleep_tracks\": 1000}",
         "{\"uid\": \"04AB53A9\", \"folder\": \"A\", \"sleep_minutes\": 721}",

@@ -79,6 +79,7 @@ cJSON *config_to_json(const config_t *c, bool secrets)
     cJSON_AddNumberToObject(o, "resume_s", s->resume_timeout_s);
     cJSON_AddBoolToObject(o, "resume_after_other", s->resume_after_other);
     cJSON_AddBoolToObject(o, "shuffle", s->shuffle);
+    cJSON_AddBoolToObject(o, "repeat", s->repeat);
     cJSON_AddNumberToObject(o, "normalize", s->normalize);
     cJSON_AddNumberToObject(o, "compress", s->compress);
     cJSON *ctl = cJSON_AddObjectToObject(o, "controls");
@@ -229,7 +230,7 @@ bool config_from_json(const cJSON *o, config_t *out, char *err, size_t errlen)
     }
     s->resume_timeout_s = (uint32_t)v;
     if (!get_bool(o, "resume_after_other", &s->resume_after_other) || !get_bool(o, "shuffle", &s->shuffle) ||
-        !get_bool(o, "https", &s->https_enabled)) {
+        !get_bool(o, "repeat", &s->repeat) || !get_bool(o, "https", &s->https_enabled)) {
         FAIL("réglage oui/non invalide");
     }
     v = s->normalize;
@@ -327,6 +328,7 @@ cJSON *card_to_json(const card_entry_t *e, bool with_folder)
     add_opt_int(o, "resume_s", e->resume_s);
     add_opt_bool(o, "resume_other", e->resume_other);
     add_opt_bool(o, "shuffle", e->shuffle);
+    add_opt_bool(o, "repeat", e->repeat);
     add_opt_int(o, "normalize", e->normalize);
     add_opt_int(o, "compress", e->compress);
     cJSON_AddNumberToObject(o, "sleep_tracks", e->sleep_tracks);
@@ -404,7 +406,8 @@ bool card_from_json(const cJSON *o, card_entry_t *e, bool with_folder, char *err
     }
     int32_t normalize, compress;
     if (!opt_int(o, "resume_s", 30L * 24 * 3600, &e->resume_s) || !opt_bool(o, "resume_other", &e->resume_other) ||
-        !opt_bool(o, "shuffle", &e->shuffle) || !opt_int(o, "normalize", SOUND_LEVEL_MAX, &normalize) ||
+        !opt_bool(o, "shuffle", &e->shuffle) || !opt_bool(o, "repeat", &e->repeat) ||
+        !opt_int(o, "normalize", SOUND_LEVEL_MAX, &normalize) ||
         !opt_int(o, "compress", SOUND_LEVEL_MAX, &compress)) {
         FAIL("réglages invalides pour la carte %s", e->uid);
     }
