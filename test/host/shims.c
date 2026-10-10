@@ -22,6 +22,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "log_buffer.h"
 
 /* ---------- Divers ---------- */
 
@@ -174,6 +175,15 @@ UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q)
     UBaseType_t n = q->count;
     pthread_mutex_unlock(&q->m);
     return n;
+}
+
+/* ---------- Journal : pas de pile FreeRTOS à surveiller sur PC ---------- */
+
+void log_buffer_stack_check(const char *task, const char *detail, uint32_t *low)
+{
+    (void)task;
+    (void)detail;
+    (void)low;
 }
 
 /* ---------- Mutex ---------- */

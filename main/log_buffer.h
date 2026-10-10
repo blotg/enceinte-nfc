@@ -16,3 +16,7 @@ void log_buffer_report_boot(void);
 /* Cf. log_ring_read. Taille utile : log_buffer_size() + 1. */
 size_t log_buffer_read(uint64_t since, char *out, size_t cap, uint64_t *next, bool *reset);
 size_t log_buffer_size(void);
+/* Marge de pile de la tâche appelante : inscrit dans le journal chaque nouveau plus bas
+ * (par paliers de 256 octets) pour vérifier les tailles de pile en usage réel. *low vaut
+ * UINT32_MAX au départ ; detail (format lu…) peut être NULL. */
+void log_buffer_stack_check(const char *task, const char *detail, uint32_t *low);

@@ -22,6 +22,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "log_buffer.h"
 #include "media_info.h"
 #include "radio.h"
 #include "sdkconfig.h"
@@ -131,6 +132,7 @@ static uint32_t s_gen;
 static chunk_t *s_chunk;
 static esp_audio_simple_dec_raw_t s_raw;
 static esp_audio_simple_dec_handle_t s_dec;
+static audio_fmt_t s_dec_fmt;
 static uint8_t *s_out;
 static uint32_t s_out_cap;
 static int16_t *s_pcm;
@@ -299,6 +301,16 @@ static esp_err_t post(cmd_type_t type, int arg, uint32_t arg2, bool wait)
 
 /* ---------- Tâche de lecture SD ---------- */
 
+/* Marge de pile vérifiée au plus une fois par seconde (cf. log_buffer_stack_check). */
+static void watch_stack(const char *task, const char *detail, uint32_t *low, int64_t *last)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - *last >= 1000000) {
+        *last = now;
+        log_buffer_stack_check(task, detail, low);
+    }
+}
+
 static void send_chunk_error(uint32_t gen)
 {
     chunk_t *c;
@@ -416,7 +428,10 @@ static void reader_task(void *arg)
     uint32_t header_left = 0, jump_to = 0; /* repositionnement : en-tête d'abord, puis saut */
     bool first = false;
     media_info_t *mi = malloc(sizeof(media_info_t));
+    uint32_t stack_low = UINT32_MAX;
+    int64_t stack_checked = 0;
     for (;;) {
+        watch_stack("reader", st ? "webradio" : NULL, &stack_low, &stack_checked);
         read_req_t req;
         if (xQueueReceive(s_req_q, &req, (fd >= 0 || st) ? 0 : portMAX_DELAY) == pdTRUE) {
             if (fd >= 0) {
@@ -704,6 +719,7 @@ static bool open_decoder(audio_fmt_t fmt)
         s_dec = NULL;
         return false;
     }
+    s_dec_fmt = fmt;
     return true;
 }
 
@@ -1228,6 +1244,12 @@ static void handle_cmd(const cmd_t *c)
 
 static void player_task(void *arg)
 {
+    static const char *const fmt_names[] = {
+        [AUDIO_FMT_MP3] = "MP3", [AUDIO_FMT_AAC] = "AAC", [AUDIO_FMT_FLAC] = "FLAC",
+        [AUDIO_FMT_WAV] = "WAV", [AUDIO_FMT_M4A] = "M4A", [AUDIO_FMT_OGG] = "Ogg",
+    };
+    uint32_t stack_low = UINT32_MAX;
+    int64_t stack_checked = 0;
     for (;;) {
         cmd_t c;
         TickType_t wait = (s_state == PLAYER_PLAYING || s_skip_pending) ? 0 : portMAX_DELAY;
@@ -1252,6 +1274,8 @@ static void player_task(void *arg)
         }
         if (s_state == PLAYER_PLAYING) {
             decode_step();
+            /* les décodeurs demandent à eux seuls jusqu'à ~20 Ko de pile */
+            watch_stack("player", s_dec ? fmt_names[s_dec_fmt] : NULL, &stack_low, &stack_checked);
         }
     }
 }
@@ -1305,9 +1329,9 @@ esp_err_t player_init(uint8_t volume, uint8_t max_volume, player_event_cb_t cb)
         return err;
     }
     /* La connexion HTTPS d'une webradio (TLS) demande de la pile. */
-    xTaskCreatePinnedToCore(reader_task, "reader", 8192, NULL, 9, NULL, 1);
+    xTaskCreatePinnedToCore(reader_task, "reader", 10240, NULL, 9, NULL, 1); /* TLS des webradios */
     /* Les décodeurs (Opus, Vorbis, FLAC...) demandent environ 20 Ko de pile selon Espressif. */
-    xTaskCreatePinnedToCore(player_task, "player", 24576, NULL, 10, &s_player_task, 1);
+    xTaskCreatePinnedToCore(player_task, "player", 32768, NULL, 10, &s_player_task, 1);
     return ESP_OK;
 }
 

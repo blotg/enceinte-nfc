@@ -20,6 +20,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "log_buffer.h"
 #include "net_http.h"
 #include "player.h"
 #include "radio.h"
@@ -577,6 +578,8 @@ static bool player_busy(void)
     return st.state == PLAYER_PLAYING;
 }
 
+static uint32_t s_stack_low = UINT32_MAX; /* d'une tâche à la suivante (même taille de pile) */
+
 static void podcast_task(void *arg)
 {
     request_t *req = malloc(sizeof(request_t));
@@ -612,6 +615,7 @@ static void podcast_task(void *arg)
                 continue; /* automatique : jamais pendant l'écoute */
             }
             sync_folder(f.folders[i]);
+            log_buffer_stack_check("podcast", NULL, &s_stack_low);
         }
     }
     free(req);
@@ -634,7 +638,7 @@ static void request(const char *folder, bool manual)
     UNLOCK();
     /* Tâche créée à la demande : sa pile (TLS, écriture SD) n'occupe la RAM interne que
      * pendant les téléchargements. */
-    if (start && xTaskCreate(podcast_task, "podcast", 8192, NULL, 3, NULL) != pdPASS) {
+    if (start && xTaskCreate(podcast_task, "podcast", 12288, NULL, 3, NULL) != pdPASS) {
         s_running = false;
     }
 }

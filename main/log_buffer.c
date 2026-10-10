@@ -141,14 +141,25 @@ void log_buffer_report_boot(void)
         for (uint32_t i = 0; i < depth && o < sizeof(bt); i++) {
             o += (size_t)snprintf(bt + o, sizeof(bt) - o, " 0x%08" PRIx32, s->exc_bt_info.bt[i]);
         }
-        char sha[9];
-        for (int i = 0; i < 4; i++) {
-            snprintf(sha + 2 * i, 3, "%02x", s->app_elf_sha256[i]);
-        }
-        ESP_LOGW(TAG, "plantage précédent : tâche « %s », PC 0x%08" PRIx32 ", firmware %s, pile :%s%s", s->exc_task,
-                 s->exc_pc, sha, bt, s->exc_bt_info.corrupted ? " (incomplète)" : "");
+        /* app_elf_sha256 est déjà du texte (hexadécimal) : 9 caractères, comme « build » */
+        ESP_LOGW(TAG, "plantage précédent : tâche « %s », PC 0x%08" PRIx32 ", firmware %.9s, pile :%s%s", s->exc_task,
+                 s->exc_pc, (const char *)s->app_elf_sha256, bt, s->exc_bt_info.corrupted ? " (incomplète)" : "");
     }
     free(s);
     esp_core_dump_image_erase(); /* signalé une seule fois */
 #endif
+}
+
+#define STACK_STEP 256  /* nouvel enregistrement au-delà de cette baisse */
+#define STACK_WARN 1536 /* en dessous : avertissement */
+
+void log_buffer_stack_check(const char *task, const char *detail, uint32_t *low)
+{
+    uint32_t left = (uint32_t)uxTaskGetStackHighWaterMark(NULL); /* octets (ESP-IDF) */
+    if (left + STACK_STEP > *low) {
+        return;
+    }
+    *low = left;
+    ESP_LOG_LEVEL(left < STACK_WARN ? ESP_LOG_WARN : ESP_LOG_INFO, TAG, "pile « %s » : %" PRIu32 " octets libres au plus bas%s%s%s",
+                  task, left, detail ? " (" : "", detail ? detail : "", detail ? ")" : "");
 }
