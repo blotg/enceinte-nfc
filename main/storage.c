@@ -23,8 +23,6 @@
 
 static const char *TAG = "storage";
 
-#define MAX_TRACKS 2000
-#define MAX_DEPTH 6
 
 static sdmmc_card_t *s_card;
 static volatile bool s_mounted;
@@ -268,7 +266,7 @@ static int path_cmp(const void *a, const void *b)
 
 static esp_err_t list_add(path_list_t *out, int *cap, const char *item)
 {
-    if (out->count >= MAX_TRACKS) {
+    if (out->count >= STORAGE_MAX_TRACKS) {
         return ESP_OK;
     }
     if (out->count == *cap) {
@@ -310,7 +308,7 @@ static esp_err_t collect_tracks(const char *rel_dir, path_list_t *out, int *cap,
     if (err != ESP_OK) {
         return err;
     }
-    for (int i = 0; i < n && err == ESP_OK && out->count < MAX_TRACKS; i++) {
+    for (int i = 0; i < n && err == ESP_OK && out->count < STORAGE_MAX_TRACKS; i++) {
         char child[REL_PATH_MAX];
         int len = rel_dir[0] ? snprintf(child, sizeof(child), "%s/%s", rel_dir, entries[i].name)
                              : snprintf(child, sizeof(child), "%s", entries[i].name);
@@ -318,7 +316,7 @@ static esp_err_t collect_tracks(const char *rel_dir, path_list_t *out, int *cap,
             continue;
         }
         if (entries[i].is_dir) {
-            if (depth < MAX_DEPTH) {
+            if (depth < STORAGE_MAX_DEPTH) {
                 err = collect_tracks(child, out, cap, depth + 1);
             }
         } else if (is_audio_file(entries[i].name)) {
@@ -441,7 +439,7 @@ static esp_err_t remove_rec(const char *rel, int depth)
         err = ESP_ERR_NOT_FOUND;
     } else if (!S_ISDIR(st.st_mode)) {
         err = unlink(c->path) == 0 ? ESP_OK : ESP_FAIL;
-    } else if (depth > MAX_DEPTH + 2) {
+    } else if (depth > STORAGE_MAX_DEPTH + 2) {
         err = ESP_FAIL;
     } else {
         /* Liste FatFs brute : inclut les fichiers cachés (._xxx de macOS) pour pouvoir vider le dossier. */

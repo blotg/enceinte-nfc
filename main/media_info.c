@@ -921,7 +921,7 @@ static void vc_skip_bytes(vc_stream_t *v, uint32_t n)
     }
 }
 
-static void probe_ogg(FILE *f, media_info_t *mi)
+static void probe_ogg(FILE *f, media_info_t *mi, bool tags_only)
 {
     enum { PKT_CAP = 512, BODY_MAX = 255 * 255 };
     uint8_t *pkt = malloc(PKT_CAP);
@@ -960,6 +960,12 @@ static void probe_ogg(FILE *f, media_info_t *mi)
                 break;
             }
             uint32_t blen = pg.size - 27 - pg.nseg;
+            if (tags_only && packet == 1 && vc->state == VC_SKIP && vc->left == 0) {
+                /* Dernier commentaire sauté (pochette) : plus rien d'utile avant l'audio, qui
+                 * commence au plus tôt après lui (les en-têtes des pages suivantes en plus). */
+                mi->audio_start = off + 27 + pg.nseg + vc->need;
+                break;
+            }
             /* Inutile de lire une page entièrement couverte par un saut (pochette). */
             bool read_body = packet == 0 || (packet == 1 && vc->state != VC_DONE && !vc_skipping(vc, blen));
             if (read_body && (fseek(f, off + 27 + pg.nseg, SEEK_SET) != 0 || fread(body, 1, blen, f) != blen)) {
@@ -1059,7 +1065,7 @@ static bool seek_ogg(FILE *f, const media_info_t *mi, uint32_t ms, media_seek_t 
 
 /* ---- Point d'entrée ---- */
 
-bool media_probe(FILE *f, audio_fmt_t fmt, media_info_t *mi)
+static bool probe(FILE *f, audio_fmt_t fmt, media_info_t *mi, bool tags_only)
 {
     memset(mi, 0, sizeof(*mi));
     if (fseek(f, 0, SEEK_END) != 0) {
@@ -1087,12 +1093,22 @@ bool media_probe(FILE *f, audio_fmt_t fmt, media_info_t *mi)
         probe_wav(f, mi);
         break;
     case AUDIO_FMT_OGG:
-        probe_ogg(f, mi);
+        probe_ogg(f, mi, tags_only);
         break;
     default:
         break;
     }
     return true;
+}
+
+bool media_probe(FILE *f, audio_fmt_t fmt, media_info_t *mi)
+{
+    return probe(f, fmt, mi, false);
+}
+
+bool media_probe_tags(FILE *f, audio_fmt_t fmt, media_info_t *mi)
+{
+    return probe(f, fmt, mi, true);
 }
 
 static bool seek_mp3(const media_info_t *mi, uint32_t ms, media_seek_t *out)

@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include "changes.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -33,8 +34,11 @@ static const char *TAG = "mpd";
 #define OUT_FLUSH 8192
 #define LIST_MAX_BYTES 65536
 #define INACTIVITY_S 600
-#define CACHE_SIZE 48
-#define MAX_WALK_DEPTH 6
+#define MAX_WALK_DEPTH STORAGE_MAX_DEPTH
+#ifndef INDEX_QUIET_MS
+#define INDEX_QUIET_MS 10000 /* carte sans changement depuis ce délai : mise en cache */
+#endif
+#define SLOW_COMMAND_US 1000000 /* au-delà, la commande est notée dans le journal */
 
 enum {
     ACK_ERROR_NOT_LIST = 1,
@@ -175,109 +179,233 @@ static int fail(client_t *c, int code, const char *fmt, ...)
 
 /* ======================= Cache des métadonnées ======================= */
 
+/*
+ * Tags de tous les morceaux déjà lus, en PSRAM : un parcours complet (list, find, search...)
+ * ne relit chaque fichier qu'une fois. Après un changement sur la carte, une entrée est
+ * revérifiée (date et taille) à sa prochaine lecture au lieu de tout relire.
+ */
+#define CACHE_BUCKETS 1024            /* puissance de 2 */
+#define CACHE_MAX_BYTES (1536 * 1024) /* plusieurs milliers de morceaux */
+#define TAG_NONE UINT16_MAX
+
 typedef struct {
-    char *tags[MPD_TAG_COUNT];
+    const char *tags[MPD_TAG_COUNT]; /* dans text */
     uint32_t duration_ms;
     time_t mtime;
     const char *file; /* non possédé */
+    char *text;       /* copie des tags */
 } song_meta_t;
 
-typedef struct {
-    char *path;
-    song_meta_t meta;
+typedef struct cache_entry {
+    struct cache_entry *next;
+    uint32_t hash;
+    uint32_t checked; /* version de la base à la dernière vérification */
+    uint32_t bytes;   /* taille de l'allocation */
+    time_t mtime;
+    off_t size;
+    uint32_t duration_ms;
+    uint16_t tag_at[MPD_TAG_COUNT]; /* position dans tags, TAG_NONE si absent */
+    uint16_t tags_len;
+    char *tags; /* dans path, après le chemin */
+    char path[]; /* chemin puis tags, chacun terminé par '\0' */
 } cache_entry_t;
 
-static cache_entry_t s_cache[CACHE_SIZE];
-static int s_cache_next;
-static uint32_t s_cache_db_version;
+static cache_entry_t **s_cache; /* seaux */
+static size_t s_cache_bytes;
 static SemaphoreHandle_t s_cache_lock;
+
+static void *psram_alloc(size_t size)
+{
+    void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : malloc(size);
+}
+
+static uint32_t path_hash(const char *s)
+{
+    uint32_t h = 2166136261u; /* FNV-1a */
+    while (*s) {
+        h = (h ^ (uint8_t)*s++) * 16777619u;
+    }
+    return h;
+}
+
+/* Emplacement de l'entrée (ou du NULL qui la remplacerait), verrou pris. */
+static cache_entry_t **cache_slot(const char *rel, uint32_t hash)
+{
+    cache_entry_t **pp = &s_cache[hash & (CACHE_BUCKETS - 1)];
+    while (*pp && ((*pp)->hash != hash || strcmp((*pp)->path, rel) != 0)) {
+        pp = &(*pp)->next;
+    }
+    return pp;
+}
+
+static void cache_remove(cache_entry_t **pp)
+{
+    cache_entry_t *e = *pp;
+    *pp = e->next;
+    s_cache_bytes -= e->bytes;
+    free(e);
+}
+
+static void cache_clear(void)
+{
+    for (int i = 0; i < CACHE_BUCKETS; i++) {
+        while (s_cache[i]) {
+            cache_remove(&s_cache[i]);
+        }
+    }
+}
+
+static void cache_forget(const char *rel, uint32_t hash)
+{
+    xSemaphoreTake(s_cache_lock, portMAX_DELAY);
+    cache_entry_t **pp = cache_slot(rel, hash);
+    if (*pp) {
+        cache_remove(pp);
+    }
+    xSemaphoreGive(s_cache_lock);
+}
+
+/* Place limitée : au-delà, le cache repart de zéro. Verrou pris ; l'entrée est ensuite au cache. */
+static void cache_insert(cache_entry_t *e)
+{
+    cache_entry_t **pp = cache_slot(e->path, e->hash);
+    if (*pp) {
+        cache_remove(pp);
+    }
+    if (s_cache_bytes + e->bytes > CACHE_MAX_BYTES) {
+        cache_clear();
+    }
+    cache_entry_t **head = &s_cache[e->hash & (CACHE_BUCKETS - 1)];
+    e->next = *head;
+    *head = e;
+    s_cache_bytes += e->bytes;
+}
+
+/* Copie privée des tags : l'entrée peut disparaître dès le verrou rendu. */
+static void meta_from_entry(song_meta_t *m, const cache_entry_t *e)
+{
+    m->mtime = e->mtime;
+    m->duration_ms = e->duration_ms;
+    m->text = e->tags_len ? malloc(e->tags_len) : NULL;
+    if (m->text) {
+        memcpy(m->text, e->tags, e->tags_len);
+    }
+    for (int t = 0; t < MPD_TAG_COUNT; t++) {
+        m->tags[t] = m->text && e->tag_at[t] != TAG_NONE ? m->text + e->tag_at[t] : NULL;
+    }
+}
 
 static void meta_free(song_meta_t *m)
 {
-    for (int i = 0; i < MPD_TAG_COUNT; i++) {
-        free(m->tags[i]);
-        m->tags[i] = NULL;
-    }
+    free(m->text);
+    m->text = NULL;
+    memset(m->tags, 0, sizeof(m->tags));
 }
 
-static void meta_copy(song_meta_t *dst, const song_meta_t *src)
+/* Nouvelle entrée ; mi NULL : fichier illisible, sans tags. */
+static cache_entry_t *entry_new(const char *rel, uint32_t hash, const struct stat *st, const media_info_t *mi)
 {
-    for (int i = 0; i < MPD_TAG_COUNT; i++) {
-        dst->tags[i] = src->tags[i] ? strdup(src->tags[i]) : NULL;
+    const char *vals[MPD_TAG_COUNT] = {0};
+    if (mi) {
+        vals[MPD_TAG_ARTIST] = mi->artist;
+        vals[MPD_TAG_ALBUMARTIST] = mi->album_artist;
+        vals[MPD_TAG_ALBUM] = mi->album;
+        vals[MPD_TAG_TITLE] = mi->title;
+        vals[MPD_TAG_TRACK] = mi->track;
+        vals[MPD_TAG_GENRE] = mi->genre;
+        vals[MPD_TAG_DATE] = mi->date;
     }
-    dst->duration_ms = src->duration_ms;
-    dst->mtime = src->mtime;
-}
-
-static void cache_check_version_locked(void)
-{
-    uint32_t snap[CHG_COUNT];
-    changes_snapshot(snap);
-    if (snap[CHG_DATABASE] != s_cache_db_version) {
-        for (int i = 0; i < CACHE_SIZE; i++) {
-            free(s_cache[i].path);
-            s_cache[i].path = NULL;
-            meta_free(&s_cache[i].meta);
+    size_t plen = strlen(rel) + 1, tlen = 0;
+    for (int t = 0; t < MPD_TAG_COUNT; t++) {
+        tlen += vals[t] && vals[t][0] ? strlen(vals[t]) + 1 : 0;
+    }
+    size_t bytes = sizeof(cache_entry_t) + plen + tlen;
+    cache_entry_t *e = psram_alloc(bytes);
+    if (!e) {
+        return NULL;
+    }
+    e->next = NULL;
+    e->hash = hash;
+    e->checked = 0;
+    e->bytes = (uint32_t)bytes;
+    e->mtime = st->st_mtime;
+    e->size = st->st_size;
+    e->duration_ms = mi ? mi->duration_ms : 0;
+    memcpy(e->path, rel, plen);
+    e->tags = e->path + plen;
+    size_t o = 0;
+    for (int t = 0; t < MPD_TAG_COUNT; t++) {
+        e->tag_at[t] = TAG_NONE;
+        if (vals[t] && vals[t][0]) {
+            size_t n = strlen(vals[t]) + 1;
+            memcpy(e->tags + o, vals[t], n);
+            e->tag_at[t] = (uint16_t)o;
+            o += n;
         }
-        s_cache_db_version = snap[CHG_DATABASE];
     }
+    e->tags_len = (uint16_t)o;
+    return e;
 }
 
-static char *dup_nonempty(const char *s)
+/* Cherche l'entrée de rel ; hors vérification (checked != version), seulement si la date et la
+ * taille (st) n'ont pas changé. */
+static bool cache_lookup(const char *rel, uint32_t hash, uint32_t version, const struct stat *st, song_meta_t *m)
 {
-    return s && *s ? strdup(s) : NULL;
+    bool hit = false;
+    xSemaphoreTake(s_cache_lock, portMAX_DELAY);
+    cache_entry_t *e = *cache_slot(rel, hash);
+    if (e && (e->checked == version || (st && e->mtime == st->st_mtime && e->size == st->st_size))) {
+        e->checked = version;
+        meta_from_entry(m, e);
+        hit = true;
+    }
+    xSemaphoreGive(s_cache_lock);
+    return hit;
 }
 
 static bool load_meta(const char *rel, song_meta_t *m)
 {
     memset(m, 0, sizeof(*m));
     m->file = rel;
-    xSemaphoreTake(s_cache_lock, portMAX_DELAY);
-    cache_check_version_locked();
-    for (int i = 0; i < CACHE_SIZE; i++) {
-        if (s_cache[i].path && strcmp(s_cache[i].path, rel) == 0) {
-            meta_copy(m, &s_cache[i].meta);
-            xSemaphoreGive(s_cache_lock);
-            return true;
-        }
+    uint32_t snap[CHG_COUNT];
+    changes_snapshot(snap);
+    uint32_t hash = path_hash(rel);
+    if (s_cache && cache_lookup(rel, hash, snap[CHG_DATABASE], NULL, m)) {
+        return true;
     }
-    xSemaphoreGive(s_cache_lock);
-
     char abs[ABS_PATH_MAX];
-    if (!path_to_abs(rel, abs, sizeof(abs))) {
-        return false;
-    }
     struct stat st;
-    if (stat(abs, &st) != 0) {
+    if (!path_to_abs(rel, abs, sizeof(abs)) || stat(abs, &st) != 0) {
+        if (s_cache) {
+            cache_forget(rel, hash);
+        }
         return false;
     }
-    m->mtime = st.st_mtime;
+    if (s_cache && cache_lookup(rel, hash, snap[CHG_DATABASE], &st, m)) {
+        return true;
+    }
     FILE *f = fopen(abs, "rb");
     media_info_t *mi = malloc(sizeof(media_info_t));
-    if (f && mi && media_probe(f, audio_fmt_from_name(rel), mi)) {
-        m->tags[MPD_TAG_ARTIST] = dup_nonempty(mi->artist);
-        m->tags[MPD_TAG_ALBUMARTIST] = dup_nonempty(mi->album_artist);
-        m->tags[MPD_TAG_ALBUM] = dup_nonempty(mi->album);
-        m->tags[MPD_TAG_TITLE] = dup_nonempty(mi->title);
-        m->tags[MPD_TAG_TRACK] = dup_nonempty(mi->track);
-        m->tags[MPD_TAG_GENRE] = dup_nonempty(mi->genre);
-        m->tags[MPD_TAG_DATE] = dup_nonempty(mi->date);
-        m->duration_ms = mi->duration_ms;
-    }
-    free(mi);
+    bool ok = f && mi && media_probe_tags(f, audio_fmt_from_name(rel), mi);
     if (f) {
         fclose(f);
     }
-
-    xSemaphoreTake(s_cache_lock, portMAX_DELAY);
-    cache_entry_t *e = &s_cache[s_cache_next];
-    s_cache_next = (s_cache_next + 1) % CACHE_SIZE;
-    free(e->path);
-    meta_free(&e->meta);
-    e->path = strdup(rel);
-    if (e->path) {
-        meta_copy(&e->meta, m);
+    cache_entry_t *e = entry_new(rel, hash, &st, ok ? mi : NULL);
+    free(mi);
+    if (!e) {
+        m->mtime = st.st_mtime;
+        return true;
     }
+    e->checked = snap[CHG_DATABASE];
+    if (!s_cache) {
+        meta_from_entry(m, e);
+        free(e);
+        return true;
+    }
+    xSemaphoreTake(s_cache_lock, portMAX_DELAY);
+    cache_insert(e);
+    meta_from_entry(m, e);
     xSemaphoreGive(s_cache_lock);
     return true;
 }
@@ -395,6 +523,98 @@ static void walk(client_t *c, const char *rel, walk_mode_t mode, int depth)
     }
     free(child);
     storage_free_dir(entries, n);
+}
+
+/* ======================= Mise en cache en tâche de fond ======================= */
+
+/*
+ * Au démarrage, puis après chaque changement sur la carte (envoi, podcast...) une fois la carte
+ * calme, les tags de toute la bibliothèque sont lus en tâche de fond : la première liste d'une
+ * application MPD est alors aussi rapide que les suivantes.
+ */
+static uint32_t db_version(void)
+{
+    uint32_t snap[CHG_COUNT];
+    changes_snapshot(snap);
+    return snap[CHG_DATABASE];
+}
+
+typedef struct {
+    uint32_t version;
+    int songs;
+    bool aborted; /* la carte a changé pendant le parcours */
+} index_ctx_t;
+
+static void index_dir(const char *rel, int depth, index_ctx_t *ix)
+{
+    dir_entry_t *entries;
+    int n;
+    if (depth > MAX_WALK_DEPTH || storage_list_dir(rel, &entries, &n) != ESP_OK) {
+        return;
+    }
+    char *child = malloc(REL_PATH_MAX);
+    for (int i = 0; child && i < n && !ix->aborted && ix->songs < STORAGE_MAX_TRACKS; i++) {
+        if (!join(child, REL_PATH_MAX, rel, entries[i].name)) {
+            continue;
+        }
+        if (entries[i].is_dir) {
+            index_dir(child, depth + 1, ix);
+        } else if (is_audio_file(entries[i].name)) {
+            song_meta_t m;
+            if (load_meta(child, &m)) {
+                meta_free(&m);
+                ix->songs++;
+            }
+        }
+        ix->aborted = db_version() != ix->version;
+    }
+    free(child);
+    storage_free_dir(entries, n);
+}
+
+/* Oublie les morceaux qu'un parcours complet n'a pas vus (fichiers supprimés). Retourne la
+ * taille du cache. */
+static size_t cache_sweep(uint32_t version)
+{
+    xSemaphoreTake(s_cache_lock, portMAX_DELAY);
+    for (int i = 0; i < CACHE_BUCKETS; i++) {
+        cache_entry_t **pp = &s_cache[i];
+        while (*pp) {
+            if ((*pp)->checked != version) {
+                cache_remove(pp);
+            } else {
+                pp = &(*pp)->next;
+            }
+        }
+    }
+    size_t bytes = s_cache_bytes;
+    xSemaphoreGive(s_cache_lock);
+    return bytes;
+}
+
+static void index_task(void *arg)
+{
+    uint32_t seen = db_version(), done = UINT32_MAX;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(INDEX_QUIET_MS));
+        uint32_t v = db_version();
+        if (v != seen) {
+            seen = v; /* pas encore calme */
+            continue;
+        }
+        if (v == done || !storage_is_mounted()) {
+            continue;
+        }
+        int64_t t0 = esp_timer_get_time();
+        index_ctx_t ix = {.version = v};
+        index_dir("", 0, &ix);
+        if (!ix.aborted) {
+            size_t bytes = cache_sweep(v);
+            done = v;
+            ESP_LOGI(TAG, "bibliothèque en cache : %d morceaux (%u Ko) en %.1f s", ix.songs, (unsigned)(bytes / 1024),
+                     (esp_timer_get_time() - t0) / 1e6);
+        }
+    }
 }
 
 /* Applique fn à chaque morceau de la carte (ou d'un sous-dossier) correspondant au filtre. */
@@ -1657,7 +1877,12 @@ static bool execute(client_t *c, char *line, int list_index)
         outf(c, "ACK [%d@%d] {%s} wrong number of arguments for \"%s\"\n", ACK_ERROR_ARG, list_index, name, name);
         return false;
     }
+    int64_t t0 = esp_timer_get_time();
     int r = d->fn(c, argc, argv);
+    int64_t us = esp_timer_get_time() - t0;
+    if (us >= SLOW_COMMAND_US) {
+        ESP_LOGI(TAG, "commande « %s » : %.1f s", d->name, us / 1e6);
+    }
     log_buffer_stack_check("mpd_client", d->name, &s_stack_low);
     if (r != 0) {
         outf(c, "ACK [%d@%d] {%s} %s\n", c->err_code ? c->err_code : ACK_ERROR_SYSTEM, list_index, name,
@@ -1897,5 +2122,15 @@ esp_err_t mpd_server_start(void)
 {
     s_start_us = esp_timer_get_time();
     s_cache_lock = xSemaphoreCreateMutex();
+    s_cache = psram_alloc(CACHE_BUCKETS * sizeof(*s_cache));
+    if (s_cache) {
+        memset(s_cache, 0, CACHE_BUCKETS * sizeof(*s_cache));
+        /* Pile en PSRAM : la tâche ne touche que la carte SD, jamais la flash. */
+        if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0 ||
+            xTaskCreatePinnedToCoreWithCaps(index_task, "mpd_index", 8192, NULL, 1, NULL, tskNO_AFFINITY,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            xTaskCreate(index_task, "mpd_index", 6144, NULL, 1, NULL);
+        }
+    }
     return xTaskCreate(listen_task, "mpd", 3584, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }

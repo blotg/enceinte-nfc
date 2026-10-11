@@ -481,6 +481,13 @@ static void reader_task(void *arg)
             LOCK();
             s_probe = *mi;
             s_probe_gen = gen;
+            if (s_stream_gen == gen) {
+                /* Connus dès l'analyse, sans attendre le premier bloc décodé : en pause juste après
+                 * un saut, la durée s'affiche et un nouveau saut reste possible. */
+                s_duration_ms = mi->duration_ms;
+                s_bitrate_kbps = mi->bitrate / 1000;
+                s_seekable = mi->seekable;
+            }
             UNLOCK();
             fd = open(req.path, O_RDONLY);
             struct stat stt;
@@ -780,6 +787,9 @@ static void start_song(uint32_t id, uint32_t seek_ms)
     s_cur_stream = stream;
     s_stream_gen = s_gen;
     s_stream_title[0] = s_stream_err[0] = '\0';
+    s_duration_ms = 0; /* avant la requête : l'analyse du lecteur SD les renseigne */
+    s_bitrate_kbps = 0;
+    s_seekable = false;
     UNLOCK();
     xQueueOverwrite(s_req_q, &req);
     s_preroll_until = stream ? esp_timer_get_time() + STREAM_PREROLL_US : 0;
@@ -791,9 +801,6 @@ static void start_song(uint32_t id, uint32_t seek_ms)
     s_state = PLAYER_PLAYING;
     s_elapsed_ms = seek_ms;
     s_base_ms = seek_ms;
-    s_duration_ms = 0;
-    s_bitrate_kbps = 0;
-    s_seekable = false;
     UNLOCK();
     s_frames = 0;
     s_need_info = true;
@@ -1642,7 +1649,8 @@ esp_err_t player_seek(int pos, uint32_t ms)
         id = pos < s_qlen ? s_queue[pos].id : 0;
     }
     bool current = id && id == s_cur_id && s_state != PLAYER_STOPPED;
-    bool seekable = s_seekable;
+    /* Morceau pas encore analysé (saut juste après un autre) : on essaie ; au pire il repart du début. */
+    bool seekable = !s_cur_stream && (s_seekable || s_probe_gen != s_stream_gen);
     UNLOCK();
     if (!id) {
         return ESP_ERR_INVALID_ARG;

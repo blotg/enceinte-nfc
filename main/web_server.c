@@ -569,7 +569,7 @@ static void current_tags(const char *rel)
         return;
     }
     media_info_t *mi = malloc(sizeof(media_info_t));
-    if (mi && media_probe(f, audio_fmt_from_name(rel), mi)) {
+    if (mi && media_probe_tags(f, audio_fmt_from_name(rel), mi)) {
         str_copy(s_tag_title, mi->title, sizeof(s_tag_title));
         str_copy(s_tag_artist, mi->artist, sizeof(s_tag_artist));
         str_copy(s_tag_album, mi->album, sizeof(s_tag_album));

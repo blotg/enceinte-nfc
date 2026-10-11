@@ -76,6 +76,31 @@ static void test_seek(const char *dir)
 
     /* Grosse pochette en tête des métadonnées : sautée sans être lue */
     check_seek(dir, "bigtags.opus", 12000, 1500, "OggS", 4, "Grosse pochette");
+    check_seek(dir, "bigtags_last.opus", 12000, 1500, "OggS", 4, "Pochette à la fin");
+
+    /* Tags seulement : une pochette en dernier commentaire n'est pas parcourue (début de
+     * l'audio alors estimé par défaut), une pochette suivie d'autres tags l'est. */
+    FILE *g = open_fixture(dir, "bigtags_last.opus");
+    if (g) {
+        media_info_t full, tags;
+        CHECK(media_probe(g, AUDIO_FMT_OGG, &full));
+        CHECK(media_probe_tags(g, AUDIO_FMT_OGG, &tags));
+        CHECK_STR(tags.title, "Pochette à la fin");
+        CHECK_STR(tags.artist, "Oiseaux de France");
+        CHECK_NEAR(tags.duration_ms, 30000, 60);
+        CHECK(tags.audio_start > 300000 && tags.audio_start < full.audio_start);
+        CHECK(full.audio_start - tags.audio_start < 4096);
+        fclose(g);
+    }
+    g = open_fixture(dir, "bigtags.opus");
+    if (g) {
+        media_info_t full, tags;
+        CHECK(media_probe(g, AUDIO_FMT_OGG, &full));
+        CHECK(media_probe_tags(g, AUDIO_FMT_OGG, &tags));
+        CHECK_STR(tags.title, "Grosse pochette");
+        CHECK(tags.audio_start == full.audio_start && tags.duration_ms == full.duration_ms);
+        fclose(g);
+    }
 
     FILE *f = open_fixture(dir, "long.opus");
     if (f) {

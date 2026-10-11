@@ -50,9 +50,12 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 - **M4A** : seulement les fichiers « optimisés pour le streaming » (`moov` avant `mdat`).
 - **Carte SD en FAT32** : exFAT n'est pas pris en charge par ESP-IDF. Reformater les cartes de plus
   de 32 Go en FAT32.
-- **MPD** : pas de base de données. Les recherches par tag (`list`, `find`, `search`) parcourent
-  la carte et sont lentes sur une grosse bibliothèque. Les listes de lecture sont les dossiers
-  de premier niveau (lecture seule).
+- **MPD** : pas de base de données sur la carte. Les tags de toute la bibliothèque (2 000
+  morceaux au plus) sont gardés en mémoire : lus en tâche de fond au démarrage, puis après
+  chaque changement sur la carte (envoi, podcast…), une fois la carte calme depuis 10 s. Les
+  listes et recherches (`list`, `find`, `search`) prennent alors moins d'une seconde, un peu
+  plus juste après un changement. Les listes de lecture sont les dossiers de premier niveau
+  (lecture seule).
 
 ## Matériel
 
@@ -218,6 +221,9 @@ absente à ce moment rapporterait ses réglages à son retour.
   M.A.L.P. (Android), mpc, Cantata, ncmpcpp, Rigelian (iOS)… Beaucoup d'applications, dont
   M.A.L.P., ne savent pas résoudre `enceinte.local` : mieux vaut réserver l'adresse IP de
   l'enceinte dans la box. Mot de passe facultatif dans *Réglages*.
+  Dans M.A.L.P., toucher un morceau l'ajoute seulement à la file d'attente (réglage par défaut,
+  comme avec un vrai serveur MPD) ; pour le lancer aussitôt : *Paramètres → Bibliothèque →
+  Action au clic sur la piste → Jouer la piste*.
   Pris en charge : lecture, pause, morceau suivant ou précédent, recherche de position,
   volume, aléatoire, répétition, single, consume. Aussi la file d'attente (`add`, `delete`,
   `move`, `swap`, `playlistinfo`, `plchanges`…), le parcours de la carte (`lsinfo`,
@@ -307,8 +313,8 @@ et le nombre d'épisodes à garder (10 par défaut, **0 pour tous**). Ou *Musiqu
 les mêmes que sur le port série), avec l'heure, la raison du dernier redémarrage (coupure,
 chute de tension, plantage, chien de garde…) et, après un plantage, la tâche en cause et la
 pile d'appels. La mémoire libre y est affichée (mémoire interne, plus grand bloc, minimum
-depuis le démarrage, PSRAM). « Télécharger » en fait un fichier texte à joindre à un
-signalement.
+depuis le démarrage, PSRAM). Les commandes MPD de plus d'une seconde y sont notées.
+« Télécharger » en fait un fichier texte à joindre à un signalement.
 
 ### Adresse IP fixe
 
@@ -496,6 +502,21 @@ test/host/run_tests.sh       # nécessite gcc, ffmpeg, lame, flac ; python-mpd2 
    découpé de toutes les façons possibles.
 
 Le tout est compilé avec AddressSanitizer et UndefinedBehaviorSanitizer.
+
+### Sur une vraie enceinte
+
+```bash
+MPD_PASSWORD=… test/device/mpd_device_test.py 192.168.1.70    # Python standard seul, ~1 min 30
+```
+
+Essaie, par le réseau, chaque commande MPD annoncée par l'enceinte avec ses cas d'erreur, puis
+les gestes des applications : clic sur un morceau dans M.A.L.P. (ajouter, jouer, jouer ensuite),
+listes de commandes, `idle` vu d'une autre connexion, fins de morceau avec
+repeat/single/consume/random, sauts de position (y compris en pause), plusieurs clients en
+même temps, nombre de connexions limité. Signale les commandes lentes et toute commande
+annoncée mais jamais essayée. L'enceinte joue de courts extraits à faible volume (`--volume`) ;
+rien n'est écrit sur la carte SD, et la file d'attente, le volume et la lecture en cours sont
+remis comme avant. Fermer les applications MPD avant (3 connexions au plus).
 
 L'interface web peut être développée sans l'enceinte : `python3 test/web/mock_api.py`, puis
 http://127.0.0.1:8080 (`--setup` pour l'assistant, `--ap` pour le Wi-Fi de secours ; mot de

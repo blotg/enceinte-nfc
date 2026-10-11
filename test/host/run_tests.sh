@@ -43,6 +43,9 @@ gen_fixtures() {
     # Opus dont les métadonnées commencent par une « pochette » de 400 Ko
     python3 -c "import base64, os; print(';FFMETADATA1'); print('METADATA_BLOCK_PICTURE=' + base64.b64encode(os.urandom(300000)).decode()); print('title=Grosse pochette')" > "$FIX/bigtags.txt"
     ffmpeg "${q[@]}" -i "$FIX/long.wav" -i "$FIX/bigtags.txt" -map_metadata 1 -c:a libopus -b:a 64k "$FIX/bigtags.opus"
+    # ... et une pochette en dernier commentaire, comme l'ajoutent la plupart des outils
+    python3 -c "import base64, os; print(';FFMETADATA1'); print('title=Pochette à la fin'); print('artist=Oiseaux de France'); print('METADATA_BLOCK_PICTURE=' + base64.b64encode(os.urandom(300000)).decode())" > "$FIX/bigtags_last.txt"
+    ffmpeg "${q[@]}" -i "$FIX/long.wav" -i "$FIX/bigtags_last.txt" -map_metadata 1 -c:a libopus -b:a 64k "$FIX/bigtags_last.opus"
     flac --silent --force -S 2s -T "TITLE=Rouge-gorge" -o "$FIX/long_seektable.flac" "$FIX/long.wav"
     flac --silent --force -S- -o "$FIX/long_noseektable.flac" "$FIX/long.wav"
     python3 -c "import random, sys; random.seed(1234); sys.stdout.buffer.write(bytes(random.getrandbits(8) for _ in range(20000)))" > "$FIX/garbage.mp3"
@@ -88,7 +91,7 @@ fi
 
 echo "== 3. Intégration MPD"
 if [ $HAVE_MEDIA = 1 ] && "$PY" -c "import mpd" 2> /dev/null; then
-    gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd\"" -I"$HERE/stubs" -I"$MAIN" -I"$HERE" \
+    gcc "${CFLAGS[@]}" -DMUSIC_ROOT="\"$WORK/sd\"" -DINDEX_QUIET_MS=300 -I"$HERE/stubs" -I"$MAIN" -I"$HERE" \
         "$HERE/mpd_host_main.c" "$HERE/shims.c" "$HERE/mocks.c" "$MAIN/player.c" "$MAIN/dsp.c" "$MAIN/mpd_server.c" "$MAIN/radio.c" \
         "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/util.c" "$MAIN/changes.c" -lm -o "$WORK/mpd_host"
     "$PY" "$HERE/mpd_integration.py" "$WORK/mpd_host" "$WORK/sd" "$FIX"

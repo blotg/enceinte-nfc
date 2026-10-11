@@ -59,18 +59,27 @@ def build_sd(sd, fix):
 
 class Server:
     def __init__(self, binary, password=None):
-        env = dict(os.environ, SHIM_SPEEDUP="20", ASAN_OPTIONS="detect_leaks=0")
+        env = dict(os.environ, SHIM_SPEEDUP="20", SHIM_LOG="1", ASAN_OPTIONS="detect_leaks=0")
         if password:
             env["MPD_PASSWORD"] = password
-        self.proc = subprocess.Popen([binary], stdout=subprocess.PIPE, text=True, env=env)
+        self.proc = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
         self.events = []
+        self.logs = []
         line = self.proc.stdout.readline()
         assert line.strip() == "READY", line
         threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._read_logs, daemon=True).start()
 
     def _read(self):
         for line in self.proc.stdout:
             self.events.append(line.strip())
+
+    def _read_logs(self):
+        for line in self.proc.stderr:
+            line = line.rstrip()
+            self.logs.append(line)
+            if not line[:3] in ("E (", "W (", "I ("):
+                print(line, file=sys.stderr)  # rapports des sanitizers
 
     def stop(self):
         self.proc.terminate()
@@ -138,6 +147,23 @@ def test_library(c):
         pass
 
 
+def test_cache(c, sd, fix):
+    """Cache des tags : gardé tant que rien ne change, revérifié après un changement sur la carte."""
+    track = "Rock/Album A/track1.flac"
+    titles = lambda: {e["file"]: e.get("title") for e in c.listallinfo("Rock") if "file" in e}
+    check(titles().get(track) == "Titre FLAC", f"cache : titre initial {titles()}")
+    shutil.copy(f"{fix}/long_seektable.flac", f"{sd}/{track}")
+    c.update()  # changement signalé (envoi, podcast...) : date et taille revérifiées
+    check(titles().get(track) == "Rouge-gorge", f"cache : fichier remplacé {titles()}")
+    check(len(c.find("title", "Rouge-gorge")) == 1, "cache : find après remplacement")
+    os.remove(f"{sd}/{track}")
+    c.update()
+    check(track not in titles() and not c.find("title", "Rouge-gorge"), "cache : fichier supprimé")
+    shutil.copy(f"{fix}/tone.flac", f"{sd}/{track}")
+    c.update()
+    check(titles().get(track) == "Titre FLAC", f"cache : fichier rétabli {titles()}")
+
+
 def test_playback(c, srv):
     c.clear()
     c.add("Comptines")
@@ -196,6 +222,15 @@ def test_playback(c, srv):
     st = c.status()
     check(st["state"] == "pause", f"seek en pause conserve la pause : {st['state']}")
     check(abs(float(st["elapsed"]) - 2.5) < 0.3, f"seekcur : {st['elapsed']}")
+    # En pause, rien n'est décodé : la durée et un second saut ne doivent pas en dépendre.
+    check(wait_for(lambda: float(c.status().get("duration", 0)) > 4), f"durée en pause après un saut : {c.status()}")
+    c.seekcur(1.0)
+    st = c.status()
+    check(st["state"] == "pause" and abs(float(st["elapsed"]) - 1.0) < 0.3, f"second saut en pause : {st}")
+    c.seekcur(3.0)
+    c.seekcur(1.5)  # aussitôt après un autre, avant l'analyse du fichier
+    st = c.status()
+    check(st["state"] == "pause" and abs(float(st["elapsed"]) - 1.5) < 0.3, f"sauts rapprochés : {st}")
     c.stop()
 
     # volume
@@ -424,8 +459,12 @@ if __name__ == "__main__":
     build_sd(SD, FIX)
     server = Server(BINARY)
     try:
+        # bibliothèque mise en cache en tâche de fond peu après le démarrage
+        check(wait_for(lambda: any("bibliothèque en cache : 8 morceaux" in l for l in server.logs), 10),
+              f"mise en cache au démarrage : {[l for l in server.logs if 'cache' in l]}")
         cl = client()
         test_library(cl)
+        test_cache(cl, SD, FIX)
         test_playback(cl, server)
         test_queue(cl)
         test_radio(cl)

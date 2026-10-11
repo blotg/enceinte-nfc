@@ -590,6 +590,47 @@ static void pw_derive(const char *password, const uint8_t *salt, uint32_t iterat
                                   PW_SALT_LEN, iterations, PW_HASH_LEN, out);
 }
 
+static bool same_hash(const uint8_t *a, const uint8_t *b)
+{
+    uint8_t diff = 0; /* comparaison en temps constant */
+    for (int i = 0; i < PW_HASH_LEN; i++) {
+        diff |= a[i] ^ b[i];
+    }
+    return diff == 0;
+}
+
+/*
+ * Dernier mot de passe reconnu, gardé en RAM sous forme d'empreinte rapide (HMAC avec une clé
+ * tirée au démarrage) : les applications MPD, qui se reconnectent souvent, évitent les 0,5 à
+ * 1,5 s de PBKDF2. Un mauvais mot de passe passe toujours par PBKDF2. Oublié à chaque
+ * changement du mot de passe (gen).
+ */
+typedef struct {
+    uint32_t gen;
+    bool valid;
+    uint8_t digest[PW_HASH_LEN];
+} pw_cache_t;
+
+static pw_cache_t s_pw_cache[2]; /* 0 : administrateur, 1 : MPD */
+static uint8_t s_pw_cache_key[32];
+static bool s_pw_cache_key_ready;
+
+static pw_cache_t *pw_cache(const char *key)
+{
+    return &s_pw_cache[strcmp(key, "admin_pw") == 0 ? 0 : 1];
+}
+
+/* Après l'écriture du nouveau mot de passe : une vérification de l'ancien, en cours, ne sera pas
+ * mise en cache. */
+static void pw_cache_forget(const char *key)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    pw_cache_t *pc = pw_cache(key);
+    pc->gen++;
+    pc->valid = false;
+    xSemaphoreGive(s_lock);
+}
+
 static esp_err_t pw_store(const char *key, const char *password)
 {
     nvs_handle_t h;
@@ -614,6 +655,7 @@ static esp_err_t pw_store(const char *key, const char *password)
         err = nvs_commit(h);
     }
     nvs_close(h);
+    pw_cache_forget(key);
     return err;
 }
 
@@ -631,6 +673,24 @@ static bool pw_load(const char *key, uint8_t blob[PW_BLOB_LEN])
 
 static bool pw_check(const char *key, const char *password)
 {
+    pw_cache_t *pc = pw_cache(key);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (!s_pw_cache_key_ready) {
+        esp_fill_random(s_pw_cache_key, sizeof(s_pw_cache_key));
+        s_pw_cache_key_ready = true;
+    }
+    uint32_t gen = pc->gen;
+    bool cached = pc->valid;
+    uint8_t known[PW_HASH_LEN];
+    memcpy(known, pc->digest, sizeof(known));
+    xSemaphoreGive(s_lock);
+    uint8_t fast[PW_HASH_LEN];
+    mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), s_pw_cache_key, sizeof(s_pw_cache_key),
+                    (const unsigned char *)password, strlen(password), fast);
+    if (cached && same_hash(fast, known)) {
+        return true;
+    }
+
     uint8_t blob[PW_BLOB_LEN];
     if (!pw_load(key, blob)) {
         return false;
@@ -639,11 +699,16 @@ static bool pw_check(const char *key, const char *password)
     memcpy(&it, blob, 4);
     uint8_t hash[PW_HASH_LEN];
     pw_derive(password, blob + 4, it, hash);
-    uint8_t diff = 0; /* comparaison en temps constant */
-    for (int i = 0; i < PW_HASH_LEN; i++) {
-        diff |= hash[i] ^ blob[4 + PW_SALT_LEN + i];
+    if (!same_hash(hash, blob + 4 + PW_SALT_LEN)) {
+        return false;
     }
-    return diff == 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (pc->gen == gen) {
+        memcpy(pc->digest, fast, sizeof(fast));
+        pc->valid = true;
+    }
+    xSemaphoreGive(s_lock);
+    return true;
 }
 
 static esp_err_t pw_store_blob(const char *key, const uint8_t *blob)
@@ -665,6 +730,7 @@ static esp_err_t pw_store_blob(const char *key, const uint8_t *blob)
         err = nvs_commit(h);
     }
     nvs_close(h);
+    pw_cache_forget(key);
     return err;
 }
 
@@ -747,5 +813,7 @@ esp_err_t settings_factory_reset(void)
     nvs_flash_deinit_partition(CFG_PARTITION);
     esp_err_t err = nvs_flash_erase_partition(CFG_PARTITION);
     nvs_flash_init_partition(CFG_PARTITION);
+    pw_cache_forget("admin_pw");
+    pw_cache_forget("mpd_pw");
     return err;
 }

@@ -49,6 +49,13 @@ typedef struct {
 bool media_probe(FILE *f, audio_fmt_t fmt, media_info_t *mi);
 
 /*
+ * Tags et durée seulement (listes MPD, page web) : plus rapide, une pochette Ogg placée en
+ * dernier commentaire n'est pas parcourue. audio_start peut alors être approximatif : à ne pas
+ * utiliser pour lire le fichier.
+ */
+bool media_probe_tags(FILE *f, audio_fmt_t fmt, media_info_t *mi);
+
+/*
  * Calcule où reprendre la lecture pour atteindre "ms" (MP3, FLAC, WAV, Ogg Opus/Vorbis).
  * Le fichier doit être celui analysé par media_probe. Retourne false si impossible.
  */

@@ -36,6 +36,9 @@ void storage_report_io_error(void);
 esp_err_t storage_list_dir(const char *rel_dir, dir_entry_t **entries, int *count);
 void storage_free_dir(dir_entry_t *entries, int count);
 
+#define STORAGE_MAX_TRACKS 2000 /* morceaux au plus dans une liste (carte, recherche...) */
+#define STORAGE_MAX_DEPTH 6     /* sous-dossiers parcourus au plus */
+
 /* Fichiers audio d'un dossier et de ses sous-dossiers, ordre naturel des chemins. */
 esp_err_t storage_list_tracks(const char *rel_dir, path_list_t *out);
 void path_list_free(path_list_t *list);
