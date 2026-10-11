@@ -19,6 +19,7 @@ int main(int argc, char **argv)
     test_log_ring();
     test_radio();
     test_rss();
+    test_web_auth();
     if (argc > 1) {
         test_media(argv[1]);
     } else {

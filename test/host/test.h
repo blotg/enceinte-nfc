@@ -49,3 +49,4 @@ void test_pn5180(void);
 void test_log_ring(void);
 void test_radio(void);
 void test_rss(void);
+void test_web_auth(void);

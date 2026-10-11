@@ -17,6 +17,7 @@ idf_component_register(
         "wifi_mgr.c"
         "dns_server.c"
         "web_server.c"
+        "web_auth.c"
         "tls_cert.c"
         "mpd_server.c"
         "mpd_proto.c"

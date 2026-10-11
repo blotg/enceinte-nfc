@@ -29,7 +29,7 @@ Firmware ESP-IDF 5.5, successeur du prototype Arduino (`archive/arduino/`).
 | Normalisation et compression | ✅ | Trois intensités chacune, en réglage général et carte par carte. Niveau égalisé entre playlists et morceaux, écarts réduits dans un morceau. |
 | Adresse IP fixe | ✅ | Adresse, masque, passerelle, DNS. Sans connexion administrateur à la nouvelle adresse sous 5 min, retour à l'ancienne configuration. |
 | Réglages et cartes sur la carte SD | ✅ | Une carte SD clonée se comporte dans une autre enceinte exactement comme dans la première. Export et import des réglages en JSON. |
-| Mot de passe administrateur en sortie d'usine | ✅ | Stocké haché (PBKDF2-SHA256). |
+| Mot de passe administrateur en sortie d'usine | ✅ | Stocké haché (PBKDF2-SHA256). Le navigateur reste connecté, même après un redémarrage ou une mise à jour ; la connexion se perd après 30 jours sans visite, ou quand le mot de passe change. |
 | Adresse `enceinte.local` | ✅ | mDNS ; nom modifiable. |
 | Page d'administration | ✅ | Wi-Fi, adresse IP, mots de passe admin et MPD, fichiers (envoi, déplacement, renommage), cartes, volume maximum, son, HTTPS, mises à jour, sauvegarde, redémarrage. |
 | *En plus* | | Bips au volume réglé (carte inconnue, dossier vide), réinitialisation usine (bouton BOOT 10 s), installation manuelle d'un `.bin`, volume maximum. |

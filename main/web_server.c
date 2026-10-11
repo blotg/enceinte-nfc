@@ -21,6 +21,7 @@
 #include "esp_http_server.h"
 #include "esp_https_server.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -30,6 +31,7 @@
 #include "lwip/sockets.h"
 #include "media_info.h"
 #include "nfc.h"
+#include "nvs.h"
 #include "ota.h"
 #include "player.h"
 #include "podcast.h"
@@ -39,6 +41,7 @@
 #include "storage.h"
 #include "tls_cert.h"
 #include "util.h"
+#include "web_auth.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "web";
@@ -46,8 +49,6 @@ static const char *TAG = "web";
 #define BODY_MAX 4096
 #define IMPORT_MAX (160 * 1024) /* 300 cartes aux noms de dossier très longs */
 #define UPLOAD_BUF 8192
-#define MAX_SESSIONS 8
-#define SESSION_IDLE_US (30LL * 24 * 3600 * 1000000) /* 30 jours */
 #define CSRF_HEADER "X-Requested-With"
 
 extern const char index_html_start[] asm("_binary_index_html_start");
@@ -57,12 +58,8 @@ extern const char app_js_end[] asm("_binary_app_js_end");
 extern const char style_css_start[] asm("_binary_style_css_start");
 extern const char style_css_end[] asm("_binary_style_css_end");
 
-typedef struct {
-    char token[33];
-    int64_t last_used;
-} web_session_t;
-
-static web_session_t s_sessions[MAX_SESSIONS];
+static web_auth_t s_auth; /* connexions, copiées en NVS */
+static SemaphoreHandle_t s_auth_lock;
 static httpd_handle_t s_http, s_https;
 static volatile bool s_https_busy; /* démarrage/arrêt du serveur HTTPS en cours */
 /* user_ctx des gestionnaires : indique par quel serveur la requête est arrivée */
@@ -263,51 +260,91 @@ static esp_err_t deny_http(httpd_req_t *req)
 
 /* ================= Authentification ================= */
 
-static web_session_t *find_session(httpd_req_t *req)
+static int64_t clock_now(void)
 {
-    char token[40];
-    size_t len = sizeof(token);
-    if (httpd_req_get_cookie_val(req, "sid", token, &len) != ESP_OK || strlen(token) != 32) {
-        return NULL;
-    }
-    int64_t now = esp_timer_get_time();
-    for (int i = 0; i < MAX_SESSIONS; i++) {
-        web_session_t *s = &s_sessions[i];
-        if (s->token[0] && now - s->last_used < SESSION_IDLE_US) {
-            uint8_t diff = 0;
-            for (int k = 0; k < 32; k++) {
-                diff |= (uint8_t)(s->token[k] ^ token[k]);
-            }
-            if (diff == 0) {
-                s->last_used = now;
-                return s;
-            }
-        }
-    }
-    return NULL;
+    time_t now = time(NULL);
+    return now > 1700000000 ? (int64_t)now : 0; /* 0 : pas encore l'heure par NTP */
 }
 
-static void create_session(httpd_req_t *req)
+/* Appelé avec s_auth_lock pris. */
+static void auth_save(void)
 {
-    int slot = 0;
-    for (int i = 1; i < MAX_SESSIONS; i++) {
-        if (s_sessions[i].last_used < s_sessions[slot].last_used) {
-            slot = i; /* la plus ancienne est remplacée */
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_from_partition(CFG_PARTITION, "web", NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, "sessions", &s_auth, sizeof(s_auth));
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
         }
+        nvs_close(h);
     }
-    uint8_t rnd[16];
-    esp_fill_random(rnd, sizeof(rnd));
-    bytes_to_hex(rnd, sizeof(rnd), s_sessions[slot].token);
-    s_sessions[slot].last_used = esp_timer_get_time();
-    static char cookie[112];
-    snprintf(cookie, sizeof(cookie), "sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000%s",
-             s_sessions[slot].token, via_https(req) ? "; Secure" : "");
-    httpd_resp_set_hdr(req, "Set-Cookie", cookie);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "connexions non enregistrées : %s", esp_err_to_name(err));
+    }
 }
 
-static void clear_sessions(void)
+static void auth_load(void)
 {
-    memset(s_sessions, 0, sizeof(s_sessions));
+    s_auth_lock = xSemaphoreCreateMutex();
+    nvs_handle_t h;
+    if (nvs_open_from_partition(CFG_PARTITION, "web", NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    size_t sz = sizeof(s_auth);
+    if (nvs_get_blob(h, "sessions", &s_auth, &sz) != ESP_OK || sz != sizeof(s_auth)) {
+        memset(&s_auth, 0, sizeof(s_auth));
+    }
+    nvs_close(h);
+}
+
+/* Le cookie reste dans le navigateur aussi longtemps que la connexion sur l'enceinte. */
+static void set_cookie(httpd_req_t *req, const char *token)
+{
+    static char cookie[2][112]; /* un par serveur : chacun traite une requête à la fois */
+    char *c = cookie[via_https(req)];
+    snprintf(c, sizeof(cookie[0]), "sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s", token,
+             WEB_AUTH_IDLE_S, via_https(req) ? "; Secure" : "");
+    httpd_resp_set_hdr(req, "Set-Cookie", c);
+}
+
+static bool get_token(httpd_req_t *req, char token[WEB_AUTH_TOKEN_LEN + 1])
+{
+    size_t len = WEB_AUTH_TOKEN_LEN + 1;
+    return httpd_req_get_cookie_val(req, "sid", token, &len) == ESP_OK;
+}
+
+static bool logged_in(httpd_req_t *req)
+{
+    char token[WEB_AUTH_TOKEN_LEN + 1];
+    if (!get_token(req, token)) {
+        return false;
+    }
+    xSemaphoreTake(s_auth_lock, portMAX_DELAY);
+    web_auth_result_t r = web_auth_check(&s_auth, token, clock_now());
+    if (r == WEB_AUTH_RENEWED || r == WEB_AUTH_EXPIRED) {
+        auth_save();
+    }
+    xSemaphoreGive(s_auth_lock);
+    if (r == WEB_AUTH_RENEWED) {
+        set_cookie(req, token);
+    }
+    return r == WEB_AUTH_OK || r == WEB_AUTH_RENEWED;
+}
+
+/* forget_others : changement de mot de passe, les autres appareils sont déconnectés. */
+static void create_session(httpd_req_t *req, bool forget_others)
+{
+    uint8_t key[WEB_AUTH_KEY_LEN];
+    esp_fill_random(key, sizeof(key));
+    char token[WEB_AUTH_TOKEN_LEN + 1];
+    xSemaphoreTake(s_auth_lock, portMAX_DELAY);
+    if (forget_others) {
+        memset(&s_auth, 0, sizeof(s_auth));
+    }
+    web_auth_add(&s_auth, key, clock_now(), token);
+    auth_save();
+    xSemaphoreGive(s_auth_lock);
+    set_cookie(req, token);
 }
 
 /* Les requêtes qui modifient l'état doivent porter l'en-tête CSRF (impossible à
@@ -331,7 +368,7 @@ static bool require_auth(httpd_req_t *req)
         send_error(req, "403 Forbidden", "requête refusée");
         return false;
     }
-    if (!find_session(req)) {
+    if (!logged_in(req)) {
         send_error(req, "401 Unauthorized", "connexion requise");
         return false;
     }
@@ -442,7 +479,7 @@ static esp_err_t h_state(httpd_req_t *req)
     ota_get_status(&os);
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "setup_required", !cfg.admin_set);
-    cJSON_AddBoolToObject(root, "logged_in", cfg.admin_set && find_session(req) != NULL);
+    cJSON_AddBoolToObject(root, "logged_in", cfg.admin_set && logged_in(req));
     cJSON_AddStringToObject(root, "version", os.current_version);
     cJSON_AddStringToObject(root, "build", s_build);
     cJSON_AddStringToObject(root, "hostname", cfg.hostname);
@@ -500,7 +537,7 @@ static esp_err_t h_setup(httpd_req_t *req)
         wifi_mgr_reconnect_later(1500);
     }
     ESP_LOGI(TAG, "configuration initiale terminée");
-    create_session(req);
+    create_session(req, false);
     return send_ok(req);
 }
 
@@ -528,15 +565,19 @@ static esp_err_t h_login(httpd_req_t *req)
         return send_error(req, "401 Unauthorized", "mot de passe incorrect");
     }
     s_login_failures = 0;
-    create_session(req);
+    create_session(req, false);
     return send_ok(req);
 }
 
 static esp_err_t h_logout(httpd_req_t *req)
 {
-    web_session_t *s = find_session(req);
-    if (s) {
-        memset(s, 0, sizeof(*s));
+    char token[WEB_AUTH_TOKEN_LEN + 1];
+    if (get_token(req, token)) {
+        xSemaphoreTake(s_auth_lock, portMAX_DELAY);
+        if (web_auth_remove(&s_auth, token)) {
+            auth_save();
+        }
+        xSemaphoreGive(s_auth_lock);
     }
     httpd_resp_set_hdr(req, "Set-Cookie", "sid=; Path=/; Max-Age=0");
     return send_ok(req);
@@ -1210,8 +1251,7 @@ static esp_err_t h_password(httpd_req_t *req)
     if (err != ESP_OK) {
         return send_error(req, "400 Bad Request", msg);
     }
-    clear_sessions(); /* déconnecte les autres appareils */
-    create_session(req);
+    create_session(req, true);
     return send_ok(req);
 }
 
@@ -1871,6 +1911,7 @@ static esp_err_t h_https(httpd_req_t *req)
 esp_err_t web_server_start(void)
 {
     prepare_static();
+    auth_load();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     base_config(&cfg);
     cfg.stack_size = 10240;

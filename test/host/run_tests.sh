@@ -74,7 +74,7 @@ if [ ${#CJSON[@]} -gt 0 ]; then
 fi
 gcc "${CFLAGS[@]}" -DDNS_HOST_TEST -I"$MAIN" -I"$HERE" -I"$HERE/stubs" \
     "$HERE"/test_*.c "$MAIN/util.c" "$MAIN/pn532_frame.c" "$MAIN/session.c" "$MAIN/dns_server.c" \
-    "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/dsp.c" "$MAIN/touch_keys.c" "$MAIN/pn5180_proto.c" "$MAIN/log_ring.c" "$MAIN/radio.c" "$MAIN/rss.c" "${JSON[@]}" -lm -o "$WORK/tests"
+    "$MAIN/mpd_proto.c" "$MAIN/media_info.c" "$MAIN/dsp.c" "$MAIN/touch_keys.c" "$MAIN/pn5180_proto.c" "$MAIN/log_ring.c" "$MAIN/radio.c" "$MAIN/rss.c" "$MAIN/web_auth.c" "${JSON[@]}" -lm -o "$WORK/tests"
 if [ $HAVE_MEDIA = 1 ]; then "$WORK/tests" "$FIX"; else "$WORK/tests"; fi
 
 echo "== 2. Contrôleur de cartes (vrai lecteur)"
